@@ -1,0 +1,67 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# Editors and local configuration
+.vscode/
+.idea/
+.env
+.env.*
+
+# Build and package output
+build/
+dist/
+diff_rasterization/build/
+diff_rasterization/dist/
+diff_rasterization/*.egg-info/
+
+# Datasets, experiments, logs, and generated visualizations
+input/
+data/
+datasets/
+output/
+outputs/
+checkpoints/
+wandb/
+tensorboard_3d/
+screenshots/
+assets/
+
+# Learned tensors, point clouds, and generated media
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.ply
+*.bin
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.html
+
+# Local archives, office documents, and patch bundles
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.docx
+*.patch
+*.diff
+diffs/
+patches/
+
+# Submodules are intentionally excluded until their local modifications are
+# ready to be vendored or committed independently.
+.gitmodules
+SIBR_viewers/
+submodules/

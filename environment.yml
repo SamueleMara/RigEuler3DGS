@@ -1,0 +1,37 @@
+name: rigeuler3dgs
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - wheel
+  - ninja
+  - cmake
+  - git
+  - wget
+  - curl
+  - ca-certificates
+  - numpy=1.26.*
+  - scipy
+  - tqdm
+  - plyfile
+  - pyyaml
+  - matplotlib
+  - scikit-image
+  - scikit-learn
+  - imageio
+  - imageio-ffmpeg
+  - pillow
+  - joblib
+  - tensorboard
+  - trimesh
+  - einops
+  - omegaconf
+  - submitit
+  - opencv
+  - pip:
+      - packaging
+      - rich
+      - typing_extensions
