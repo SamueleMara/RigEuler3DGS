@@ -50,6 +50,43 @@ RUN_START=$(date +%s)
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac }
 
+# --- is the static stage actually done? ----------------------------------
+#
+# `ls iteration_*/point_cloud.ply` was not enough, three ways over:
+#
+#   * it matches iteration_7000, the intermediate save. A run killed at 8000
+#     leaves one behind and the next run calls the scene trained.
+#   * it only looked at frame0_static. The pipeline needs BOTH endpoints --
+#     frame 0 and the last frame -- and the second was never checked.
+#   * it said nothing about depth. A model trained before depth supervision
+#     worked would be reused silently, which is the whole point of the
+#     30k rebuild.
+#
+# So: both endpoints, at the requested iteration, with depth recorded in the
+# model's own cfg_args.
+static_complete() {
+  local root="$1" iters="$2" ep
+  for ep in frame0_static frame_t_static; do
+    [ -f "$root/$ep/point_cloud/iteration_${iters}/point_cloud.ply" ] || return 1
+    grep -q "sapien_depth_is_metric=True" "$root/$ep/cfg_args" 2>/dev/null || return 2
+    grep -q "depths='[^']" "$root/$ep/cfg_args" 2>/dev/null || return 2
+  done
+  return 0
+}
+
+static_why() {
+  local root="$1" iters="$2" ep
+  for ep in frame0_static frame_t_static; do
+    if [ ! -f "$root/$ep/point_cloud/iteration_${iters}/point_cloud.ply" ]; then
+      echo "$ep has no iteration_${iters} checkpoint"; return
+    fi
+    if ! grep -q "sapien_depth_is_metric=True" "$root/$ep/cfg_args" 2>/dev/null; then
+      echo "$ep was trained without depth"; return
+    fi
+  done
+  echo "complete"
+}
+
 # --- GPU contention gate -------------------------------------------------
 #
 # Static 3DGS needs several GiB. When something else holds the card, train.py
@@ -158,12 +195,14 @@ for S in $SCENES; do
     continue
   fi
 
-  # --- [1] static 3DGS ------------------------------------------------
+  # --- [1] static 3DGS, both endpoints, with depth ----------------------
+  SHARED="$OUTROOT/${S}_${TAG}/shared"
   if has_stage 1; then
-    if ls "$MODEL"/point_cloud/iteration_*/point_cloud.ply >/dev/null 2>&1; then
-      echo "  [1/3] static 3DGS: already trained, reusing $MODEL"
+    if static_complete "$SHARED" "$ITERS"; then
+      echo "  [1/5] static 3DGS t0 + tfinal @ ${ITERS} with depth: present, reusing"
     else
-      echo "  [1/3] static 3DGS endpoints ($ITERS iters)  -> $LOGDIR/${S}_static.log"
+      echo "  [1/5] static 3DGS t0 + tfinal, ${ITERS} iters with depth"
+      echo "        (rebuilding: $(static_why "$SHARED" "$ITERS"))  -> $LOGDIR/${S}_static.log"
       $PY tools/train_all_static_endpoints.py \
           --only "$S" --iterations "$ITERS" --tag "$TAG" \
           --output-root "$OUTROOT" \
@@ -193,15 +232,19 @@ for S in $SCENES; do
       fi
     fi
   fi
-  if ! ls "$MODEL"/point_cloud/iteration_*/point_cloud.ply >/dev/null 2>&1; then
-    STATUS+=("$S SKIPPED(no static model)")
-    echo "  !! no trained model at $MODEL -- run stage 1"
+  if ! static_complete "$SHARED" "$ITERS"; then
+    STATUS+=("$S SKIPPED(static incomplete)")
+    echo "  !! static stage incomplete: $(static_why "$SHARED" "$ITERS")"
+    echo "     run with stage 1 enabled to build it"
     continue
   fi
 
   # --- [2] coherence static/dynamic -----------------------------------
   if has_stage 2; then
-    echo "  [2/3] coherence static/dynamic  -> $LOGDIR/${S}_coherence.log"
+    echo "  [2/5] Phase 1 free motion  +  [3/5] coherence static/dynamic"
+    echo "        (Phase 1 is solved ONCE here; the rigid stage reuses its"
+    echo "         centers rather than paying for it twice)"
+    echo "        -> $LOGDIR/${S}_coherence.log"
     $PY tools/run_motion_coherence_support.py \
         --scene "$S" --model "$MODEL" --source "input/$S" \
         --frames "$FRAMES" --cameras "$CAMS" \
@@ -228,7 +271,8 @@ for S in $SCENES; do
     [ "$RENDERS" = "0" ] && EXTRA+=(--no-renders)
     # Phase 1 was already solved in stage 2; reuse it rather than paying twice.
     [ -d "$COH/phase1_centers" ] && EXTRA+=(--phase1-centers "$COH/phase1_centers")
-    echo "  [3/3] rigid SE(3) + joint reduction  -> $LOGDIR/${S}_rigid.log"
+    echo "  [4/5] Phase 2 rigid SE(3) RGB-D  +  [5/5] joint fitting"
+    echo "        then results and debug pages  -> $LOGDIR/${S}_rigid.log"
     $PY tools/run_rigid_se3_pipeline.py \
         --scene "$S" --model "$MODEL" --source "input/$S" \
         --frames "$FRAMES" --cameras "$CAMS" --camera "$CAMERA" \
@@ -247,6 +291,42 @@ for S in $SCENES; do
   fi
   STATUS+=("$S OK $(( $(date +%s) - T_SCENE ))s")
 done
+
+echo ""
+echo "=============================================================="
+echo " PER-PHASE VERIFICATION"
+echo "=============================================================="
+printf "%-18s %-9s %-9s %-10s %-9s %-7s %-6s\n" \
+       scene static phase1 coherence rigid joint debug
+printf -- "------------------ --------- --------- ---------- --------- ------- ------\n"
+for S in $SCENES; do
+  SHARED="$OUTROOT/${S}_${TAG}/shared"
+  COH="$OUTROOT/motion_coherence_$S"
+  RIG="$OUTROOT/rigid_se3_$S"
+  static_complete "$SHARED" "$ITERS" && A=ok || A=MISSING
+  NC=$(ls "$COH"/phase1_centers/centers_frame_*.npy 2>/dev/null | wc -l)
+  [ "$NC" -ge "$FRAMES" ] && B="${NC}f" || B=MISSING
+  if [ -f "$COH/predicted_support.json" ]; then
+    grep -q NO_COHERENT_MOVING "$COH/predicted_support.json" && C=NO_MOVING || C=ok
+  else C=MISSING; fi
+  if [ -f "$RIG/phase2_rigid/poses.npy" ]; then
+    grep -q '"passes": true' "$RIG/phase2_rigid/exact_rigidity_gate.json" 2>/dev/null \
+      && D=ok || D=RIGIDITY
+  else D=MISSING; fi
+  [ -f "$RIG/joint_reduction/revolute/geometry.json" ] \
+    && [ -f "$RIG/joint_reduction/prismatic/geometry.json" ] \
+    && [ -f "$RIG/joint_reduction/one_dof_diagnostics.json" ] && E=ok || E=MISSING
+  N=$(ls "$RIG"/html/*.html 2>/dev/null | wc -l)
+  [ "$N" -ge 3 ] && F="${N}p" || F=MISSING
+  printf "%-18s %-9s %-9s %-10s %-9s %-7s %-6s\n" "$S" "$A" "$B" "$C" "$D" "$E" "$F"
+done
+echo ""
+echo "  static    t0 and tfinal at ${ITERS} iterations, trained with depth"
+echo "  phase1    free per-Gaussian motion, one centers file per frame"
+echo "  coherence static/dynamic support, frozen before Phase 2"
+echo "  rigid     Phase 2 SE(3) poses, with the exact-rigidity gate passing"
+echo "  joint     P and R geometry plus the one-DOF diagnostic"
+echo "  debug     3D, timeline and render pages"
 
 echo ""
 echo "=============================================================="

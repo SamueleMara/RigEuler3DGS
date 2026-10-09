@@ -101,7 +101,14 @@ def load_scene(model_path: str, source_path: str | None, sh_degree: int = 3,
         saved = eval(cfg.read_text(),
                      {"Namespace": Namespace, "inf": float("inf"),
                       "nan": float("nan"), "true": True, "false": False})
-        for name in ("images", "depths", "resolution", "white_background",
+        # `sapien_depth_is_metric` travels WITH `depths`. It is not a
+        # preference, it is how the bytes behind `depths` are to be read: the
+        # same .npy is a distance or its reciprocal depending on it. Restoring
+        # one without the other loads the file and misinterprets it -- which
+        # is what happened the first time, and only showed up because the
+        # mis-read is now checked rather than silently trained on.
+        for name in ("images", "depths", "sapien_depth_is_metric",
+                     "resolution", "white_background",
                      "train_test_exp", "sh_degree", "eval"):
             if hasattr(saved, name):
                 setattr(args, name, getattr(saved, name))

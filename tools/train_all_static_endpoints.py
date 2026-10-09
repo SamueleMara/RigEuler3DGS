@@ -135,10 +135,27 @@ def _single_batch_lock(lock_path: Path, *, dry_run: bool):
 def _ensure_model(args, *, phase: str, source_scene: Path, model_dir: Path, scene: Path, frame_idx: int, log: Path) -> Path:
     ply = model_ply_path(model_dir, int(args.iterations))
     requires_gt = has_sparse_gt_parts(scene)
-    if ply.is_file() and (not requires_gt or has_inherited_gt_labels(ply)) and not bool(args.force):
-        tqdm.write(f"{scene.name} {phase}: reuse {ply}")
-        return ply
     cmd = _train_command(args, source_scene, model_dir, scene, int(frame_idx))
+    # Reuse only if the existing model was trained the way this run would
+    # train it. A checkpoint at the right iteration is not enough: a model
+    # fitted before depth supervision worked sits at the same path under the
+    # same name, and silently reusing it is how one endpoint ends up with
+    # depth and the other without.
+    wants_depth = "--depths" in cmd
+    has_depth = False
+    cfg = model_dir / "cfg_args"
+    if cfg.is_file():
+        text = cfg.read_text(errors="replace")
+        has_depth = ("sapien_depth_is_metric=True" in text
+                     and "depths=''" not in text)
+    if (ply.is_file() and (not requires_gt or has_inherited_gt_labels(ply))
+            and not bool(args.force)):
+        if wants_depth and not has_depth:
+            tqdm.write(f"{scene.name} {phase}: retraining -- the existing "
+                       f"model was fitted without depth")
+        else:
+            tqdm.write(f"{scene.name} {phase}: reuse {ply}")
+            return ply
     code = _run_train(args, cmd, log)
     if code != 0:
         raise RuntimeError(f"{scene.name} {phase} train failed exit={code}; log={log}")

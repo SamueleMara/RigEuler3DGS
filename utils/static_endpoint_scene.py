@@ -276,6 +276,37 @@ def write_labeled_points_ply(path: str | Path, xyz: np.ndarray, rgb: np.ndarray,
     PlyData([PlyElement.describe(elements, "vertex")]).write(str(path))
 
 
+def link_endpoint_depth(scene, output_scene, frame_idx) -> int:
+    """Link frame `frame_idx`'s depth into a frame_t scene, beside colmap/.
+
+    Idempotent and separate from the scene build so that an ALREADY BUILT
+    endpoint scene picks the depth up too. Without that, every frame_t scene
+    made before depth supervision worked would keep training on RGB alone
+    while frame 0 got depth -- the two ends of the sequence fitted under
+    different supervision, which is the asymmetry the endpoint pair exists to
+    avoid.
+    """
+    scene = Path(scene).expanduser().resolve()
+    output_scene = Path(output_scene).expanduser().resolve()
+    images_dir = output_scene / "colmap" / "images"
+    depth_dir = output_scene / "depth_npy"
+    if not images_dir.is_dir():
+        return 0
+    n = 0
+    for cam_dir in sorted(p for p in images_dir.iterdir() if p.is_dir()):
+        for img in sorted(cam_dir.iterdir()):
+            src = scene / "depth_npy" / cam_dir.name / f"{img.stem}.npy"
+            if not src.is_file():
+                continue
+            dst = depth_dir / cam_dir.name / f"{img.stem}.npy"
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            dst.symlink_to(os.path.relpath(src.resolve(), dst.parent.resolve()))
+            n += 1
+    return n
+
+
 def build_labeled_frame_static_scene(
     scene: str | Path,
     output_scene: str | Path,
@@ -290,6 +321,8 @@ def build_labeled_frame_static_scene(
     summary_path = output_scene / "frame_static_scene_summary.json"
     ply = sparse / "points3D.ply"
     if ply.is_file() and summary_path.is_file() and not force:
+        # built already, but still make sure its depth is linked
+        link_endpoint_depth(scene, output_scene, int(frame_idx))
         return output_scene
 
     source_sparse = scene / "colmap" / "sparse" / "0"
@@ -314,6 +347,7 @@ def build_labeled_frame_static_scene(
         if dst.exists() or dst.is_symlink():
             dst.unlink()
         dst.symlink_to(os.path.relpath(rgb_path.resolve(), dst.parent.resolve()))
+
         used_camera_ids.add(int(image.camera_id))
         new_images[int(image_id)] = Image(
             id=int(image_id),
@@ -340,6 +374,7 @@ def build_labeled_frame_static_scene(
     }
     write_model(kept_cameras, new_images, points3d, str(sparse), ext=".bin")
     write_model(kept_cameras, new_images, points3d, str(sparse), ext=".txt")
+    link_endpoint_depth(scene, output_scene, int(frame_idx))
     write_labeled_points_ply(ply, xyz, rgb, parts)
     write_labeled_points_ply(sparse / "points3D_parts.ply", xyz, rgb, parts)
 
