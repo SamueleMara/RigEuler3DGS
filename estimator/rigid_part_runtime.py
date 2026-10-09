@@ -311,8 +311,8 @@ def kabsch_initialize(members: Tensor, mu0: Tensor, positions,
             "initialization_source": "phase1_kabsch",
             "used_axis_or_joint_model": False,
             "unexplained_fraction_note": (
-                "mean Kabsch residual / |p_t|: the fraction of the observed "
-                "displacement that the best single rigid motion leaves "
+                "mean Kabsch residual / mean per-point displacement: the "
+                "fraction of the observed motion that the best single rigid "
                 "unexplained. It rises both when the support spans several "
                 "bodies and when Phase 1 is noisy over it, so read it with "
                 "gamma_1DOF rather than alone. Never thresholded."),

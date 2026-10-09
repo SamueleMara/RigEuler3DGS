@@ -290,11 +290,18 @@ def select_moving_component(cands: list) -> dict:
     """Among graph-persistent candidates, the strongest held-out non-identity
     rigid evidence. No weighted sum of persistence, eta and motion.
 
-    A candidate qualifies when a common rigid trajectory beats identity on
-    nodes it never saw (`eta_cv > 0`, `delta_rss_cv > 0`) AND survives the
-    complexity penalty (`delta_bic > 0`). Among those, the one with the largest
-    held-out `delta_rss_cv` -- the absolute amount of motion the rigid model
-    explains out of sample -- is the moving body.
+    A candidate qualifies on FOUR conditions, and delta_bic is NOT one of
+    them -- see the comment below for why it was demoted to a diagnostic:
+
+        not degenerate
+        num_boundary_edges > 0          it has something to move relative to
+        relative_motion_ratio > sqrt(eps)   it moves above the numerical floor
+        eta_cv > 0  and  delta_rss_cv > 0   a common rigid trajectory beats
+                                            identity on nodes it never saw
+
+    Among those, the one with the largest held-out `delta_rss_cv` -- the
+    absolute amount of motion the rigid model explains out of sample -- is the
+    moving body.
 
     If nothing qualifies, say so. Section 17 forbids fabricating a half-scene
     dynamic component.
@@ -333,8 +340,8 @@ def select_moving_component(cands: list) -> dict:
     if not ok:
         whole = [c for c in cands if c["edges"]["num_boundary_edges"] == 0]
         why = ("no candidate is explained by a common non-identity rigid "
-               "trajectory on held-out nodes with delta_bic > 0; section 17 "
-               "forbids inventing one")
+               "trajectory on held-out nodes; section 17 forbids inventing "
+               "one")
         near_zero = [c for c in cands
                      if not c["rigidity"].get("degenerate")
                      and c["rigidity"].get("relative_motion_ratio", 1.0)

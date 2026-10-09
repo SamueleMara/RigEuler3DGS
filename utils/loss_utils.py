@@ -252,7 +252,7 @@ def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
     # Detach RGB/depth geometry for this auxiliary render: the semantic loss
     # must train only the per-Gaussian semantic logits.
     pkg = render_semantic_field(viewpoint_cam, gaussians, pipe, detach_geometry=True)
-    pred = pkg["render"][0].clamp(1e-5, 1.0 - 1e-5)
+    composited = pkg["render"][0]
 
     # A_k(p): accumulated alpha/visibility.  The feature rasterizer alpha-
     # composites an all-ones scalar field, giving sum_i w_i(p).
@@ -261,11 +261,35 @@ def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
             viewpoint_camera=viewpoint_cam,
             pc=gaussians,
             pipe=pipe,
-            features=torch.ones((gaussians.get_xyz.shape[0], 1), device=gaussians.get_xyz.device, dtype=pred.dtype),
-            bg_feature=torch.zeros(1, device=gaussians.get_xyz.device, dtype=pred.dtype),
+            features=torch.ones((gaussians.get_xyz.shape[0], 1), device=gaussians.get_xyz.device, dtype=composited.dtype),
+            bg_feature=torch.zeros(1, device=gaussians.get_xyz.device, dtype=composited.dtype),
             detach_geometry=True,
         )
         alpha = ones_pkg["render"][0].detach().clamp(0.0, 1.0)
+
+    # NORMALISE BY COVERAGE BEFORE COMPARING WITH THE MASK.
+    #
+    #     S(p) = sum_i w_i(p) s_i        is a weighted SUM, not a mean
+    #     A(p) = sum_i w_i(p)            the same weights, on a field of ones
+    #     s_hat(p) = S(p) / (A(p) + eps) the coverage-normalised mean
+    #
+    # The mask is a per-pixel statement about WHAT is there, not about how
+    # much of the pixel is covered. Comparing the raw sum against it conflates
+    # the two: wherever A < 1 -- a silhouette edge, a thin part, anything
+    # partially occluded -- S is attenuated even when every contributing
+    # Gaussian already has s_i = 1, so the target of 1 is unreachable and the
+    # only way to close the gap is to push the logits up. Measured on the
+    # trained models, that is exactly what happened: the field saturated at
+    # p = 1.0 on 9 of 13 scenes and separated the two classes by less than
+    # 0.005 on most of them.
+    #
+    # s_hat is the expected semantic value of whatever is at that pixel,
+    # independent of coverage, which is the quantity the mask is a label for.
+    # `alpha` is detached, so the division changes the gradient the logits
+    # receive but does not open a second route into the geometry -- this loss
+    # trains `_semantic_logits` and nothing else.
+    eps = 1e-6
+    pred = (composited / (alpha + eps)).clamp(1e-5, 1.0 - 1e-5)
 
     valid = torch.isfinite(pred) & torch.isfinite(target) & torch.isfinite(alpha) & (alpha > 1e-8)
     if valid.sum() < 16:
@@ -273,7 +297,7 @@ def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
 
     bce_map = F.binary_cross_entropy(pred, target, reduction="none")
     weight = alpha * valid.float()
-    denom = weight.sum().clamp_min(1e-6)
+    denom = weight.sum() + eps
     bce = (weight * bce_map).sum() / denom
 
     return bce, {
@@ -281,6 +305,8 @@ def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
         "semantic_bce": float(bce.detach().item()),
         "semantic_valid_pixels": float(valid.sum().item()),
         "semantic_mean_alpha": float(alpha[valid].mean().detach().item()) if valid.any() else 0.0,
+        "semantic_mean_pred": float(pred[valid].mean().detach().item()) if valid.any() else 0.0,
+        "semantic_mean_target": float(target[valid].mean().detach().item()) if valid.any() else 0.0,
     }
 
 

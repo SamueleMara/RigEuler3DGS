@@ -102,6 +102,19 @@ def main() -> int:
         ep = P["pose_residual"]["weighted_energy"]
         er = R["pose_residual"]["weighted_energy"]
         gt = g.get("gt_joint_type") if g.get("available") else None
+        # A scene whose GT part labels are entirely zero scores as if nothing
+        # moves: precision 0, F1 undefined, and an axis error measured against
+        # a joint its own labels deny. washer_103776 ships like that --
+        # points3D_parts.ply holds 5344 points with part == 0 throughout -- so
+        # the row is MARKED rather than read as a result.
+        mcf = root / f"motion_coherence_{s}" / "numerical" / "gt_metrics.json"
+        if mcf.exists():
+            try:
+                if float(json.load(mcf.open())["coherence"]
+                         ["gt_dynamic_fraction"]) <= 0.0:
+                    gt = "!GT-EMPTY"
+            except Exception:
+                pass
         picked[s] = (gt, R.get("axis_radius_over_part_scale"), ep, er,
                      g.get("prismatic", {}).get("axis_angle_deg"),
                      g.get("revolute", {}).get("axis_angle_deg"))
@@ -146,6 +159,9 @@ def main() -> int:
     print("  Phase-1 trajectories. It is NOT a body count: the scissor, the one")
     print("  scene that really is two bodies, sits mid-pack at 24%.")
     print("  gamma is what finds that: 0.59 there, 0.92+ everywhere else.")
+    print("  !GT-EMPTY means that scene's points3D_parts.ply labels NOTHING as")
+    print("  moving, so every GT number for it is vacuous. Its poses are still")
+    print("  real; only the scoring against GT is meaningless.")
     print("  No joint-type classifier is produced here. E_R < E_P alone is NOT")
     print("  sufficient -- on a near-prismatic part R can win on energy while")
     print("  placing its axis tens of part-radii away.")
