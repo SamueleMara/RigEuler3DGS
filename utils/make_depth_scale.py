@@ -3,7 +3,8 @@ import argparse
 import cv2
 from joblib import delayed, Parallel
 import json
-from read_write_model import *
+import os
+from read_write_model import qvec2rotmat, read_model
 
 def get_scales(key, cameras, images, points3d_ordered, args):
     image_meta = images[key]

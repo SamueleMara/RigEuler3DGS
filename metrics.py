@@ -73,9 +73,9 @@ def evaluate(model_paths):
                     psnrs.append(psnr(renders[idx], gts[idx]))
                     lpipss.append(lpips(renders[idx], gts[idx], net_type='vgg'))
 
-                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
-                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))
-                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean(), ".5"))
+                print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean()))
+                print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean()))
+                print("  LPIPS: {:>12.7f}".format(torch.tensor(lpipss).mean()))
                 print("")
 
                 full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),

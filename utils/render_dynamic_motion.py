@@ -1,324 +1,198 @@
-"""Utilities to render Dynamic Eulerian/RigEuler 3DGS trajectories.
-
-This module is intentionally importable from train.py and also runnable as:
-
-    python -m utils.render_dynamic_motion ...
-
-The core function is render_dynamic_sequence(...). It accepts an already-loaded
-Scene/GaussianModel, so post-training rendering does not need to reload the
-whole checkpoint. Rendering can be driven either by gaussian_tracks.pt or by the
-in-memory Eulerian motion field via gaussians.set_time(...).
-"""
+"""Render the final hard dynamic model or its exported Gaussian tracks."""
 
 from __future__ import annotations
 
 import json
 import re
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Optional
 
 import torch
 import torchvision
 from tqdm import tqdm
 
 from gaussian_renderer import render
+from utils.dynamic_loss_utils import get_camera_timestamp
 
 
-def _split_csv(value: str) -> Optional[set]:
-    if value is None:
-        return None
-    value = str(value).strip()
-    if value == "" or value.lower() == "all":
-        return None
-    return {v.strip() for v in value.split(",") if v.strip()}
+def _camera_id(camera):
+    value = getattr(camera, "dynamic_camera_id", None)
+    if value is not None:
+        return str(value)
+    match = re.search(r"cam_\d+", str(getattr(camera, "image_name", "")))
+    return match.group(0) if match is not None else f"cam_{int(camera.uid):03d}"
 
 
-def camera_id(cam) -> str:
-    """Best-effort dynamic camera id, compatible with patched Camera clones."""
-    for attr in ("dynamic_camera_id", "camera_id", "cam_id"):
-        val = getattr(cam, attr, None)
-        if val is not None:
-            return str(val)
-    name = str(getattr(cam, "image_name", ""))
-    m = re.search(r"cam_\d+", name)
-    if m:
-        return m.group(0)
-    return f"cam_{int(getattr(cam, 'uid', 0)):03d}"
+def _frame_id(camera):
+    if hasattr(camera, "frame_id"):
+        return int(camera.frame_id)
+    match = re.search(r"frame[_-]?(\d+)", str(getattr(camera, "image_name", "")))
+    return int(match.group(1)) if match is not None else 0
 
 
-def frame_id(cam, fps: float = 30.0) -> int:
-    """Best-effort frame id from Camera attributes or image name."""
-    if hasattr(cam, "frame_id"):
-        return int(getattr(cam, "frame_id"))
-    name = str(getattr(cam, "image_name", ""))
-    m = re.search(r"frame[_-]?(\d+)", name)
-    if m:
-        return int(m.group(1))
-    return int(round(float(getattr(cam, "timestamp", 0.0)) * float(fps)))
-
-
-def timestamp(cam, fps: float = 30.0, time_scale: float = 1.0) -> float:
-    if hasattr(cam, "timestamp"):
-        return float(getattr(cam, "timestamp")) * float(time_scale)
-    return float(frame_id(cam, fps=fps)) / max(float(fps), 1e-8) * float(time_scale)
-
-
-def load_tracks(tracks_path: str) -> Dict[str, torch.Tensor]:
-    path = Path(tracks_path).expanduser()
-    if not path.exists():
-        raise FileNotFoundError(f"Could not find gaussian track file: {path}")
-    tracks = torch.load(str(path), map_location="cpu")
-    if not isinstance(tracks, dict):
-        raise ValueError(f"{path} must contain a dict saved with torch.save(...).")
-    if "positions" not in tracks:
-        raise ValueError(f"{path} must contain tracks['positions'] with shape [T, N, 3].")
-    positions = tracks["positions"]
-    if positions.ndim != 3 or positions.shape[-1] != 3:
-        raise ValueError(f"tracks['positions'] must have shape [T, N, 3], got {tuple(positions.shape)}")
-    return tracks
-
-
-def build_track_index(tracks: Dict[str, torch.Tensor]) -> Tuple[Dict[int, int], torch.Tensor]:
-    positions = tracks["positions"]
-    if "frame_ids" in tracks and tracks["frame_ids"] is not None:
-        frame_ids = tracks["frame_ids"].long().cpu()
-    else:
-        frame_ids = torch.arange(positions.shape[0], dtype=torch.long)
-    return {int(fid): idx for idx, fid in enumerate(frame_ids.tolist())}, frame_ids
-
-
-def nearest_track_index(fid: int, frame_ids: torch.Tensor) -> int:
-    diffs = torch.abs(frame_ids.long() - int(fid))
-    return int(torch.argmin(diffs).item())
-
-
-def set_gaussians_from_tracks(gaussians, tracks: Dict[str, torch.Tensor], track_idx: int, device: str = "cuda") -> None:
-    """Inject per-frame xyz/velocity into GaussianModel without changing canonical xyz."""
-    xyz = tracks["positions"][track_idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    if "velocities" in tracks and tracks["velocities"] is not None:
-        vel = tracks["velocities"][track_idx].to(device=device, dtype=torch.float32, non_blocking=True)
-    else:
-        vel = torch.zeros_like(xyz)
-
-    # The patched GaussianModel.get_xyz reads _current_xyz when set_time/track
-    # injection is active. We keep rotations/scales/features canonical for the
-    # first version, exactly as requested: simple positions + velocities.
-    gaussians._current_xyz = xyz
-    gaussians._current_velocity = vel
-    if hasattr(gaussians, "_rotation"):
-        gaussians._current_rotation = gaussians._rotation.detach()
-    if "times" in tracks and tracks["times"] is not None:
-        gaussians._current_time = float(tracks["times"][track_idx])
-
-
-def clear_dynamic_state(gaussians) -> None:
-    if hasattr(gaussians, "clear_time"):
-        gaussians.clear_time()
-        return
-    for attr in ("_current_xyz", "_current_velocity", "_current_rotation", "_current_time"):
-        if hasattr(gaussians, attr):
-            setattr(gaussians, attr, None)
-
-
-def collect_dynamic_views(scene, split: str = "all", cameras: str = "", frame_start: int = 0,
-                          frame_end: int = -1, frame_stride: int = 1, fps: float = 30.0) -> List:
-    """Collect and sort dynamic Camera clones by camera id and frame id."""
+def _selected_views(scene, split, cameras, frame_start, frame_end, frame_stride):
     if split == "train":
         views = list(scene.getTrainCameras())
     elif split == "test":
         views = list(scene.getTestCameras())
     else:
         views = list(scene.getTrainCameras()) + list(scene.getTestCameras())
-
-    allowed = _split_csv(cameras)
-    out = []
-    seen = set()
-    stride = max(1, int(frame_stride))
-    for cam in views:
-        cid = camera_id(cam)
-        fid = frame_id(cam, fps=fps)
-        if allowed is not None and cid not in allowed:
+    allowed = None if not cameras or cameras == "all" else set(cameras.split(","))
+    selected, seen = [], set()
+    for camera in views:
+        camera_id, frame_id = _camera_id(camera), _frame_id(camera)
+        if allowed is not None and camera_id not in allowed:
             continue
-        if fid < int(frame_start):
+        if frame_id < frame_start or (frame_end >= 0 and frame_id > frame_end):
             continue
-        if int(frame_end) >= 0 and fid > int(frame_end):
+        if (frame_id - frame_start) % max(1, frame_stride) != 0:
             continue
-        if stride > 1 and ((fid - int(frame_start)) % stride != 0):
-            continue
-        key = (cid, fid)
-        if key in seen:
-            # Avoid duplicate train/test entries for the same dynamic view.
-            continue
-        seen.add(key)
-        out.append(cam)
-    out.sort(key=lambda c: (camera_id(c), frame_id(c, fps=fps)))
-    return out
+        key = (camera_id, frame_id)
+        if key not in seen:
+            selected.append(camera)
+            seen.add(key)
+    return sorted(selected, key=lambda camera: (_camera_id(camera), _frame_id(camera)))
 
 
-def save_video_from_pngs(render_dir: Path, video_path: Path, fps: float) -> None:
-    frames = sorted(render_dir.glob("frame_*.png"))
-    if not frames:
-        return
+def _load_tracks(path: Optional[str]):
+    if not path:
+        return None
+    tracks = torch.load(path, map_location="cpu", weights_only=False)
+    required = ("times", "positions", "rotations", "velocities")
+    if not isinstance(tracks, dict) or any(key not in tracks for key in required):
+        raise ValueError(f"{path} is not a unified Gaussian-track checkpoint")
+    return tracks
+
+
+def _inject_nearest_track(gaussians, tracks, time):
+    index = int(torch.argmin(torch.abs(tracks["times"].float() - float(time))))
+    gaussians._current_xyz = tracks["positions"][index].cuda().float()
+    gaussians._current_rotation = tracks["rotations"][index].cuda().float()
+    gaussians._current_velocity = tracks["velocities"][index].cuda().float()
+    gaussians._current_time = float(tracks["times"][index])
+
+
+def _write_video(frame_dir: Path, output: Path, fps: float):
     try:
         import imageio.v2 as imageio
-        imgs = [imageio.imread(str(p)) for p in frames]
-        imageio.mimsave(str(video_path), imgs, fps=float(fps), quality=8)
-        print(f"[render_dynamic_motion] Wrote video {video_path}")
-    except Exception as exc:
-        print(f"[render_dynamic_motion] Could not write video {video_path}: {exc}")
+        frames = [imageio.imread(path) for path in sorted(frame_dir.glob("frame_*.png"))]
+        if frames:
+            imageio.mimsave(output, frames, fps=fps, quality=8)
+    except Exception as error:
+        print(f"[render] MP4 export skipped: {error}")
 
 
+@torch.no_grad()
 def render_dynamic_sequence(
     scene,
     gaussians,
     pipeline,
-    background: torch.Tensor,
-    dyn,
-    iteration: int,
+    background,
+    args,
+    iteration,
     tracks_path: Optional[str] = None,
-    out_root: Optional[Path] = None,
+    output_root: Optional[str] = None,
+    split: str = "all",
     cameras: str = "",
     frame_start: int = 0,
     frame_end: int = -1,
     frame_stride: int = 1,
-    split: str = "all",
-    use_tracks: bool = True,
+    use_tracks: bool = False,
     save_video: bool = False,
-    train_test_exp: bool = False,
     separate_sh: bool = False,
 ) -> Dict:
-    """Render all selected dynamic views from either gaussian_tracks.pt or field rollout.
+    """Render selected dynamic views.
 
-    Args:
-        scene: already-loaded Scene with dynamic cameras enabled.
-        gaussians: trained GaussianModel.
-        pipeline: PipelineParams object passed to gaussian_renderer.render.
-        background: CUDA background color tensor.
-        dyn: argparse namespace containing fps/time_scale/motion_integration_steps.
-        iteration: iteration tag used in output path.
-        tracks_path: gaussian_tracks.pt path. If None, uses scene.model_path/track_export_name.
-        out_root: output root. If None, scene.model_path/dynamic_renders is used.
-        cameras: comma-separated camera ids. Empty/all = all cameras.
-        frame_start/frame_end/frame_stride: selected frame range.
-        split: train/test/all.
-        use_tracks: inject exported per-frame positions when True. Otherwise use gaussians.set_time.
-        save_video: create one MP4 per camera.
+    The default evaluates the in-memory exact joint model at each timestamp.
+    ``use_tracks`` is a deterministic debug replay of exported states, not an
+    alternative trainable motion representation.
     """
-    fps = float(getattr(dyn, "fps", 30.0))
-    time_scale = float(getattr(dyn, "time_scale", 1.0))
-    model_path = Path(scene.model_path)
-    out_root = Path(out_root) if out_root is not None else model_path / "dynamic_renders"
-    out_base = out_root / f"ours_{int(iteration)}"
-    out_base.mkdir(parents=True, exist_ok=True)
-
-    tracks = None
-    track_index = None
-    track_frame_ids = None
-    if use_tracks:
-        if tracks_path is None:
-            tracks_path = model_path / getattr(dyn, "track_export_name", "gaussian_tracks.pt")
-        tracks = load_tracks(str(tracks_path))
-        track_index, track_frame_ids = build_track_index(tracks)
-        print(f"[render_dynamic_motion] Loaded tracks {tracks_path} with positions {tuple(tracks['positions'].shape)}")
-
-    views = collect_dynamic_views(
-        scene=scene,
-        split=split,
-        cameras=cameras,
-        frame_start=frame_start,
-        frame_end=frame_end,
-        frame_stride=frame_stride,
-        fps=fps,
-    )
-    if not views:
-        print("[render_dynamic_motion] No views matched the requested camera/frame filters.")
-        return {"num_views": 0, "out_dir": str(out_base)}
-
-    rendered = []
-    by_camera: Dict[str, int] = {}
-    for view in tqdm(views, desc="Rendering dynamic motion"):
-        cid = camera_id(view)
-        fid = frame_id(view, fps=fps)
-        cam_dir = out_base / cid
-        render_dir = cam_dir / "renders"
-        gt_dir = cam_dir / "gt"
-        render_dir.mkdir(parents=True, exist_ok=True)
-        gt_dir.mkdir(parents=True, exist_ok=True)
-
-        if tracks is not None:
-            tidx = track_index.get(fid, None)
-            if tidx is None:
-                tidx = nearest_track_index(fid, track_frame_ids)
-            set_gaussians_from_tracks(gaussians, tracks, tidx, device="cuda")
+    tracks = _load_tracks(tracks_path) if use_tracks else None
+    views = _selected_views(scene, split, cameras, frame_start, frame_end, frame_stride)
+    output = Path(output_root or (Path(scene.model_path) / "dynamic_renders")) / f"ours_{iteration}"
+    output.mkdir(parents=True, exist_ok=True)
+    counts, rows = {}, []
+    for camera in tqdm(views, desc="Rendering exact dynamic model"):
+        camera_id, frame_id = _camera_id(camera), _frame_id(camera)
+        time = get_camera_timestamp(camera, args.fps, args.time_scale)
+        if tracks is None:
+            gaussians.set_time(time, detach_canonical=True)
         else:
-            t = timestamp(view, fps=fps, time_scale=time_scale)
-            gaussians.set_time(
-                t,
-                detach_canonical=True,
-                steps=int(getattr(dyn, "motion_integration_steps", 4)),
-            )
-
-        pkg = render(
-            view,
-            gaussians,
-            pipeline,
-            background,
-            use_trained_exp=train_test_exp,
+            _inject_nearest_track(gaussians, tracks, time)
+        package = render(
+            camera, gaussians, pipeline, background,
+            use_trained_exp=scene._scene_args.train_test_exp,
             separate_sh=separate_sh,
         )
-        image = pkg["render"]
-        gt = getattr(view, "original_image", None)
-        if gt is not None:
-            gt = gt[0:3, :, :]
-
-        if train_test_exp:
-            image = image[..., image.shape[-1] // 2:]
-            if gt is not None:
-                gt = gt[..., gt.shape[-1] // 2:]
-
-        torchvision.utils.save_image(torch.clamp(image, 0.0, 1.0), render_dir / f"frame_{fid:06d}.png")
-        if gt is not None:
-            torchvision.utils.save_image(torch.clamp(gt, 0.0, 1.0), gt_dir / f"frame_{fid:06d}.png")
-
-        clear_dynamic_state(gaussians)
-        by_camera[cid] = by_camera.get(cid, 0) + 1
-        rendered.append({"camera": cid, "frame_id": int(fid), "image": str(render_dir / f"frame_{fid:06d}.png")})
-
+        render_dir = output / camera_id / "renders"
+        target_dir = output / camera_id / "gt"
+        render_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        render_path = render_dir / f"frame_{frame_id:06d}.png"
+        torchvision.utils.save_image(package["render"].clamp(0, 1), render_path)
+        torchvision.utils.save_image(camera.original_image[:3].clamp(0, 1), target_dir / render_path.name)
+        gaussians.clear_time()
+        counts[camera_id] = counts.get(camera_id, 0) + 1
+        rows.append({"camera": camera_id, "frame": frame_id, "time": time, "render": str(render_path)})
     if save_video:
-        for cid in sorted(by_camera):
-            render_dir = out_base / cid / "renders"
-            save_video_from_pngs(render_dir, out_base / cid / f"{cid}_renders.mp4", fps=fps)
-
+        for camera_id in counts:
+            _write_video(
+                output / camera_id / "renders",
+                output / camera_id / f"{camera_id}.mp4",
+                args.fps,
+            )
     summary = {
+        "schema_version": 1,
         "iteration": int(iteration),
-        "num_views": int(len(rendered)),
-        "num_cameras": int(len(by_camera)),
-        "views_per_camera": by_camera,
-        "used_tracks": bool(tracks is not None),
-        "tracks_path": str(tracks_path) if tracks_path is not None else "",
-        "out_dir": str(out_base),
-        "split": split,
-        "frame_start": int(frame_start),
-        "frame_end": int(frame_end),
-        "frame_stride": int(frame_stride),
+        "hard_kinematic_render": tracks is None,
+        "views_per_camera": counts,
+        "views": rows,
     }
-    with open(out_base / "render_dynamic_summary.json", "w") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[render_dynamic_motion] Rendered {len(rendered)} views to {out_base}")
+    (output / "render_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
 
-# Optional standalone entry point. This is intentionally small: for full training
-# integration, train.py calls render_dynamic_sequence(...) directly.
-def main() -> None:
-    parser = ArgumentParser(description="Render dynamic 3DGS tracks from an already trained model.")
-    parser.add_argument("--tracks_path", required=True, type=str)
-    parser.add_argument("--out_dir", required=True, type=str)
-    parser.add_argument("--note", default="This module is mainly designed to be called from train.py after training.")
-    args = parser.parse_args()
-    print(args.note)
-    print("For checkpoint-based standalone rendering, prefer calling render_dynamic_sequence from a small project script after loading Scene/GaussianModel.")
+def main():
+    from arguments import (
+        ModelParams, PipelineParams, add_dynamic_args,
+        apply_dynamic_defaults, get_combined_args,
+    )
+    from scene import GaussianModel, Scene
+
+    parser = ArgumentParser()
+    model = ModelParams(parser, sentinel=True)
+    pipeline = PipelineParams(parser)
+    add_dynamic_args(parser)
+    parser.add_argument("--iteration", type=int, default=-1)
+    parser.add_argument("--split", choices=("train", "test", "all"), default="all")
+    parser.add_argument("--render_cameras", type=str, default="")
+    parser.add_argument("--render_frame_start", type=int, default=0)
+    parser.add_argument("--render_frame_end", type=int, default=-1)
+    parser.add_argument("--render_frame_stride", type=int, default=1)
+    parser.add_argument("--tracks", type=str, default="")
+    parser.add_argument("--use_tracks", action="store_true")
+    parser.add_argument("--save_video", action="store_true")
+    args = apply_dynamic_defaults(get_combined_args(parser))
+    dataset = model.extract(args)
+    gaussians = GaussianModel(dataset.sh_degree)
+    scene = Scene(dataset, gaussians, load_iteration=args.iteration, shuffle=False, dynamic_args=args)
+    iteration = scene.loaded_iter if scene.loaded_iter is not None else args.iteration
+    background = torch.tensor(
+        [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
+        device="cuda",
+    )
+    render_dynamic_sequence(
+        scene, gaussians, pipeline.extract(args), background, args, iteration,
+        tracks_path=args.tracks,
+        split=args.split,
+        cameras=args.render_cameras,
+        frame_start=args.render_frame_start,
+        frame_end=args.render_frame_end,
+        frame_stride=args.render_frame_stride,
+        use_tracks=args.use_tracks,
+        save_video=args.save_video,
+    )
 
 
 if __name__ == "__main__":

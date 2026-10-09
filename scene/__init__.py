@@ -29,9 +29,7 @@ class Scene:
     gaussians : GaussianModel
 
     def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], dynamic_args=None):
-        """b
-        :param path: Path to colmap scene main folder.
-        """
+        """Load the canonical GraphDECO scene and optionally its video cameras."""
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
@@ -58,7 +56,8 @@ class Scene:
         # later by cloning these fixed COLMAP cameras over time.
         colmap_source_path = infer_colmap_source_path(args.source_path)
         if os.path.exists(os.path.join(colmap_source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](colmap_source_path, args.images, args.depths, args.eval, args.train_test_exp)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](colmap_source_path, args.images, args.depths, args.eval, args.train_test_exp,
+                load_gt_parts=getattr(args, 'load_gt_parts', True))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)
@@ -113,14 +112,26 @@ class Scene:
             # timestamps at construction time.
             fps = float(getattr(dynamic_args, "fps", 30.0)) if dynamic_args is not None else 30.0
             time_scale = float(getattr(dynamic_args, "time_scale", 1.0)) if dynamic_args is not None else 1.0
-            normalize_camera_timestamps(self.train_cameras[resolution_scale], fps=fps, time_scale=time_scale)
-            normalize_camera_timestamps(self.test_cameras[resolution_scale], fps=fps, time_scale=time_scale)
+            time_mode = str(getattr(dynamic_args, "motion_time_mode", "seconds")) if dynamic_args is not None else "seconds"
+            all_dynamic_cameras = list(self.train_cameras[resolution_scale]) + list(self.test_cameras[resolution_scale])
+            normalize_camera_timestamps(
+                all_dynamic_cameras, fps=fps, time_scale=time_scale, time_mode=time_mode
+            )
 
         if self.loaded_iter:
-            self.gaussians.load_ply(os.path.join(self.model_path,
-                                                           "point_cloud",
-                                                           "iteration_" + str(self.loaded_iter),
-                                                           "point_cloud.ply"), args.train_test_exp)
+            point_cloud_path = os.path.join(
+                self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter)
+            )
+            self.gaussians.load_ply(
+                os.path.join(point_cloud_path, "point_cloud.ply"), args.train_test_exp,
+                load_gt_parts=getattr(args, 'load_gt_parts', True)
+            )
+            dynamic_path = os.path.join(point_cloud_path, "dynamic_motion.pth")
+            if dynamic_args is not None and getattr(dynamic_args, "dynamic_motion", False) and os.path.exists(dynamic_path):
+                import torch
+                self.gaussians.load_dynamic_state(
+                    torch.load(dynamic_path, map_location="cpu", weights_only=False), dynamic_args
+                )
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 
@@ -148,8 +159,11 @@ class Scene:
                     changed_any = True
             fps = float(getattr(dynamic_args, "fps", 30.0))
             time_scale = float(getattr(dynamic_args, "time_scale", 1.0))
-            normalize_camera_timestamps(self.train_cameras[resolution_scale], fps=fps, time_scale=time_scale)
-            normalize_camera_timestamps(self.test_cameras[resolution_scale], fps=fps, time_scale=time_scale)
+            time_mode = str(getattr(dynamic_args, "motion_time_mode", "seconds"))
+            all_dynamic_cameras = list(self.train_cameras[resolution_scale]) + list(self.test_cameras[resolution_scale])
+            normalize_camera_timestamps(
+                all_dynamic_cameras, fps=fps, time_scale=time_scale, time_mode=time_mode
+            )
         return changed_any
 
     def save(self, iteration):
@@ -175,29 +189,3 @@ class Scene:
 
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
-
-    def getNextTrainCamera(self, camera, scale=1.0):
-        """Return the closest later training camera by timestamp, if available."""
-        cams = self.getTrainCameras(scale)
-        if not cams:
-            return None
-        t = float(getattr(camera, "timestamp", 0.0))
-        cam_id = getattr(camera, "dynamic_camera_id", None)
-        later = [c for c in cams if float(getattr(c, "timestamp", 0.0)) > t + 1e-8 and (cam_id is None or getattr(c, "dynamic_camera_id", None) == cam_id)]
-        if not later:
-            return None
-        later.sort(key=lambda c: float(getattr(c, "timestamp", 0.0)))
-        return later[0]
-
-    def getPrevTrainCamera(self, camera, scale=1.0):
-        """Return the closest earlier training camera by timestamp, if available."""
-        cams = self.getTrainCameras(scale)
-        if not cams:
-            return None
-        t = float(getattr(camera, "timestamp", 0.0))
-        cam_id = getattr(camera, "dynamic_camera_id", None)
-        earlier = [c for c in cams if float(getattr(c, "timestamp", 0.0)) < t - 1e-8 and (cam_id is None or getattr(c, "dynamic_camera_id", None) == cam_id)]
-        if not earlier:
-            return None
-        earlier.sort(key=lambda c: float(getattr(c, "timestamp", 0.0)), reverse=True)
-        return earlier[0]

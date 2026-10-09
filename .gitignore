@@ -65,3 +65,14 @@ patches/
 .gitmodules
 SIBR_viewers/
 submodules/
+
+# Run artifacts written INTO the source tree by tests and tools. These are
+# generated, not authored -- tests/tiny_diffusion_test/ alone is 11 MB of
+# checkpoints and diagnostic PNGs produced by tests/tiny_video_diffusion_test.py.
+tests/tiny_diffusion_test/
+tests/**/*.pt
+tests/**/*.pth
+tests/**/*.zip
+tests/**/*.npy
+tests/**/*.ply
+tests/**/diagnostics/

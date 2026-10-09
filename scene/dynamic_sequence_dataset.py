@@ -1,5 +1,5 @@
 #
-# Dynamic fixed-camera sequence expansion for the adaptive Eulerian 3DGS patch.
+# Fixed-camera video expansion for unified dynamic 3DGS.
 #
 # This module deliberately keeps the canonical 3DGS initialization vanilla:
 # Scene first loads the standard COLMAP dataset from source_path/sparse and
@@ -23,10 +23,11 @@
 
 from __future__ import annotations
 
-import os
+import csv
+import json
 import re
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -35,8 +36,113 @@ from PIL import Image
 from scene.cameras import Camera
 
 
+_TIMESTAMP_TABLE_CACHE: Dict[str, object] = {}
+
+
 def _get_arg(args, name: str, default=None):
     return getattr(args, name, default)
+
+
+def _timestamp_file(root: Path, dyn) -> Optional[Path]:
+    """Resolve an optional real acquisition-timestamp table.
+
+    ``--dynamic_timestamps_file`` accepts JSON or CSV.  When it is omitted,
+    ``ROOT/timestamps.json`` and ``ROOT/metadata/timestamps.json`` are detected
+    automatically.  Falling back to ``frame_id / fps`` remains exact for a
+    constant-rate rendered sequence.
+    """
+    requested = str(_get_arg(dyn, "dynamic_timestamps_file", "") or "").strip()
+    candidates = []
+    if requested:
+        path = Path(requested).expanduser()
+        candidates.append(path if path.is_absolute() else root / path)
+    else:
+        candidates.extend((root / "timestamps.json", root / "metadata" / "timestamps.json"))
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    if requested:
+        raise FileNotFoundError(f"Dynamic timestamp file does not exist: {candidates[0]}")
+    return None
+
+
+def _load_timestamp_table(path: Path):
+    cache_key = str(path)
+    if cache_key in _TIMESTAMP_TABLE_CACHE:
+        return _TIMESTAMP_TABLE_CACHE[cache_key]
+    if path.suffix.lower() == ".json":
+        with path.open("r", encoding="utf-8") as stream:
+            table = json.load(stream)
+    elif path.suffix.lower() in (".csv", ".tsv"):
+        delimiter = "\t" if path.suffix.lower() == ".tsv" else ","
+        rows = []
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            for row in csv.DictReader(stream, delimiter=delimiter):
+                rows.append(row)
+        table = rows
+    else:
+        raise ValueError("Dynamic timestamps must be JSON, CSV or TSV")
+    _TIMESTAMP_TABLE_CACHE[cache_key] = table
+    return table
+
+
+def _frame_key_to_int(value) -> Optional[int]:
+    if isinstance(value, int):
+        return int(value)
+    match = re.search(r"(\d+)$", str(value))
+    return int(match.group(1)) if match else None
+
+
+def _timestamp_from_table(table, camera_id: str, frame_id: int) -> float:
+    """Read common global/per-camera JSON and tabular timestamp layouts."""
+    if isinstance(table, dict):
+        nested = table.get(camera_id, table)
+        if isinstance(nested, list):
+            if frame_id >= len(nested):
+                raise KeyError(frame_id)
+            value = nested[frame_id]
+            if isinstance(value, dict):
+                value = next(
+                    value[key] for key in ("timestamp_seconds", "timestamp", "time")
+                    if key in value
+                )
+            return float(value)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                if _frame_key_to_int(key) == frame_id:
+                    if isinstance(value, dict):
+                        value = next(
+                            value[name]
+                            for name in ("timestamp_seconds", "timestamp", "time")
+                            if name in value
+                        )
+                    return float(value)
+    if isinstance(table, list):
+        if table and not isinstance(table[0], dict):
+            return float(table[frame_id])
+        for row in table:
+            row_camera = str(row.get("camera", row.get("camera_id", camera_id)))
+            row_frame = _frame_key_to_int(row.get("frame", row.get("frame_id", "")))
+            if row_camera == camera_id and row_frame == frame_id:
+                for name in ("timestamp_seconds", "timestamp", "time"):
+                    if name in row and str(row[name]).strip():
+                        return float(row[name])
+    raise KeyError(f"No timestamp for {camera_id} frame {frame_id}")
+
+
+def _physical_timestamp(root: Path, camera_id: str, frame_id: int, dyn) -> float:
+    path = _timestamp_file(root, dyn)
+    if path is None:
+        fps = float(_get_arg(dyn, "fps", 30.0))
+        if fps <= 0.0:
+            raise ValueError("--fps must be positive when no timestamp file is supplied")
+        return float(frame_id) / fps
+    try:
+        return _timestamp_from_table(_load_timestamp_table(path), camera_id, frame_id)
+    except (KeyError, StopIteration) as exc:
+        raise RuntimeError(
+            f"Missing physical timestamp for {camera_id} frame {frame_id} in {path}"
+        ) from exc
 
 
 def infer_dynamic_sequence_root(source_path: str, dyn=None) -> Optional[Path]:
@@ -76,7 +182,7 @@ def dynamic_sequence_available(source_path: str, dyn=None) -> bool:
     root = infer_dynamic_sequence_root(source_path, dyn)
     if root is None:
         return False
-    rgb_dir = _get_arg(dyn, "dynamic_rgb_dir", _get_arg(dyn, "sapien_rgb_dir", "rgb")) if dyn is not None else "rgb"
+    rgb_dir = _get_arg(dyn, "dynamic_rgb_dir", "rgb") if dyn is not None else "rgb"
     return (root / rgb_dir).is_dir() and any((root / rgb_dir).glob("cam_*"))
 
 
@@ -144,14 +250,14 @@ def _compute_resolution_from_args(image: Image.Image, args, resolution_scale: fl
     return int(orig_w / scale), int(orig_h / scale)
 
 
-def _load_depth_for_frame(root: Path, cam_id: str, frame_id: int, image_name: str, resolution: Tuple[int, int], dyn) -> Optional[np.ndarray]:
-    use_depth = bool(_get_arg(dyn, "dynamic_use_depth", _get_arg(dyn, "sapien_use_depth", False)))
+def _load_depth_for_frame(root: Path, cam_id: str, frame_id: int, resolution: Tuple[int, int], dyn) -> Optional[np.ndarray]:
+    use_depth = bool(_get_arg(dyn, "dynamic_use_depth", False))
     if not use_depth:
         return None
 
-    use_npy = bool(_get_arg(dyn, "dynamic_use_depth_npy", _get_arg(dyn, "sapien_use_depth_npy", True)))
-    depth_npy_dir = _get_arg(dyn, "dynamic_depth_npy_dir", _get_arg(dyn, "sapien_depth_npy_dir", "depth_npy"))
-    depth_png_dir = _get_arg(dyn, "dynamic_depth_png_dir", _get_arg(dyn, "sapien_depth_png_dir", "depth_png"))
+    use_npy = bool(_get_arg(dyn, "dynamic_use_depth_npy", True))
+    depth_npy_dir = _get_arg(dyn, "dynamic_depth_npy_dir", "depth_npy")
+    depth_png_dir = _get_arg(dyn, "dynamic_depth_png_dir", "depth_png")
 
     npy_path = root / depth_npy_dir / cam_id / f"frame_{frame_id:06d}.npy"
     png_path = root / depth_png_dir / cam_id / f"frame_{frame_id:06d}.png"
@@ -163,8 +269,14 @@ def _load_depth_for_frame(root: Path, cam_id: str, frame_id: int, image_name: st
         raw = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
         if raw is not None:
             depth = raw.astype(np.float32)
-            # Common 16-bit normalized depth/invdepth convention.
-            if depth.dtype != np.float32 or depth.max(initial=0.0) > 255.0:
+            # Scale 16-bit PNGs only when they encode normalized inverse depth.
+            # Metric depth PNGs commonly store millimetres and must retain that
+            # physical scale before inversion.
+            if (
+                not bool(_get_arg(dyn, "dynamic_depth_is_metric", True))
+                and np.issubdtype(raw.dtype, np.integer)
+                and raw.dtype.itemsize > 1
+            ):
                 depth = depth / float(2 ** 16)
     elif (not use_npy) and npy_path.exists():
         depth = np.load(str(npy_path)).astype(np.float32)
@@ -174,7 +286,7 @@ def _load_depth_for_frame(root: Path, cam_id: str, frame_id: int, image_name: st
     if depth.ndim == 3:
         depth = depth[..., 0]
 
-    metric_depth = bool(_get_arg(dyn, "dynamic_depth_is_metric", _get_arg(dyn, "sapien_depth_is_metric", True)))
+    metric_depth = bool(_get_arg(dyn, "dynamic_depth_is_metric", True))
     if metric_depth:
         valid = depth > 1e-8
         invdepth = np.zeros_like(depth, dtype=np.float32)
@@ -204,9 +316,9 @@ def _dinov3_path_for_frame(root: Path, cam_id: str, frame_id: int, dyn) -> str:
 def _iter_frame_paths(root: Path, rgb_dir: str, cam_id: str, dyn) -> List[Path]:
     cam_dir = root / rgb_dir / cam_id
     paths = sorted(list(cam_dir.glob("*.png")) + list(cam_dir.glob("*.jpg")) + list(cam_dir.glob("*.jpeg")))
-    frame_start = int(_get_arg(dyn, "dynamic_frame_start", _get_arg(dyn, "sapien_frame_start", 0)))
-    frame_end = int(_get_arg(dyn, "dynamic_frame_end", _get_arg(dyn, "sapien_frame_end", -1)))
-    frame_stride = max(1, int(_get_arg(dyn, "dynamic_frame_stride", _get_arg(dyn, "sapien_frame_stride", 1))))
+    frame_start = int(_get_arg(dyn, "dynamic_frame_start", 0))
+    frame_end = int(_get_arg(dyn, "dynamic_frame_end", -1))
+    frame_stride = max(1, int(_get_arg(dyn, "dynamic_frame_stride", 1)))
     out = []
     for p in paths:
         fid = _extract_frame_id(p.name)
@@ -224,7 +336,7 @@ def clone_fixed_camera_for_frame(template_cam, image_path: Path, root: Path, cam
     image = Image.open(str(image_path))
     resolution = _compute_resolution_from_args(image, args, resolution_scale)
     frame_id = _extract_frame_id(image_path.name)
-    invdepthmap = _load_depth_for_frame(root, cam_id, frame_id, image_path.name, resolution, dyn)
+    invdepthmap = _load_depth_for_frame(root, cam_id, frame_id, resolution, dyn)
 
     image_name = f"{cam_id}_{image_path.stem}"
     cam = Camera(
@@ -246,9 +358,18 @@ def clone_fixed_camera_for_frame(template_cam, image_path: Path, root: Path, cam
     )
     cam.dynamic_camera_id = cam_id
     cam.frame_id = frame_id
-    fps = float(_get_arg(dyn, "fps", 30.0))
-    time_scale = float(_get_arg(dyn, "time_scale", 1.0))
-    cam.timestamp = (float(frame_id) / max(fps, 1e-8)) * time_scale
+    raw_seconds = _physical_timestamp(root, cam_id, frame_id, dyn)
+    # Store the physical acquisition time. Scene-level normalization is applied
+    # once, jointly across train and test cameras, according to motion_time_mode.
+    cam.raw_timestamp_seconds = raw_seconds
+    cam.raw_timestamp = raw_seconds
+    cam.timestamp = raw_seconds
+    timestamp_path = _timestamp_file(root, dyn)
+    cam.timestamp_source = (
+        str(timestamp_path)
+        if timestamp_path is not None
+        else f"frame_id/{float(_get_arg(dyn, 'fps', 30.0)):.12g}"
+    )
     cam.original_colmap_image_name = getattr(template_cam, "image_name", "")
     cam.dynamic_image_path = str(image_path)
     cam.dino_feature_path = _dinov3_path_for_frame(root, cam_id, frame_id, dyn)
@@ -266,12 +387,12 @@ def expand_fixed_colmap_cameras_to_dynamic_sequence(train_templates: Sequence, t
     if root is None:
         return list(train_templates), list(test_templates), False
 
-    rgb_dir = _get_arg(dyn, "dynamic_rgb_dir", _get_arg(dyn, "sapien_rgb_dir", "rgb"))
+    rgb_dir = _get_arg(dyn, "dynamic_rgb_dir", "rgb")
     rgb_root = root / rgb_dir
     if not rgb_root.is_dir():
         return list(train_templates), list(test_templates), False
 
-    requested = _get_arg(dyn, "dynamic_cameras", _get_arg(dyn, "sapien_cameras", ""))
+    requested = _get_arg(dyn, "dynamic_cameras", "")
     if requested:
         cam_ids = [c.strip() for c in requested.split(",") if c.strip()]
     else:
@@ -283,7 +404,7 @@ def expand_fixed_colmap_cameras_to_dynamic_sequence(train_templates: Sequence, t
     if missing:
         print(f"[Dynamic sequence] WARNING: no COLMAP camera template found for: {missing}. These cameras will be skipped.")
 
-    test_stride = int(_get_arg(dyn, "dynamic_test_stride", _get_arg(dyn, "sapien_test_stride", 0)))
+    test_stride = int(_get_arg(dyn, "dynamic_test_stride", 0))
     dyn_train = []
     dyn_test = []
     uid = 0

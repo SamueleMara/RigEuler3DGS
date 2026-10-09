@@ -18,6 +18,7 @@ class BasicPointCloud(NamedTuple):
     points : np.array
     colors : np.array
     normals : np.array
+    part_indices : np.array = None
 
 def geom_transform_points(points, transf_matrix):
     P, _ = points.shape

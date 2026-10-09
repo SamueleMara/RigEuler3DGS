@@ -21,8 +21,8 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 try:
-    from diff_gaussian_rasterization import SparseGaussianAdam
-    SPARSE_ADAM_AVAILABLE = True
+    import diff_gaussian_rasterization as _rasterization
+    SPARSE_ADAM_AVAILABLE = hasattr(_rasterization, "SparseGaussianAdam")
 except:
     SPARSE_ADAM_AVAILABLE = False
 

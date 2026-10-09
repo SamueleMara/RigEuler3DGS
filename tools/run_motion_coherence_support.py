@@ -1,0 +1,398 @@
+#!/usr/bin/env python
+"""Run the motion-coherence static/dynamic filter on one scene.
+
+CODEX_IMPLEMENT_MOTION_COHERENCE_STATIC_DYNAMIC_FILTER.md sections 18-20,
+38-40, 44-45.
+
+    Phase 1 free trajectories -> coherence -> static/dynamic -> frozen support
+
+The prediction is written to disk BEFORE any ground truth is read (section 21),
+and the order is enforced by `require_prediction_on_disk`, not by convention.
+The Otsu baseline is evaluated too, but only as a row in the comparison table:
+the two selectors are never unioned, intersected, averaged or voted, and
+neither seeds the other (section 20).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+
+REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+def _csv(path: Path, header, rows):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scene", required=True)
+    ap.add_argument("--model", default=None)
+    ap.add_argument("--source", default=None)
+    ap.add_argument("--frames", type=int, default=60)
+    ap.add_argument("--cameras", type=int, default=8)
+    ap.add_argument("--max-gaussians", type=int, default=0)
+    ap.add_argument("--bootstrap-iters", type=int, default=6)
+    ap.add_argument("--supernode-size", type=int, default=64)
+    ap.add_argument("--coherence-knn", type=int, default=12,
+                    help="section 4: ONE global default for every dataset; "
+                         "do not tune it per scene")
+    ap.add_argument("--phase1-centers", default=None,
+                    help="reuse an existing phase1/centers directory instead "
+                         "of re-running Phase 1")
+    ap.add_argument("--frames-on-cpu", action="store_true")
+    ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
+                    help="v2 = section 11-19 coherent-component extraction "
+                         "(default); ncut = the superseded two-way normalized "
+                         "cut, kept only for comparison")
+    ap.add_argument("--cv-folds", type=int, default=5)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", default=None)
+    args = ap.parse_args()
+
+    model, source = args.model, args.source
+    if model is None or source is None:
+        from tools.run_all_datasets import discover
+        for rec in discover(REPO):
+            if rec["scene"] == args.scene:
+                model = model or str(rec["model"])
+                source = source or str(rec["source"])
+                break
+    out = Path(args.out or f"output/motion_coherence_{args.scene}")
+    (out / "numerical").mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    print(f"=== MOTION COHERENCE: {args.scene} ===")
+
+    from estimator.motion_coherence_support import (
+        UNRESOLVED, propagate_to_gaussians, run_motion_coherence)
+    from estimator.supernodes import build_supernodes
+
+    # ---- section 48 step 2: Phase-1 free trajectories --------------------
+    # This branch is renderer-independent by construction: it reads only the
+    # Phase-1 free trajectories. When those are already on disk nothing here
+    # needs CUDA, the 3DGS model or the cameras -- frame 0 of the trajectory
+    # IS the canonical state. That is not a convenience; a filter whose claim
+    # is about trajectory geometry should be runnable, and testable, without
+    # the renderer it is meant to be independent of.
+    positions, mu0, ncam = None, None, args.cameras
+    if args.phase1_centers:
+        d = Path(args.phase1_centers)
+        files = sorted(d.glob("centers_frame_*.npy"))[: args.frames or None]
+        if not files:
+            raise SystemExit(f"no centers_frame_*.npy under {d}")
+        positions = [torch.from_numpy(np.load(f)).double() for f in files]
+        mu0 = positions[0].clone()
+        print(f"  reusing {len(positions)} Phase-1 center frames from {d}"
+              f"  ({mu0.shape[0]} Gaussians, no renderer needed)")
+    if positions is None:
+        from estimator.sparse_iekf import IEKFConfig
+        from tools.run_iekf_scene import (dataset_rgbd_frames, load_scene,
+                                          state_from_gaussians)
+        dataset, pipe, gaussians, sc = load_scene(model, source)
+        cams_all = sc.getTrainCameras()
+        ncam = min(args.cameras, len(cams_all))
+        truth = state_from_gaussians(gaussians)
+        if args.max_gaussians and truth.mu.shape[0] > args.max_gaussians:
+            import dataclasses
+            g = torch.Generator().manual_seed(args.seed)
+            keep = torch.randperm(
+                truth.mu.shape[0],
+                generator=g)[:args.max_gaussians].sort().values
+            truth = dataclasses.replace(
+                truth, mu=truth.mu[keep], R=truth.R[keep], v=truth.v[keep],
+                omega=truth.omega[keep], colors=truth.colors[keep],
+                opacity=truth.opacity[keep], scales=truth.scales[keep])
+        mu0 = truth.mu.double()
+        cfg = IEKFConfig()
+        print(f"  {mu0.shape[0]} Gaussians, {ncam} cameras")
+        from tools.kpart_pipeline import bootstrap_positions
+
+        ns = argparse.Namespace(
+            sequence_start=0, sequence_length=args.frames, all_frames=False,
+            observation_source="dataset_rgbd", cameras=ncam,
+            bootstrap_iters=args.bootstrap_iters,
+            supernode_size=args.supernode_size, seed=args.seed,
+            frames_on_cpu=bool(args.frames_on_cpu),
+            frames_on_gpu=not args.frames_on_cpu, depth_sigma=None,
+            joint_direct_rgbd=False, joint_direct_gaussian=False,
+            window_length=0, all_cameras=False, dt=1.0 / 30.0,
+            max_gaussians=args.max_gaussians, no_model_error=False,
+            model_error_beta=1.0, model_error_blur=1)
+        frames_raw, frame_ids = dataset_rgbd_frames(cams_all[:ncam], cfg, ns,
+                                                    truth, Path(source))
+        cameras = frames_raw[0][1]
+        window = [(ob, fid) for (ob, _s, _d), fid
+                  in zip(frames_raw, frame_ids["frames"])]
+        print(f"  Phase 1 over {len(window)} frames ...")
+        positions, _info = bootstrap_positions(truth, cameras, window, cfg,
+                                               None, ns, verbose=True)
+        cdir = out / "phase1_centers"
+        cdir.mkdir(parents=True, exist_ok=True)
+        for t, p in enumerate(positions):
+            np.save(cdir / f"centers_frame_{t:04d}.npy",
+                    torch.as_tensor(p).double().cpu().numpy())
+
+    # ---- sections 3-17: the coherence branch -----------------------------
+    mu0 = mu0.double().cpu()
+    part = build_supernodes(mu0.float(), target_size=args.supernode_size,
+                            seed=args.seed)
+    sid = part.supernode_id.long().cpu()
+    print(f"  {int(sid.max()) + 1} supernodes (target size "
+          f"{args.supernode_size})")
+    res = run_motion_coherence(positions, sid, knn=args.coherence_knn,
+                               verbose=True)
+
+    # ---- sections 11-19: replace the two-way Ncut ------------------------
+    if args.extractor == "v2":
+        from estimator.coherence_extraction import (
+            MOVING_RIGID, NO_MOVING, extract_moving_component)
+        from estimator.motion_coherence_support import supernode_trajectories
+        sn = supernode_trajectories(positions, sid)
+        traj_nodes = sn["trajectories"][:, res["node_ids"], :]
+        ex = extract_moving_component(
+            traj_nodes, res["edge_i"], res["edge_j"], res["C"],
+            res["num_supernodes"], folds=args.cv_folds, verbose=True)
+        res["extraction"] = ex
+        res["status"] = ex["status"]
+        res["dynamic_nodes"] = res["node_ids"][ex["moving_nodes"]] \
+            if ex["moving_nodes"].numel() else torch.zeros(0, dtype=torch.long)
+        keep = torch.tensor([l != MOVING_RIGID for l in ex["labels"]])
+        res["static_nodes"] = res["node_ids"][keep]
+        res["node_class"] = ex["labels"]
+        print(f"    extraction: {ex['status']}  {ex['counts']}")
+        if ex["status"] != NO_MOVING:
+            sel = next(c for c in ex["candidates"]
+                       if c["candidate_id"] == ex["selection"]["selected"])
+            r, rw = sel["rigidity"], sel["rigidity_world"]
+            print(f"    selected candidate {sel['candidate_id']}: "
+                  f"{sel['num_members']} nodes, persistence "
+                  f"{sel['persistence']:.4f}, eta_cv(rel) {r['eta_cv']:.4f}, "
+                  f"dRSS_world {rw['delta_rss_cv']:.4e}, "
+                  f"dBIC(rel) {r['delta_bic']:.3e}")
+        else:
+            print(f"    {ex['selection']['reason']}")
+    status = res["status"]
+    print(f"  status: {status}")
+    for k, c in enumerate(res["components"]):
+        tag = ""
+        if status != UNRESOLVED:
+            tag = (" DYNAMIC" if k == res["identification"]["dynamic_component"]
+                   else " STATIC")
+        print(f"    component {k}{tag}: {c['num_nodes']} nodes  "
+              f"E_rigid {c['E_rigid']:.4e}  E_identity {c['E_identity']:.4e}  "
+              f"gain {c['gain']:.4e}")
+
+    dyn_g = propagate_to_gaussians(res["dynamic_nodes"], sid)
+    sta_g = propagate_to_gaussians(res["static_nodes"], sid)
+
+    # ---- section 40: the prediction, written BEFORE any GT ---------------
+    pred_path = out / "predicted_support.json"
+    pred_path.write_text(json.dumps({
+        "method": res["method"],
+        "status": status,
+        "num_supernodes": res["num_supernodes"],
+        "num_gaussians": int(mu0.shape[0]),
+        "static_supernodes": res["static_nodes"].tolist(),
+        "dynamic_supernodes": res["dynamic_nodes"].tolist(),
+        "static_gaussians": sta_g.tolist(),
+        "dynamic_gaussians": dyn_g.tolist(),
+        "predicted_dynamic_fraction": float(dyn_g.numel()) / max(int(mu0.shape[0]), 1),
+        "graph_config": {**res["graph"], "coherence_knn": args.coherence_knn,
+                         "supernode_target_size": args.supernode_size},
+        "component_stats": [{k: v for k, v in c.items() if k != "per_frame"}
+                            for c in res["components"]],
+        "identification": res["identification"],
+        "cut": res["cut"],
+        "note": ("sections 0, 40: inferred from trajectory metric coherence "
+                 "ALONE. No Otsu, no displacement threshold, no RGB residual, "
+                 "no semantics, no joint type, no GT."),
+    }, indent=1, default=str))
+    (out / "config.json").write_text(json.dumps({
+        "scene": args.scene, "model": model, "source": source,
+        "frames": len(positions), "cameras": ncam,
+        "gaussians": int(mu0.shape[0]),
+        "coherence_knn": args.coherence_knn,
+        "supernode_target_size": args.supernode_size,
+        "seed": args.seed,
+        "weight_convention": "uniform w_i = 1",
+    }, indent=1))
+
+    # ---- section 25/26: per-edge and per-node debug -----------------------
+    ei, ej, C, J = res["edge_i"], res["edge_j"], res["C"], res["J"]
+    lab = res["labels"]
+    _csv(out / "numerical" / "edges.csv",
+         ["edge_id", "node_i", "node_j", "canonical_distance", "C_rigid",
+          "J_jitter", "same_predicted_component"],
+         [[e, int(ei[e]), int(ej[e]), float(res["canonical_distance"][e]),
+           float(C[e]), float(J[e]), int(lab[ei[e]] == lab[ej[e]])]
+          for e in range(int(ei.numel()))])
+    amb = res["ambiguity"]
+    _csv(out / "numerical" / "nodes.csv",
+         ["node", "supernode", "label", "predicted_class", "C_in", "C_out",
+          "margin", "ambiguous"],
+         [[i, int(res["node_ids"][i]), int(lab[i]),
+           ("DYNAMIC" if status != UNRESOLVED
+            and int(lab[i]) == res["identification"]["dynamic_component"]
+            else "STATIC" if status != UNRESOLVED else "UNRESOLVED"),
+           float(amb["C_in"][i]), float(amb["C_out"][i]),
+           float(amb["margin"][i]), int(bool(amb["ambiguous"][i]))]
+          for i in range(res["num_supernodes"])])
+    (out / "numerical" / "components.json").write_text(json.dumps(
+        {"status": status, "identification": res["identification"],
+         "components": res["components"], "cut": res["cut"],
+         "length_scale": res["length_scale"]}, indent=1, default=str))
+    # section 10: the whole temporal signal
+    sub = torch.argsort(C)[:: max(1, int(ei.numel()) // 4000)]
+    np.savez_compressed(
+        out / "numerical" / "edge_strain_timeseries.npz",
+        edge_i=ei.numpy(), edge_j=ej.numpy(),
+        C_edge=C.numpy(), J_edge=J.numpy(),
+        subset=sub.numpy(),
+        z=res["z"][:, sub].numpy().astype(np.float32),
+        epsilon=res["epsilon"][:, sub].numpy().astype(np.float32))
+
+    # ---- sections 27-33: debug pages -------------------------------------
+    from debug.motion_coherence_debug import (
+        write_differential_strain_heatmap, write_finite_strain_heatmap,
+        write_representative_edges, write_support_3d)
+    dbg = out / "debug"
+    write_finite_strain_heatmap(dbg / "finite_strain_heatmap.html", res)
+    write_differential_strain_heatmap(dbg / "differential_strain_heatmap.html", res)
+    write_representative_edges(dbg / "representative_edges.html", res)
+    if res.get("extraction"):
+        from debug.motion_coherence_debug import write_candidate_tree
+        write_candidate_tree(dbg / "coherence_component_tree.html",
+                             res["extraction"],
+                             f"{args.scene} — coherence candidate tree")
+
+    # ======================================================================
+    # EVALUATION ONLY from here. GT has not been touched above.
+    # ======================================================================
+    from estimator.motion_coherence_eval import (
+        classification_metrics, compare_selectors, gt_edge_coherence,
+        load_static_dynamic_gt, require_prediction_on_disk, write_json)
+
+    (out / "evaluation").mkdir(parents=True, exist_ok=True)
+    require_prediction_on_disk(pred_path)          # section 21 order guard
+    from estimator.optimized_gt import (NOT_FOUND, compare_with_sparse_nn,
+                                        load_optimized_gt, supernode_gt)
+    # Sections 2-6: the optimized labelled 3DGS model is the PRIMARY GT.
+    gt = load_optimized_gt(model, mu0)
+    sparse = load_static_dynamic_gt(source, mu0)
+    if gt.get("status") == NOT_FOUND:
+        # Section 5: do not silently call sparse-NN labels ground truth.
+        write_json(out / "evaluation" / "optimized_3dgs_gt.json", gt)
+        print(f"  {NOT_FOUND}: {gt.get('reason')}")
+        gt = {"available": False, "reason": NOT_FOUND}
+    else:
+        np.save(out / "evaluation" / "optimized_3dgs_gt_labels.npy",
+                gt["labels"].numpy())
+        write_json(out / "evaluation" / "optimized_3dgs_gt.json",
+                   {k: v for k, v in gt.items() if k != "labels"})
+        if sparse.get("available"):
+            write_json(out / "evaluation" / "sparse_nn_vs_optimized.json",
+                       compare_with_sparse_nn(gt["labels"], sparse["labels"]))
+        write_json(out / "numerical" / "supernode_gt.json",
+                   supernode_gt(gt["labels"], sid))
+    ev = out / "evaluation"
+    rows = []
+    gt_node = None
+
+    # Section 24: the Otsu baseline. It reads the SAME Phase-1 trajectories the
+    # coherence extractor read and nothing else -- it is not seeded by, and
+    # does not seed, the coherence support.
+    from estimator.moving_support import select_moving_support
+    base = select_moving_support(positions)
+    pred_base = torch.zeros(mu0.shape[0], dtype=torch.bool)
+    pred_base[base["members"]] = True
+    pred_dyn = torch.zeros(mu0.shape[0], dtype=torch.bool)
+    pred_dyn[dyn_g] = True
+    m_coh = m_base = None
+
+    if gt.get("available"):
+        gtl = gt["labels"]
+        write_json(out / "numerical" / "gt_mapping.json",
+                   {k: v for k, v in gt.items() if k != "labels"})
+        print(f"  GT: {gt['mapping_method']} from {gt['iteration']}, "
+              f"{100 * gt['gt_dynamic_fraction']:.1f}% dynamic, "
+              f"alignment {gt['alignment'].get('max_alignment_error', 0):.1e}")
+        m_coh = classification_metrics(pred_dyn, gtl)
+        m_base = classification_metrics(pred_base, gtl)
+        for name, m in (("current", m_base), ("coherence", m_coh)):
+            rows.append({"scene": args.scene, "selector": name, **m})
+            print(f"  [{name:>9}] dyn P {m['dynamic_precision']:.3f} "
+                  f"R {m['dynamic_recall']:.3f} F1 {m['dynamic_f1']:.3f} "
+                  f"IoU {m['dynamic_iou']:.3f} balAcc "
+                  f"{m['balanced_accuracy']:.3f}  pred dyn "
+                  f"{100 * m['predicted_dynamic_fraction']:.1f}% "
+                  f"(GT {100 * m['gt_dynamic_fraction']:.1f}%)")
+        write_json(ev / "confusion_matrix.json",
+                   {"coherence": m_coh["confusion_matrix"],
+                    "current": m_base["confusion_matrix"]})
+        write_json(ev / "current_vs_coherence.json", compare_selectors(rows))
+        write_json(out / "numerical" / "gt_metrics.json",
+                   {"coherence": m_coh, "current": m_base})
+
+        # section 35: is GT itself coherent?
+        gt_node = torch.full((res["num_supernodes"],), -1, dtype=torch.long)
+        for i in range(res["num_supernodes"]):
+            mem = torch.nonzero(sid == int(res["node_ids"][i]),
+                                as_tuple=False).reshape(-1)
+            l = gtl[mem]
+            l = l[l >= 0]
+            if l.numel():
+                gt_node[i] = int(l.double().mean().round())
+        write_json(ev / "gt_coherence.json",
+                   gt_edge_coherence(C, ei, ej, gt_node, lab))
+    else:
+        print(f"  no GT available: {gt.get('reason')}")
+        write_json(out / "numerical" / "gt_mapping.json", gt)
+
+    # Section 24: the two selectors on the same Gaussians, in 3D, over the
+    # Phase-1 trajectories -- so a point called STATIC that visibly travels is
+    # a false negative you can see rather than one you have to infer.
+    from debug.motion_coherence_debug import write_selector_comparison_3d
+    gt_vec = (gt["labels"] if gt.get("available")
+              else torch.full((mu0.shape[0],), -1, dtype=torch.long))
+    sel3d = write_selector_comparison_3d(
+        dbg / "static_dynamic_comparison_3d.html", mu0, positions,
+        gt_vec, pred_base, pred_dyn,
+        metrics=({"current": m_base, "coherence": m_coh}
+                 if m_base and m_coh else {}),
+        title=f"{args.scene} — static/dynamic: motion baseline vs coherence")
+
+    if res.get("node_class"):
+        res["node_class_counts"] = res["extraction"]["counts"]
+    write_support_3d(dbg / "motion_coherence_support_3d.html", res,
+                     node_xyz=torch.stack([
+                         mu0.cpu()[sid == int(res["node_ids"][i])].mean(0)
+                         for i in range(res["num_supernodes"])]),
+                     traj=None, gt_node=gt_node,
+                     title=f"{args.scene} — motion coherence support")
+
+    print(f"\n  === {args.scene} DONE in {time.perf_counter() - t0:.1f}s ===")
+    print(f"  {out}")
+    print(f"  3D A/B   {sel3d}")
+    print(f"  3D       {dbg / 'motion_coherence_support_3d.html'}")
+    print(f"  heatmaps {dbg / 'finite_strain_heatmap.html'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

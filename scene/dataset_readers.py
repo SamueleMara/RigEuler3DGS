@@ -117,13 +117,80 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
     sys.stdout.write('\n')
     return cam_infos
 
-def fetchPly(path):
+def _load_matching_part_indices(path, positions):
+    """Load exact sparse GT part labels for a COLMAP PLY when the dataset has them.
+
+    The SAPIEN/processed inputs keep semantic part labels in
+    ``<scene>/pointcloud/points3D_parts.ply`` while the 3DGS loader reads
+    ``<scene>/colmap/sparse/0/points3D.ply``.  For correct Gaussian lineage we
+    attach the part labels at initialization, before clone/split densification.
+    """
+    prop_names = None
+    try:
+        plydata = PlyData.read(path)
+        vertices = plydata["vertex"]
+        if "part" in {p.name for p in vertices.properties}:
+            return np.asarray(vertices["part"], dtype=np.int64)
+    except Exception:
+        return None
+
+    ply_path = Path(path).resolve()
+    candidates = [ply_path.with_name("points3D_parts.ply")]
+    for parent in ply_path.parents:
+        candidates.append(parent / "pointcloud" / "points3D_parts.ply")
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen or not candidate.exists():
+            continue
+        seen.add(candidate)
+        try:
+            part_ply = PlyData.read(candidate)
+            part_vertices = part_ply["vertex"]
+            part_props = {p.name for p in part_vertices.properties}
+            if "part" not in part_props:
+                continue
+            part_xyz = np.vstack(
+                [part_vertices["x"], part_vertices["y"], part_vertices["z"]]
+            ).T.astype(np.float32)
+            parts = np.asarray(part_vertices["part"], dtype=np.int64)
+        except Exception:
+            continue
+        if part_xyz.shape[0] != positions.shape[0]:
+            continue
+        ordered_error = np.linalg.norm(part_xyz - positions, axis=1)
+        if ordered_error.size > 0 and float(ordered_error.max()) <= 1.0e-4:
+            print(f"[GT parts] attached sparse part labels from {candidate}")
+            return parts
+
+        # Last safe fallback: same point set, different order.  This remains
+        # exact only when every nearest sparse point is unique and within the
+        # same numerical tolerance.
+        if positions.shape[0] > 10000:
+            continue
+        diff = positions[:, None, :] - part_xyz[None, :, :]
+        dist2 = np.sum(diff * diff, axis=-1)
+        nn = np.argmin(dist2, axis=1)
+        nn_dist = np.sqrt(dist2[np.arange(dist2.shape[0]), nn])
+        if float(nn_dist.max()) <= 1.0e-4 and np.unique(nn).size == positions.shape[0]:
+            print(f"[GT parts] attached reordered sparse part labels from {candidate}")
+            return parts[nn]
+    return None
+
+
+def fetchPly(path, load_gt_parts=True):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
-    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+    prop_names = {p.name for p in vertices.properties}
+    if {"nx", "ny", "nz"}.issubset(prop_names):
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(positions)
+    part_indices = (_load_matching_part_indices(path, positions.astype(np.float32))
+                    if load_gt_parts else None)
+    return BasicPointCloud(points=positions, colors=colors, normals=normals, part_indices=part_indices)
 
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
@@ -142,7 +209,7 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, load_gt_parts=True):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -213,7 +280,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
     try:
-        pcd = fetchPly(ply_path)
+        pcd = fetchPly(ply_path, load_gt_parts=load_gt_parts)
     except:
         pcd = None
 

@@ -32,7 +32,6 @@ import os
 import collections
 import numpy as np
 import struct
-import argparse
 
 
 CameraModel = collections.namedtuple(

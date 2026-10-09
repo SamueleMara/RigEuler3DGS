@@ -12,6 +12,7 @@
 import torch
 import torch.nn.functional as F
 from pathlib import Path
+import re
 import numpy as np
 from PIL import Image
 from torch.autograd import Variable
@@ -114,20 +115,35 @@ def _dino_root_for_train(dataset, dyn):
     return root / getattr(dyn, "dinov3_root", "dinov3")
 
 
-def _read_dino_feature_tensor(path):
-    obj = torch.load(str(path), map_location="cpu")
+def _read_feature_tensor(path, *, family="feature"):
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        data = np.load(str(path))
+        for key in ("features", family, "feature", "feat", "embedding"):
+            if key in data:
+                obj = torch.from_numpy(data[key])
+                break
+        else:
+            first = data.files[0] if data.files else None
+            if first is None:
+                raise RuntimeError(f"{family} npz file is empty: {path}")
+            obj = torch.from_numpy(data[first])
+    elif path.suffix.lower() == ".npy":
+        obj = torch.from_numpy(np.load(str(path)))
+    else:
+        obj = torch.load(str(path), map_location="cpu", weights_only=False)
     if isinstance(obj, dict):
-        for key in ("features", "dino", "dino_feat", "feature", "feat"):
+        for key in ("features", family, f"{family}_feat", "feature", "feat", "embedding"):
             if key in obj:
                 obj = obj[key]
                 break
     if not torch.is_tensor(obj):
-        raise RuntimeError(f"DINO feature file has unsupported object type: {type(obj)!r}")
+        raise RuntimeError(f"{family} feature file has unsupported object type: {type(obj)!r}")
     feat = obj.float()
     if feat.ndim == 4:
         feat = feat[0]
     if feat.ndim != 3:
-        raise RuntimeError(f"DINO feature map must be [C,H,W] or [1,C,H,W], got {tuple(feat.shape)}")
+        raise RuntimeError(f"{family} feature map must be [C,H,W] or [1,C,H,W], got {tuple(feat.shape)}")
     # If stored as H,W,C, move channels first.
     if feat.shape[0] > feat.shape[-1] and feat.shape[-1] <= 4096:
         # Ambiguous; DINO maps are usually C,H,W with C large and H/W small.
@@ -135,6 +151,10 @@ def _read_dino_feature_tensor(path):
     elif feat.shape[-1] > feat.shape[0] and feat.shape[0] <= 256 and feat.shape[1] <= 256:
         feat = feat.permute(2, 0, 1).contiguous()
     return feat
+
+
+def _read_dino_feature_tensor(path):
+    return _read_feature_tensor(path, family="dino")
 
 
 def _mask_root_for_train(dataset, dyn):
@@ -158,6 +178,25 @@ def _mask_path_for_camera(viewpoint_cam, dataset, dyn):
             p = mask_root / imgp.parent.name / (imgp.stem + ext)
             if p.exists():
                 return p
+    # Canonical COLMAP images normally represent frame zero.  Accept both
+    # nested names (cam_000/frame_000000) and flattened names
+    # (cam_000_frame_000000) so Phase 0 supervises the same semantic foreground
+    # used by soft discovery and later hard joint fitting.
+    name = str(getattr(viewpoint_cam, "image_name", ""))
+    cam_match = re.search(r"cam_\d+", name)
+    frame_match = re.search(r"frame[_-]?(\d+)", name)
+    if cam_match is not None:
+        cam_id = cam_match.group(0)
+        frame_id = int(frame_match.group(1)) if frame_match is not None else 0
+        stem = Path(name).stem
+        for ext in (".png", ".jpg", ".jpeg"):
+            for p in (
+                mask_root / cam_id / f"frame_{frame_id:06d}{ext}",
+                mask_root / cam_id / f"{stem}{ext}",
+                mask_root / f"{stem}{ext}",
+            ):
+                if p.exists():
+                    return p
     # Static COLMAP fallback: mask directory mirrors image name.
     image_name = getattr(viewpoint_cam, "image_name", "")
     if image_name:
@@ -184,110 +223,6 @@ def _load_mask_for_view(viewpoint_cam, dataset, dyn, hw, device="cuda"):
     mask = torch.from_numpy(arr).to(device=device)
     mask = F.interpolate(mask[None, None], size=hw, mode="nearest")[0, 0]
     return mask.clamp(0, 1)
-
-
-def dice_loss(pred, target, eps=1e-6):
-    pred = pred.reshape(-1)
-    target = target.reshape(-1)
-    inter = (pred * target).sum()
-    return 1.0 - (2.0 * inter + eps) / (pred.sum() + target.sum() + eps)
-
-
-def _gaussian_rgb_for_affinity(gaussians):
-    """Return a detached color descriptor [N,3] for color-aware local smoothing."""
-    try:
-        dc = gaussians.get_features_dc.detach()
-    except Exception:
-        return None
-    if dc.ndim == 3:
-        # GraphDeCo stores DC as [N,1,3]. Be robust to [N,3,1].
-        if dc.shape[1] == 1 and dc.shape[2] == 3:
-            dc = dc[:, 0, :]
-        elif dc.shape[1] == 3 and dc.shape[2] == 1:
-            dc = dc[:, :, 0]
-        else:
-            dc = dc.reshape(dc.shape[0], -1)[:, :3]
-    elif dc.ndim == 2:
-        dc = dc[:, :3]
-    else:
-        return None
-    # Only an affinity cue is needed. Sigmoid bounds SH-DC values and keeps the
-    # color distance numerically stable without backpropagating through color.
-    return torch.sigmoid(dc.float()).detach()
-
-
-def gaussian_aux_3d_smoothness(
-    xyz,
-    field,
-    colors=None,
-    mode="cosine",
-    k=8,
-    max_points=2048,
-    sigma_x=-1.0,
-    sigma_c=0.25,
-):
-    """Weak local 3D smoothness for auxiliary Gaussian fields.
-
-    Affinity:
-      a_ij = exp(-||mu_i-mu_j||^2/sigma_x^2) exp(-||c_i-c_j||^2/sigma_c^2)
-
-    Geometry/color only define the detached neighbourhood weights. Gradients
-    flow only into `field`, so semantic smoothness trains semantic logits only
-    and DINO smoothness trains DINO features only.
-    """
-    if field is None or field.numel() == 0:
-        return None
-    if xyz is None or xyz.numel() == 0:
-        return None
-    n = int(field.shape[0])
-    if n < 2:
-        return None
-    k = max(1, min(int(k), n - 1))
-    m = min(int(max_points), n) if int(max_points) > 0 else n
-    device = field.device
-    if m < n:
-        idx = torch.randperm(n, device=device)[:m]
-    else:
-        idx = torch.arange(n, device=device)
-
-    xyz_s = xyz.detach()[idx].float()
-    field_s = field[idx].float()
-    with torch.no_grad():
-        dist = torch.cdist(xyz_s, xyz_s, p=2)
-        dist.fill_diagonal_(float("inf"))
-        knn_dist, knn = torch.topk(dist, k=k, largest=False, dim=1)
-        if float(sigma_x) > 0:
-            sx = torch.tensor(float(sigma_x), device=device, dtype=knn_dist.dtype)
-        else:
-            finite = knn_dist[torch.isfinite(knn_dist)]
-            sx = finite.median() if finite.numel() else torch.tensor(1.0, device=device, dtype=knn_dist.dtype)
-            sx = sx.clamp_min(1e-6)
-        weights = torch.exp(-(knn_dist ** 2) / (sx ** 2 + 1e-12))
-
-        if colors is not None and float(sigma_c) > 0:
-            col_s = colors.detach()[idx].float()
-            col_j = col_s[knn]
-            col_i = col_s[:, None, :]
-            cd2 = ((col_i - col_j) ** 2).sum(dim=-1)
-            weights = weights * torch.exp(-cd2 / (float(sigma_c) ** 2 + 1e-12))
-        weights = weights.detach()
-
-    if mode == "semantic":
-        if field_s.ndim == 2 and field_s.shape[1] == 1:
-            values = torch.sigmoid(field_s[:, 0])
-        else:
-            values = torch.sigmoid(field_s.reshape(field_s.shape[0], -1)[:, 0])
-        vi = values[:, None]
-        vj = values[knn]
-        pair_loss = F.smooth_l1_loss(vi.expand_as(vj), vj, reduction="none")
-    else:
-        z = F.normalize(field_s, dim=-1)
-        zi = z[:, None, :]
-        zj = z[knn]
-        pair_loss = 1.0 - (zi * zj).sum(dim=-1).clamp(-1.0, 1.0)
-
-    denom = weights.sum().clamp_min(1e-6)
-    return (weights * pair_loss).sum() / denom
 
 
 def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
@@ -336,93 +271,252 @@ def semantic_feature_field_loss(viewpoint_cam, gaussians, pipe, dataset, dyn):
     if valid.sum() < 16:
         return None, {"semantic_valid_pixels": float(valid.sum().item())}
 
-    loss_type = str(getattr(dyn, "semantic_loss_type", "bce"))
     bce_map = F.binary_cross_entropy(pred, target, reduction="none")
     weight = alpha * valid.float()
     denom = weight.sum().clamp_min(1e-6)
     bce = (weight * bce_map).sum() / denom
 
-    # Optional dice branch is also alpha-weighted if selected.
-    pred_w = pred * weight
-    target_w = target * weight
-    dice = 1.0 - (2.0 * (pred_w * target).sum() + 1e-6) / (pred_w.sum() + target_w.sum() + 1e-6)
-
-    if loss_type == "dice":
-        pixel_loss = dice
-    elif loss_type == "bce_dice":
-        pixel_loss = bce + dice
-    else:
-        pixel_loss = bce
-
-    smooth_loss = None
-    lambda_smooth = float(getattr(dyn, "lambda_semantic_3d_smooth", 0.0))
-    if lambda_smooth > 0:
-        smooth_loss = gaussian_aux_3d_smoothness(
-            xyz=gaussians.get_canonical_xyz,
-            field=gaussians.get_semantic_logits,
-            colors=_gaussian_rgb_for_affinity(gaussians),
-            mode="semantic",
-            k=int(getattr(dyn, "smooth_3d_knn", 8)),
-            max_points=int(getattr(dyn, "smooth_3d_max_points", 2048)),
-            sigma_x=float(getattr(dyn, "smooth_3d_sigma_x", -1.0)),
-            sigma_c=float(getattr(dyn, "smooth_3d_sigma_c", 0.25)),
-        )
-
-    loss = pixel_loss if smooth_loss is None else pixel_loss + lambda_smooth * smooth_loss
-    return loss, {
-        "L_semantic_feature_field": float(loss.detach().item()),
+    return bce, {
+        "L_semantic_feature_field": float(bce.detach().item()),
         "semantic_bce": float(bce.detach().item()),
-        "semantic_dice": float(dice.detach().item()),
         "semantic_valid_pixels": float(valid.sum().item()),
         "semantic_mean_alpha": float(alpha[valid].mean().detach().item()) if valid.any() else 0.0,
-        "L_semantic_3d_smooth": float(smooth_loss.detach().item()) if smooth_loss is not None else 0.0,
     }
 
 
 def _dino_feature_path_for_camera(viewpoint_cam, dataset, dyn):
     dino_root = _dino_root_for_train(dataset, dyn)
+    extension = str(getattr(dyn, "dinov3_feature_ext", ".pt"))
+    if not extension.startswith("."):
+        extension = "." + extension
     cam_id = getattr(viewpoint_cam, "dynamic_camera_id", None)
     frame_id = getattr(viewpoint_cam, "frame_id", None)
     if cam_id is not None and frame_id is not None:
-        p = dino_root / str(cam_id) / f"frame_{int(frame_id):06d}.pt"
+        p = dino_root / str(cam_id) / f"frame_{int(frame_id):06d}{extension}"
         if p.exists():
             return p
     # Fallback from dynamic_image_path: ROOT/rgb/cam_XXX/frame_XXXXXX.png -> ROOT/dinov3/cam_XXX/frame_XXXXXX.pt
     img = getattr(viewpoint_cam, "dynamic_image_path", "")
     if img:
         imgp = Path(img)
-        p = dino_root / imgp.parent.name / (imgp.stem + ".pt")
+        p = dino_root / imgp.parent.name / (imgp.stem + extension)
         if p.exists():
             return p
+    name = str(getattr(viewpoint_cam, "image_name", ""))
+    cam_match = re.search(r"cam_\d+", name)
+    frame_match = re.search(r"frame[_-]?(\d+)", name)
+    if cam_match is not None:
+        cam_id = cam_match.group(0)
+        frame_id = int(frame_match.group(1)) if frame_match is not None else 0
+        stem = Path(name).stem
+        for p in (
+            dino_root / cam_id / f"frame_{frame_id:06d}{extension}",
+            dino_root / cam_id / f"{stem}{extension}",
+            dino_root / f"{stem}{extension}",
+        ):
+            if p.exists():
+                return p
     return None
+
+
+def _sam3_root_for_train(dataset, dyn):
+    requested = str(getattr(dyn, "sam3_feature_root", "") or "").strip()
+    if requested:
+        path = Path(requested).expanduser()
+        return path if path.is_absolute() else (_dynamic_root_for_train(dataset, dyn) / path)
+    return _dynamic_root_for_train(dataset, dyn) / "sam3"
+
+
+def _sam3_feature_path_for_camera(viewpoint_cam, dataset, dyn):
+    sam3_root = _sam3_root_for_train(dataset, dyn)
+    extensions = (".pt", ".pth", ".npz", ".npy")
+    cam_id = getattr(viewpoint_cam, "dynamic_camera_id", None)
+    frame_id = getattr(viewpoint_cam, "frame_id", None)
+    if cam_id is not None and frame_id is not None:
+        for ext in extensions:
+            p = sam3_root / str(cam_id) / f"frame_{int(frame_id):06d}{ext}"
+            if p.exists():
+                return p
+    img = getattr(viewpoint_cam, "dynamic_image_path", "")
+    if img:
+        imgp = Path(img)
+        for ext in extensions:
+            p = sam3_root / imgp.parent.name / (imgp.stem + ext)
+            if p.exists():
+                return p
+    name = str(getattr(viewpoint_cam, "image_name", ""))
+    cam_match = re.search(r"cam_\d+", name)
+    frame_match = re.search(r"frame[_-]?(\d+)", name)
+    if cam_match is not None:
+        cam_id = cam_match.group(0)
+        frame_id = int(frame_match.group(1)) if frame_match is not None else 0
+        stem = Path(name).stem
+        for ext in extensions:
+            for p in (
+                sam3_root / cam_id / f"frame_{frame_id:06d}{ext}",
+                sam3_root / cam_id / f"{stem}{ext}",
+                sam3_root / f"{stem}{ext}",
+            ):
+                if p.exists():
+                    return p
+    return None
+
+
+_DINO_TARGET_CACHE = {}
+_SAM3_TARGET_CACHE = {}
 
 
 def _load_dino_target_for_view(viewpoint_cam, dataset, dyn, hw, device="cuda"):
     path = _dino_feature_path_for_camera(viewpoint_cam, dataset, dyn)
     if path is None:
         return None
-    cache = getattr(dyn, "_dino_feature_cache", None)
     key = str(path)
-    if cache is not None and key in cache:
-        feat = cache[key]
+    if key in _DINO_TARGET_CACHE:
+        feat = _DINO_TARGET_CACHE[key]
     else:
         try:
             feat = _read_dino_feature_tensor(path)
         except Exception as exc:
             print(f"[DINO feature field] Failed reading {path}: {exc}")
             return None
-        max_cache = int(getattr(dyn, "dino_feature_cache_size", 16))
-        if cache is not None and max_cache > 0:
-            if len(cache) >= max_cache:
-                # Simple FIFO eviction.  Good enough and avoids caching all 480 maps.
-                old = next(iter(cache.keys()))
-                cache.pop(old, None)
-            cache[key] = feat
+        if len(_DINO_TARGET_CACHE) >= 16:
+            _DINO_TARGET_CACHE.pop(next(iter(_DINO_TARGET_CACHE)))
+        _DINO_TARGET_CACHE[key] = feat
     dim = int(getattr(dyn, "dino_feature_field_dim", feat.shape[0]))
     feat = feat[:dim].unsqueeze(0).to(device=device, dtype=torch.float32)
     feat = F.interpolate(feat, size=hw, mode="bilinear", align_corners=False)[0]
     feat = F.normalize(feat, dim=0)
     return feat
+
+
+def _load_sam3_target_for_view(viewpoint_cam, dataset, dyn, hw, device="cuda"):
+    path = _sam3_feature_path_for_camera(viewpoint_cam, dataset, dyn)
+    if path is None:
+        return None
+    key = str(path)
+    if key in _SAM3_TARGET_CACHE:
+        feat = _SAM3_TARGET_CACHE[key]
+    else:
+        try:
+            feat = _read_feature_tensor(path, family="sam3")
+        except Exception as exc:
+            print(f"[SAM3 feature field] Failed reading {path}: {exc}")
+            return None
+        if len(_SAM3_TARGET_CACHE) >= 16:
+            _SAM3_TARGET_CACHE.pop(next(iter(_SAM3_TARGET_CACHE)))
+        _SAM3_TARGET_CACHE[key] = feat
+    dim = int(getattr(dyn, "sam3_feature_dim", feat.shape[0]))
+    feat = feat[:dim].unsqueeze(0).to(device=device, dtype=torch.float32)
+    feat = F.interpolate(feat, size=hw, mode="bilinear", align_corners=False)[0]
+    feat = F.normalize(feat, dim=0)
+    return feat
+
+
+def _local_feature_cluster_loss(features, points, *, max_points=2048, margin=0.75):
+    """Cheap optional SAM3 field sharpening. Disabled by default."""
+    feature = F.normalize(torch.as_tensor(features).float(), dim=-1)
+    xyz = torch.as_tensor(points, device=feature.device, dtype=feature.dtype)
+    count = int(feature.shape[0])
+    if count < 3:
+        return feature.sum() * 0.0
+    if count > int(max_points):
+        ids = torch.linspace(0, count - 1, int(max_points), device=feature.device).round().long().unique()
+        feature = feature.index_select(0, ids)
+        xyz = xyz.index_select(0, ids)
+    distance = torch.cdist(xyz, xyz)
+    distance.fill_diagonal_(float("inf"))
+    nn = distance.argmin(dim=1)
+    cosine = (feature * feature[nn]).sum(-1).clamp(-1.0, 1.0)
+    positive = (1.0 - cosine).square()
+    negative = F.relu(float(margin) - torch.linalg.norm(feature - feature[nn], dim=-1)).square()
+    weight_pos = (cosine.detach() > 0.5).float()
+    weight_neg = 1.0 - weight_pos
+    return (weight_pos * positive + weight_neg * negative).mean()
+
+
+def sam3_feature_field_loss(viewpoint_cam, gaussians, pipe, background, dataset, dyn, separate_sh=False, stage="static"):
+    """SAM3 feature-field supervision from cached dense tensors.
+
+    The SAM3 extractor runs outside the RigEuler env. This loss only renders
+    cached descriptors and optimizes the per-Gaussian SAM3 field unless called
+    in a dynamic stage, where feature rows are detached and geometry receives
+    the transport gradient.
+    """
+    from gaussian_renderer import render_feature_field, render_sam3_feature_field
+
+    del background, separate_sh
+    if not getattr(dyn, "use_sam3_feature_field", False):
+        return None, {}
+    feat_param = getattr(gaussians, "get_sam3_feature_field", None)
+    if feat_param is None or not torch.is_tensor(feat_param) or feat_param.numel() == 0:
+        return None, {}
+
+    dynamic_stage = bool(getattr(dyn, "dynamic_motion", False) and str(stage) != "static")
+    freeze_dynamic = bool(getattr(dyn, "freeze_sam3_feature_dynamic", True))
+    train_features = not (dynamic_stage and freeze_dynamic)
+
+    H = int(viewpoint_cam.original_image.shape[-2])
+    W = int(viewpoint_cam.original_image.shape[-1])
+    target = _load_sam3_target_for_view(viewpoint_cam, dataset, dyn, (H, W), device=feat_param.device)
+    if target is None:
+        return None, {"sam3_feature_missing": 1.0}
+    K = min(int(feat_param.shape[1]), int(target.shape[0]))
+    if K <= 0:
+        return None, {"sam3_feature_missing": 1.0}
+
+    feat_for_render = F.normalize(feat_param[:, :K] if train_features else feat_param[:, :K].detach(), dim=-1)
+    detach_geometry = not dynamic_stage
+
+    pred_pkg = render_sam3_feature_field(
+        viewpoint_camera=viewpoint_cam,
+        pc=gaussians,
+        pipe=pipe,
+        features=feat_for_render,
+        detach_geometry=detach_geometry,
+    )
+    weight_pkg = render_feature_field(
+        viewpoint_camera=viewpoint_cam,
+        pc=gaussians,
+        pipe=pipe,
+        features=torch.ones((feat_param.shape[0], 1), device=feat_param.device, dtype=feat_param.dtype),
+        bg_feature=torch.zeros(1, device=feat_param.device, dtype=feat_param.dtype),
+        detach_geometry=detach_geometry,
+    )
+    opacity = weight_pkg["render"][0]
+    pred = pred_pkg["render"] / opacity.clamp_min(1.0e-4)[None]
+    pred_n = F.normalize(pred, dim=0)
+    target_n = F.normalize(target[:K], dim=0)
+    valid = (
+        (opacity.detach() > float(getattr(dyn, "sam3_feature_opacity_threshold", 0.05)))
+        & torch.isfinite(pred_n).all(dim=0)
+        & torch.isfinite(target_n).all(dim=0)
+    )
+    if dynamic_stage:
+        foreground_mask = _load_mask_for_view(
+            viewpoint_cam, dataset, dyn, (H, W), device=feat_param.device
+        )
+        if foreground_mask is None:
+            raise RuntimeError("Foreground-only Phase 1 requires a mask for every dynamic view")
+        valid = valid & (foreground_mask > 0.5)
+    if valid.sum() < 16:
+        return None, {"sam3_feature_valid_pixels": float(valid.sum().item())}
+
+    cosine = 1.0 - (pred_n[:, valid] * target_n[:, valid]).sum(dim=0).clamp(-1.0, 1.0)
+    alpha_weight = opacity.detach()[valid].clamp_min(0.0)
+    loss = (alpha_weight * cosine).sum() / alpha_weight.sum().clamp_min(1.0e-6)
+    if str(stage) == "static" and float(getattr(dyn, "sam3_cluster_weight", 0.0)) > 0.0:
+        loss = loss + float(getattr(dyn, "sam3_cluster_weight", 0.0)) * _local_feature_cluster_loss(
+            feat_for_render,
+            gaussians.get_xyz.detach(),
+        )
+    return loss, {
+        "L_sam3_feature_field": float(loss.detach().item()),
+        "sam3_cosine": float(cosine.mean().detach().item()),
+        "sam3_feature_valid_pixels": float(valid.sum().item()),
+        "sam3_feature_mean_opacity": float(opacity.detach()[valid].mean().item()) if valid.any() else 0.0,
+        "sam3_dynamic_transport_supervision": float(dynamic_stage),
+        "sam3_feature_frozen": float(dynamic_stage and freeze_dynamic),
+    }
 
 
 def dino_feature_field_loss(viewpoint_cam, gaussians, pipe, background, dataset, dyn, separate_sh=False, stage="static"):
@@ -497,59 +591,25 @@ def dino_feature_field_loss(viewpoint_cam, gaussians, pipe, background, dataset,
         & torch.isfinite(pred_n).all(dim=0)
         & torch.isfinite(target_n).all(dim=0)
     )
+    if dynamic_stage:
+        foreground_mask = _load_mask_for_view(
+            viewpoint_cam, dataset, dyn, (H, W), device=feat_param.device
+        )
+        if foreground_mask is None:
+            raise RuntimeError(
+                "Foreground-only Phase 1 requires a mask for every dynamic view"
+            )
+        valid = valid & (foreground_mask > 0.5)
     if valid.sum() < 16:
         return None, {"dino_feature_valid_pixels": float(valid.sum().item())}
 
     cos = 1.0 - (pred_n[:, valid] * target_n[:, valid]).sum(dim=0).clamp(-1.0, 1.0)
-    if str(getattr(dyn, "dino_feature_loss_type", "cosine")) == "cosine_l1":
-        dino_pixel_loss = cos.mean() + 0.1 * torch.abs(pred[:, valid] - target[:, valid]).mean()
-    else:
-        dino_pixel_loss = cos.mean()
-
-    smooth_loss = None
-    # DINO 3D smoothness is only a static descriptor-field regularizer.
-    lambda_smooth = float(getattr(dyn, "lambda_dino_3d_smooth", 0.0)) if not dynamic_stage else 0.0
-    if lambda_smooth > 0 and train_features:
-        smooth_loss = gaussian_aux_3d_smoothness(
-            xyz=gaussians.get_canonical_xyz,
-            field=feat_param,
-            colors=_gaussian_rgb_for_affinity(gaussians),
-            mode="cosine",
-            k=int(getattr(dyn, "smooth_3d_knn", 8)),
-            max_points=int(getattr(dyn, "smooth_3d_max_points", 2048)),
-            sigma_x=float(getattr(dyn, "smooth_3d_sigma_x", -1.0)),
-            sigma_c=float(getattr(dyn, "smooth_3d_sigma_c", 0.25)),
-        )
-
-    loss = dino_pixel_loss if smooth_loss is None else dino_pixel_loss + lambda_smooth * smooth_loss
+    loss = cos.mean()
     return loss, {
         "L_dino_feature_field": float(loss.detach().item()),
         "dino_cosine": float(cos.mean().detach().item()),
-        "L_dino_3d_smooth": float(smooth_loss.detach().item()) if smooth_loss is not None else 0.0,
         "dino_feature_valid_pixels": float(valid.sum().item()),
         "dino_feature_mean_opacity": float(opacity.detach()[valid].mean().item()) if valid.any() else 0.0,
         "dino_dynamic_transport_supervision": float(dynamic_stage),
         "dino_feature_frozen": float(dynamic_stage and freeze_dynamic),
     }
-
-# -----------------------------------------------------------------------------
-# Dynamic Eulerian-motion extension helpers.
-# Kept here as re-exports so existing code can continue importing losses from
-# utils.loss_utils, while the implementation lives in utils.dynamic_loss_utils.
-# -----------------------------------------------------------------------------
-try:
-    from utils.dynamic_loss_utils import (
-        speed_loss,
-        static_velocity_loss,
-        dynamic_sparsity_loss,
-        dynamic_binarization_loss,
-        cycle_consistency_loss,
-        sample_pairs_by_cell,
-        dino_weighted_rigidity_loss,
-        se3_local_coherence_loss,
-        compute_cell_incoherence_scores,
-    )
-except Exception:
-    # The static 3DGS path must remain importable even if dynamic utilities are
-    # not available in a partial checkout.
-    pass
