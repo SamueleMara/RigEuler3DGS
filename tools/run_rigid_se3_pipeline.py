@@ -263,8 +263,17 @@ def main() -> int:
                               for p in positions])
     kab = init["part"]
     kabsch_R, kabsch_p = kab.R.clone(), kab.p.clone()
+    unexp = init["unexplained_fraction_final"]
     print(f"      max mean Kabsch residual {init['max_mean_residual']:.5f}"
           f"   ({init['weighting']})")
+    print(f"      unexplained by ONE rigid motion, at the last frame: "
+          f"{100 * unexp:.0f}% of the displacement")
+    if unexp == unexp and unexp > 0.4:
+        print(f"      NOTE: a single rigid motion leaves {100 * unexp:.0f}% of "
+              f"this support's displacement unexplained. That is either a "
+              f"support spanning several bodies or a noisy Phase 1 over it -- "
+              f"gamma_1DOF below separates them. Phase 2 fits the best single "
+              f"rigid trajectory either way.")
 
     # =====================================================================
     # 4. RIGID SE(3) RGB-D PHASE 2 (sections 13-15, 18)
@@ -419,11 +428,13 @@ def main() -> int:
         html / "rigid_phase2_debug.html", mu0.cpu(), members.cpu(), positions,
         part, kabsch_R, kabsch_p, cameras,
         max_points=args.max_debug_points,
-        title=f"{args.scene} - rigid SE(3) Phase 2")
+        title=f"{args.scene} - rigid SE(3) Phase 2",
+        unexplained=init["unexplained_fraction_final"])
     b = write_rigid_to_joint_3d(
         html / "rigid_to_joint_debug.html", mu0.cpu(), members.cpu(), positions,
         part, kabsch_R, kabsch_p, red, ev_gt,
         max_points=args.max_debug_points,
+        unexplained=init["unexplained_fraction_final"],
         title=f"{args.scene} - rigid reconstruction and joint reduction")
     c = write_timelines(html / "rigid_timelines.html", part, red, recs,
                         cmp_rows, title=f"{args.scene} - timelines")
@@ -440,6 +451,12 @@ def main() -> int:
                     "num_members": int(members.numel()),
                     "fraction": frac / 100.0},
         "initialization": {k: v for k, v in init.items() if k != "part"},
+        "support_rigidity": {
+            "max_mean_kabsch_residual": init["max_mean_residual"],
+            "part_scale_L": init["part_scale_L"],
+            "unexplained_fraction_final": init["unexplained_fraction_final"],
+            "max_unexplained_fraction": init["max_unexplained_fraction"],
+            "note": init["unexplained_fraction_note"]},
         "exact_rigidity_gate": gate,
         "phase1_kabsch_vs_rgbd": kcmp,
         "one_dof": od,

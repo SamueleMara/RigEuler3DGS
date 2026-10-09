@@ -261,12 +261,61 @@ def kabsch_initialize(members: Tensor, mu0: Tensor, positions,
     for t in range(T):
         Xt = torch.as_tensor(positions[t]).double().cpu()[members]
         resid.append(float((Xt - (X0 @ R[t].T + p[t])).norm(dim=1).mean()))
+
+    # HOW MUCH OF THE OBSERVED MOTION ONE RIGID BODY DOES NOT EXPLAIN.
+    #
+    # The residual alone is a length and means nothing on its own. The right
+    # denominator is the DISPLACEMENT, not the part size: measured across
+    # seven scenes the per-frame residual tracks how far the part has
+    # travelled (correlation 0.84 to 0.99) and not how big it is. Dividing by
+    # the part scale made blade read 133% purely because its part is small,
+    # while its one-DOF statistic is a clean 0.993.
+    #
+    # WHAT IT DOES NOT DO, stated because the obvious guess is wrong. It is
+    # not a body count and it does not single out the scissor. Measured:
+    # stapler 16, blade 22, USB 24, SCISSOR 24, fridge 26, laptop 33,
+    # storage 44 percent. The scissor -- two blades turning oppositely about
+    # one pivot, the one scene that genuinely is not a single body -- sits in
+    # the middle, because Phase 1 recovers each blade well and the single
+    # Kabsch fit splits the difference. gamma_1DOF is what finds it: 0.59,
+    # with the first two singular values at 0.59 / 0.37, against 0.92 or
+    # better everywhere else.
+    #
+    # So read this as a quality number for the support and its Phase-1
+    # trajectories -- how much motion no rigid model accounts for -- and read
+    # gamma for whether the motion that IS rigid has one degree of freedom.
+    #
+    # The denominator is the mean per-point DISPLACEMENT, not |p_t|. Two
+    # halves rotating oppositely about a shared pivot cancel in the centre of
+    # mass, so |p_t| collapses toward zero exactly in the case this is meant
+    # to catch and the ratio diverges -- 9.2 on a synthetic scissor. The mean
+    # per-point displacement does not collapse: every point still moves.
+    c0 = X0.mean(0)
+    L = float(((X0 - c0) ** 2).sum(1).mean().sqrt())
+    travel = []
+    for t in range(T):
+        Xt = torch.as_tensor(positions[t]).double().cpu()[members]
+        travel.append(float((Xt - X0).norm(dim=1).mean()))
+    unexplained = [float(r / d) if d > 1e-9 else float("nan")
+                   for r, d in zip(resid, travel)]
+    finite = [u for u in unexplained if u == u]
     return {"part": part, "kabsch_singular_values": sing,
             "mean_residual_per_frame": resid,
             "max_mean_residual": max(resid) if resid else 0.0,
+            "part_scale_L": L,
+            "displacement_per_frame": travel,
+            "unexplained_fraction_per_frame": unexplained,
+            "unexplained_fraction_final": (finite[-1] if finite else float("nan")),
+            "max_unexplained_fraction": (max(finite) if finite else float("nan")),
             "weighting": "uniform over the frozen coherence support",
             "initialization_source": "phase1_kabsch",
             "used_axis_or_joint_model": False,
+            "unexplained_fraction_note": (
+                "mean Kabsch residual / |p_t|: the fraction of the observed "
+                "displacement that the best single rigid motion leaves "
+                "unexplained. It rises both when the support spans several "
+                "bodies and when Phase 1 is noisy over it, so read it with "
+                "gamma_1DOF rather than alone. Never thresholded."),
             "note": ("section 17: no screw, prismatic or revolute model was "
                      "fitted to produce this initialization")}
 

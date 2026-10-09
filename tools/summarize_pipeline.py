@@ -113,8 +113,8 @@ def main() -> int:
               f"{_f(R.get('axis_radius_over_part_scale'),9,1)}")
 
     # ---- the numbers that say whether to trust the run -----------------
-    hdr3 = (f"{'scene':<18}{'rigidity drift':>16}{'orient defect':>15}"
-            f"{'Kabsch d_rot':>14}{'Kabsch d_p':>12}{'runtime':>10}")
+    hdr3 = (f"{'scene':<18}{'rigidity drift':>16}{'unexpl.':>9}"
+            f"{'gamma':>8}{'Kabsch d_rot':>14}{'Kabsch d_p':>12}{'runtime':>10}")
     print(f"\nHEALTH - read these before the table above")
     print(hdr3)
     print("-" * len(hdr3))
@@ -124,8 +124,11 @@ def main() -> int:
             continue
         d = json.load(p.open())
         gate, k = d["exact_rigidity_gate"], d["phase1_kabsch_vs_rgbd"]
-        print(f"{s:<18}{_e(gate['max_pairwise_distance_drift'],16)}"
-              f"{_e(gate['max_orientation_defect'],15)}"
+        sr = d.get("support_rigidity") or {}
+        rv = sr.get("unexplained_fraction_final")
+        body = f"{100*rv:>8.0f}%" if rv is not None and rv == rv else "       --"
+        print(f"{s:<18}{_e(gate['max_pairwise_distance_drift'],16)}{body}"
+              f"{_f(d['one_dof']['gamma_1dof'],8,3)}"
               f"{_f(k['max_d_rotation_rad'],14,4)}"
               f"{_f(k['max_d_translation'],12,4)}"
               f"{_f(d.get('runtime_s'),9,0)}s")
@@ -138,6 +141,11 @@ def main() -> int:
     print("  inspect the RGB-D objective before trusting the axis.")
     print("  rad/L is the far-axis tell: order 1 means the revolute axis lies")
     print("  on the part; a large value means R is approximating a translation.")
+    print("  unexpl. is the share of the support's motion that one rigid body")
+    print("  does not explain -- a quality number for the support and its")
+    print("  Phase-1 trajectories. It is NOT a body count: the scissor, the one")
+    print("  scene that really is two bodies, sits mid-pack at 24%.")
+    print("  gamma is what finds that: 0.59 there, 0.92+ everywhere else.")
     print("  No joint-type classifier is produced here. E_R < E_P alone is NOT")
     print("  sufficient -- on a near-prismatic part R can win on energy while")
     print("  placing its axis tens of part-radii away.")
