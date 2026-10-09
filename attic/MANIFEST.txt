@@ -1,3 +1,25 @@
+# attic -- code the production pipeline does not reach.
+#
+# Nothing was deleted. Every file kept its path, so a move back is exact:
+#
+#   cd /home/samuelemara/Joint3DGS/RigEuler3DGS
+#   for d in dead superseded; do (cd attic/$d && find . -type f) | sed 's|^\./||' |
+#     while read f; do mkdir -p "$(dirname $f)"; mv "attic/$d/$f" "$f"; done; done
+#
+# Or, once you are satisfied:  rm -rf attic/
+#
+# dead/       nothing reached these at all (51 .py + 3 superseded .sh runners)
+# superseded/ only superseded tests reached these (73 modules + 27 tests)
+#
+# Derived by walking the import graph from the production entry points,
+# following imports AND subprocess path references, and counting pkg/__init__.py
+# as reached whenever pkg.sub is. Kept on purpose: SIBR_viewers, convert.py,
+# full_eval.py, utils/make_depth_scale.py (upstream 3DGS),
+# estimator/analytic_reference.py (the autograd oracle), the legacy
+# direct-axis ablation, and the extractors train.py launches.
+#
+# Paths below are relative to the repo root.
+
 debug/deep_debug_html.py
 debug/deep_debug_renders.py
 debug/dual_joint_artifacts.py

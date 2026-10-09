@@ -60,11 +60,18 @@ assets/
 diffs/
 patches/
 
-# Submodules are intentionally excluded until their local modifications are
-# ready to be vendored or committed independently.
-.gitmodules
+# Submodules are excluded, with one exception. diff-gaussian-rasterization is
+# no longer a submodule: it carries this project's own CUDA kernels (the IEKF
+# forward/backward passes and the grouped variant), so its sources are tracked
+# here directly. Its third_party/glm checkout stays out -- 1530 unmodified
+# upstream files and 23 MB -- and remains a plain git clone on disk.
 SIBR_viewers/
-submodules/
+submodules/*
+!submodules/diff-gaussian-rasterization/
+submodules/diff-gaussian-rasterization/third_party/
+submodules/diff-gaussian-rasterization/build/
+submodules/diff-gaussian-rasterization/dist/
+submodules/diff-gaussian-rasterization/*.egg-info/
 
 # Run artifacts written INTO the source tree by tests and tools. These are
 # generated, not authored -- tests/tiny_diffusion_test/ alone is 11 MB of

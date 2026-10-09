@@ -48,6 +48,18 @@ if torch.cuda.is_available():
 PY
 
 # Build 3DGS CUDA extensions against the active env + CUDA 12.8.
+# diff-gaussian-rasterization is NOT a submodule: it carries this project's own
+# CUDA kernels and its sources are tracked in this repository. Its GLM
+# dependency is not -- 1530 unmodified upstream headers -- so fetch it here.
+# Without this the build fails on a fresh clone with a missing <glm/glm.hpp>.
+GLM_DIR=submodules/diff-gaussian-rasterization/third_party/glm
+if [[ ! -f "$GLM_DIR/glm/glm.hpp" ]]; then
+  echo "fetching GLM for the rasterizer"
+  rm -rf "$GLM_DIR"
+  git clone https://github.com/g-truc/glm.git "$GLM_DIR"
+  git -C "$GLM_DIR" checkout 5c46b9c07008ae65cb81ab79cd677ecc1934b903
+fi
+
 python -m pip install --no-build-isolation -v --force-reinstall submodules/diff-gaussian-rasterization
 python -m pip install --no-build-isolation -v --force-reinstall submodules/simple-knn
 if [[ -d submodules/fused-ssim ]]; then
