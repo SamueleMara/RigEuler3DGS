@@ -50,6 +50,44 @@ RUN_START=$(date +%s)
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac }
 
+# --- where a scene's artifacts go ---------------------------------------
+#
+# PER_SCENE=1 gathers everything for one object under one directory:
+#
+#     <OUTROOT>/<scene>/
+#         static/      -> the trained endpoint pair (symlink, see below)
+#         coherence/   Phase 1 centers + the frozen static/dynamic support
+#         rigid/       Phase 2 poses, joint reduction, debug pages
+#         logs/
+#
+# PER_SCENE=0 keeps the flat layout the earlier runs used, so previously
+# produced output stays where the tooling expects it.
+#
+# The static trainer names its own directory `<scene>_<tag>` and that name is
+# not a parameter, so `static` is a symlink to it rather than a rename --
+# renaming would leave the model_path recorded inside cfg_args pointing at a
+# directory that no longer exists.
+PER_SCENE=${PER_SCENE:-1}
+
+scene_paths() {              # sets SROOT SHARED MODEL COH RIG SLOG
+  local S="$1"
+  if [ "$PER_SCENE" = "1" ]; then
+    SROOT="$OUTROOT/$S"
+    SHARED="$SROOT/${S}_${TAG}/shared"
+    COH="$SROOT/coherence"
+    RIG="$SROOT/rigid"
+    SLOG="$SROOT/logs"
+  else
+    SROOT="$OUTROOT"
+    SHARED="$OUTROOT/${S}_${TAG}/shared"
+    COH="$OUTROOT/motion_coherence_$S"
+    RIG="$OUTROOT/rigid_se3_$S"
+    SLOG="$LOGDIR"
+  fi
+  MODEL="$SHARED/frame0_static"
+  mkdir -p "$SLOG"
+}
+
 # --- is the static stage actually done? ----------------------------------
 #
 # `ls iteration_*/point_cloud.ply` was not enough, three ways over:
@@ -185,9 +223,7 @@ echo "=============================================================="
 STATUS=()
 for S in $SCENES; do
   T_SCENE=$(date +%s)
-  MODEL="$OUTROOT/${S}_${TAG}/shared/frame0_static"
-  COH="$OUTROOT/motion_coherence_$S"
-  RIG="$OUTROOT/rigid_se3_$S"
+  scene_paths "$S"
   echo ""
   echo "############################ $S"
   if ! gpu_ready; then
@@ -196,7 +232,6 @@ for S in $SCENES; do
   fi
 
   # --- [1] static 3DGS, both endpoints, with depth ----------------------
-  SHARED="$OUTROOT/${S}_${TAG}/shared"
   if has_stage 1; then
     if static_complete "$SHARED" "$ITERS"; then
       echo "  [1/5] static 3DGS t0 + tfinal @ ${ITERS} with depth: present, reusing"
@@ -205,12 +240,12 @@ for S in $SCENES; do
       echo "        (rebuilding: $(static_why "$SHARED" "$ITERS"))  -> $LOGDIR/${S}_static.log"
       $PY tools/train_all_static_endpoints.py \
           --only "$S" --iterations "$ITERS" --tag "$TAG" \
-          --output-root "$OUTROOT" \
-          --log-dir "$LOGDIR" > "$LOGDIR/${S}_static.log" 2>&1
+          --output-root "$SROOT" \
+          --log-dir "$SLOG" > "$SLOG/${S}_static.log" 2>&1
       RC=$?
       if [ $RC -ne 0 ]; then
         DETAIL=""
-        for L in "$LOGDIR/${S}_static.log" "$LOGDIR/${S}_frame0_${ITERS}.log"; do
+        for L in "$SLOG/${S}_static.log" "$SLOG/${S}_frame0_${ITERS}.log"; do
           if [ -f "$L" ] && grep -qiE "out of memory|OutOfMemoryError|cudaErrorMemoryAllocation" "$L"; then
             DETAIL=" -- CUDA OUT OF MEMORY"
             echo "    !! static training ran out of GPU memory. This is"
@@ -226,11 +261,14 @@ for S in $SCENES; do
         STATUS+=("$S FAILED(static rc=$RC)$DETAIL")
         if [ -z "$DETAIL" ]; then
           echo "    !! static training failed -- last 25 lines:"
-          tail -25 "$LOGDIR/${S}_static.log"
+          tail -25 "$SLOG/${S}_static.log"
         fi
         continue
       fi
     fi
+  fi
+  if [ "$PER_SCENE" = "1" ] && [ -d "$SHARED" ] && [ ! -e "$SROOT/static" ]; then
+    ln -s "${S}_${TAG}/shared" "$SROOT/static"
   fi
   if ! static_complete "$SHARED" "$ITERS"; then
     STATUS+=("$S SKIPPED(static incomplete)")
@@ -250,14 +288,14 @@ for S in $SCENES; do
         --frames "$FRAMES" --cameras "$CAMS" \
         --max-gaussians "$NG" --bootstrap-iters "$BOOT" \
         --coherence-knn "$KNN" --cv-folds "$FOLDS" --frames-on-cpu \
-        --out "$COH" > "$LOGDIR/${S}_coherence.log" 2>&1
+        --out "$COH" > "$SLOG/${S}_coherence.log" 2>&1
     RC=$?
     if [ $RC -ne 0 ]; then
       STATUS+=("$S FAILED(coherence rc=$RC)")
-      echo "    !! coherence failed -- last 25 lines:"; tail -25 "$LOGDIR/${S}_coherence.log"
+      echo "    !! coherence failed -- last 25 lines:"; tail -25 "$SLOG/${S}_coherence.log"
       continue
     fi
-    grep -E '^  GT:|^  \[' "$LOGDIR/${S}_coherence.log" | head -4
+    grep -E '^  GT:|^  \[' "$SLOG/${S}_coherence.log" | head -4
   fi
   if [ ! -f "$COH/predicted_support.json" ]; then
     STATUS+=("$S SKIPPED(no support)")
@@ -280,14 +318,14 @@ for S in $SCENES; do
         --rigid-iters "$RIGID_ITERS" --rigid-cg-iters "$CG" \
         --max-debug-points "$POINTS" --frames-on-cpu \
         --coherence-support "$COH/predicted_support.json" \
-        "${EXTRA[@]}" --out "$RIG" > "$LOGDIR/${S}_rigid.log" 2>&1
+        "${EXTRA[@]}" --out "$RIG" > "$SLOG/${S}_rigid.log" 2>&1
     RC=$?
     if [ $RC -ne 0 ]; then
       STATUS+=("$S FAILED(rigid rc=$RC)")
-      echo "    !! rigid stage failed -- last 25 lines:"; tail -25 "$LOGDIR/${S}_rigid.log"
+      echo "    !! rigid stage failed -- last 25 lines:"; tail -25 "$SLOG/${S}_rigid.log"
       continue
     fi
-    grep -E 'exact rigidity|vs Phase-1 Kabsch|gamma_1DOF|E_P |R axis |GT type' "$LOGDIR/${S}_rigid.log"
+    grep -E 'exact rigidity|vs Phase-1 Kabsch|gamma_1DOF|E_P |R axis |GT type' "$SLOG/${S}_rigid.log"
   fi
   STATUS+=("$S OK $(( $(date +%s) - T_SCENE ))s")
 done
@@ -300,9 +338,7 @@ printf "%-18s %-9s %-9s %-10s %-9s %-7s %-6s\n" \
        scene static phase1 coherence rigid joint debug
 printf -- "------------------ --------- --------- ---------- --------- ------- ------\n"
 for S in $SCENES; do
-  SHARED="$OUTROOT/${S}_${TAG}/shared"
-  COH="$OUTROOT/motion_coherence_$S"
-  RIG="$OUTROOT/rigid_se3_$S"
+  scene_paths "$S"
   static_complete "$SHARED" "$ITERS" && A=ok || A=MISSING
   NC=$(ls "$COH"/phase1_centers/centers_frame_*.npy 2>/dev/null | wc -l)
   [ "$NC" -ge "$FRAMES" ] && B="${NC}f" || B=MISSING

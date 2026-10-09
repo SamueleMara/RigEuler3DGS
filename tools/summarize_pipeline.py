@@ -24,6 +24,34 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 
+def _coh_dir(root: Path, scene: str) -> Path:
+    """The coherence output, in either layout.
+
+    PER_SCENE gathers a run under <root>/<scene>/{coherence,rigid}; the flat
+    layout the earlier runs used puts them at <root>/motion_coherence_<scene>
+    and <root>/rigid_se3_<scene>. Both are checked so one summary can read a
+    mixture, which is what a machine with months of runs on it actually has.
+    """
+    a = root / scene / "coherence"
+    return a if a.is_dir() else root / f"motion_coherence_{scene}"
+
+
+def _rig_dir(root: Path, scene: str) -> Path:
+    a = root / scene / "rigid"
+    return a if a.is_dir() else root / f"rigid_se3_{scene}"
+
+
+def _scenes_on_disk(root: Path) -> list:
+    out = set()
+    for p in root.glob("rigid_se3_*"):
+        if (p / "summary.json").exists():
+            out.add(p.name[len("rigid_se3_"):])
+    for p in root.iterdir() if root.is_dir() else []:
+        if (p / "rigid" / "summary.json").exists():
+            out.add(p.name)
+    return sorted(out)
+
+
 def _f(x, w=8, p=3, nan="--"):
     try:
         v = float(x)
@@ -55,9 +83,7 @@ def main() -> int:
     root = Path(args.outroot)
     scenes = list(args.scenes)
     if args.all or not scenes:
-        scenes = sorted(p.name[len("rigid_se3_"):]
-                        for p in root.glob("rigid_se3_*")
-                        if p.is_dir() and (p / "summary.json").exists())
+        scenes = _scenes_on_disk(root)
     if not scenes:
         print("no finished runs found")
         return 0
@@ -69,7 +95,7 @@ def main() -> int:
     print(hdr)
     print("-" * len(hdr))
     for s in scenes:
-        p = root / f"motion_coherence_{s}" / "numerical" / "gt_metrics.json"
+        p = _coh_dir(root, s) / "numerical" / "gt_metrics.json"
         if not p.exists():
             print(f"{s:<18}-- not run --")
             continue
@@ -92,7 +118,7 @@ def main() -> int:
     print("-" * len(hdr2))
     picked = {}
     for s in scenes:
-        p = root / f"rigid_se3_{s}" / "summary.json"
+        p = _rig_dir(root, s) / "summary.json"
         if not p.exists():
             print(f"{s:<18}-- not run --")
             continue
@@ -102,12 +128,17 @@ def main() -> int:
         ep = P["pose_residual"]["weighted_energy"]
         er = R["pose_residual"]["weighted_energy"]
         gt = g.get("gt_joint_type") if g.get("available") else None
-        # A scene whose GT part labels are entirely zero scores as if nothing
+        # A scene whose GT labels nothing as moving scores as if nothing
         # moves: precision 0, F1 undefined, and an axis error measured against
-        # a joint its own labels deny. washer_103776 ships like that --
-        # points3D_parts.ply holds 5344 points with part == 0 throughout -- so
-        # the row is MARKED rather than read as a result.
-        mcf = root / f"motion_coherence_{s}" / "numerical" / "gt_metrics.json"
+        # a joint its own labels deny. washer_103776 reads that way, and the
+        # cause is upstream of the labels: summed over all eight views, only
+        # 4454 depth pixels change by more than a centimetre across the whole
+        # episode, against 89084 on oven. Five of its eight cameras see no
+        # change at all. So COLMAP triangulated no point on the moving link,
+        # `part` came out 0 everywhere, and the file is a faithful record of a
+        # reconstruction with nothing on that link -- not a corrupt file.
+        # The row is MARKED rather than read as a result.
+        mcf = _coh_dir(root, s) / "numerical" / "gt_metrics.json"
         if mcf.exists():
             try:
                 if float(json.load(mcf.open())["coherence"]
@@ -132,7 +163,7 @@ def main() -> int:
     print(hdr3)
     print("-" * len(hdr3))
     for s in scenes:
-        p = root / f"rigid_se3_{s}" / "summary.json"
+        p = _rig_dir(root, s) / "summary.json"
         if not p.exists():
             continue
         d = json.load(p.open())
@@ -159,9 +190,11 @@ def main() -> int:
     print("  Phase-1 trajectories. It is NOT a body count: the scissor, the one")
     print("  scene that really is two bodies, sits mid-pack at 24%.")
     print("  gamma is what finds that: 0.59 there, 0.92+ everywhere else.")
-    print("  !GT-EMPTY means that scene's points3D_parts.ply labels NOTHING as")
-    print("  moving, so every GT number for it is vacuous. Its poses are still")
-    print("  real; only the scoring against GT is meaningless.")
+    print("  !GT-EMPTY means that scene's GT labels NOTHING as moving, so every")
+    print("  GT number for it is vacuous. On washer that traces to the episode")
+    print("  itself: 4454 depth pixels change across all 8 views, against 89084")
+    print("  on oven, so the moving link was never triangulated. Re-render the")
+    print("  episode with views that observe it; the files are not corrupt.")
     print("  No joint-type classifier is produced here. E_R < E_P alone is NOT")
     print("  sufficient -- on a near-prismatic part R can win on energy while")
     print("  placing its axis tens of part-radii away.")
