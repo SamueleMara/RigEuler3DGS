@@ -32,6 +32,16 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
                     invdepthmap = np.zeros_like(depth_arr, dtype=np.float32)
                     invdepthmap[valid] = 1.0 / depth_arr[valid]
                 else:
+                    _v = depth_arr[depth_arr > 1e-8]
+                    if _v.size and float(np.median(_v)) > 1.0:
+                        raise ValueError(
+                            f"{depth_path} has a median of {float(np.median(_v)):.3f} "
+                            "among its valid pixels. Inverse depth that large "
+                            "would put the surface 1/3 of a metre away over the "
+                            "whole image, so this is almost certainly metres. "
+                            "Pass --sapien_depth_is_metric, or the depth term "
+                            "trains against a map it has misread by a "
+                            "reciprocal.")
                     invdepthmap = depth_arr
             elif depth_path.endswith(".npz"):
                 data = np.load(depth_path)

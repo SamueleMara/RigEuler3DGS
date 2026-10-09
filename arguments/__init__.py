@@ -58,6 +58,11 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        # Depth stored as metric distance rather than as inverse depth. The
+        # renderer composites 1/z, so a metric map has to be inverted before
+        # it can be compared with what comes out. Without this a .npy holding
+        # 3.5 metres is silently read as an inverse depth of 3.5.
+        self.sapien_depth_is_metric = False
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False

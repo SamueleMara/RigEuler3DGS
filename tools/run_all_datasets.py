@@ -32,7 +32,12 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-SUFFIX = "_static_endpoints_14k"
+# Static-model directory suffixes, PREFERRED FIRST. 30k with depth is the
+# current default; the 14k models predate it and are still perfectly usable,
+# so discovery keeps finding them rather than orphaning seven trained scenes
+# the day the default moved. A scene with both resolves to the 30k one.
+SUFFIXES = ("_static_endpoints_30k", "_static_endpoints_14k")
+SUFFIX = SUFFIXES[0]
 RGB_EXT = (".png", ".jpg", ".jpeg")
 
 
@@ -40,12 +45,16 @@ RGB_EXT = (".png", ".jpg", ".jpeg")
 def discover(repo: Path) -> list[dict]:
     """Every (scene, model, source) triple that can actually be run."""
     out = []
-    for model_root in sorted((repo / "output").glob(f"*{SUFFIX}")):
-        scene = model_root.name[: -len(SUFFIX)]
+    roots = {}
+    for suf in reversed(SUFFIXES):          # later writes win, so prefer first
+        for d in sorted((repo / "output").glob(f"*{suf}")):
+            roots[d.name[: -len(suf)]] = (d, suf)
+    for scene in sorted(roots):
+        model_root, suf = roots[scene]
         model = model_root / "shared" / "frame0_static"
         source = repo / "input" / scene
         rec = {"scene": scene, "model": model, "source": source,
-               "runnable": True, "why_not": []}
+               "tag": suf.lstrip("_"), "runnable": True, "why_not": []}
 
         if not (model / "cfg_args").exists():
             rec["runnable"] = False

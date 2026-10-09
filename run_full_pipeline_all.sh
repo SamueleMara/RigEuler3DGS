@@ -30,7 +30,7 @@ cd "$(dirname "$0")"
 
 SCENES=${SCENES:-"scissor_11100 laptop_10211 foldchair_102255 oven_101917 washer_103776"}
 STAGES=${STAGES:-"1 2 3"}
-ITERS=${ITERS:-14000}         # static 3DGS iterations per endpoint
+ITERS=${ITERS:-30000}         # static 3DGS iterations per endpoint
 FRAMES=${FRAMES:-60}
 CAMS=${CAMS:-8}
 NG=${NG:-0}                   # 0 = every Gaussian
@@ -44,7 +44,7 @@ POINTS=${POINTS:-6000}
 RENDERS=${RENDERS:-1}
 OUTROOT=${OUTROOT:-output}
 LOGDIR=${LOGDIR:-$OUTROOT/full_pipeline_logs}
-TAG=${TAG:-static_endpoints_14k}
+TAG=${TAG:-static_endpoints_30k}
 mkdir -p "$LOGDIR"
 RUN_START=$(date +%s)
 

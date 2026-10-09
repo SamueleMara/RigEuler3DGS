@@ -62,6 +62,14 @@ def _train_command(args, source_scene: Path, model_dir: Path, scene: Path, frame
         "--disable_viewer",
         "--no_wandb",
     ]
+    # Depth supervision, when the scene actually carries depth. These exports
+    # store float32 METRES in depth_npy/; the .png beside it is a normalised
+    # visualisation and must not be used as a measurement. The source scene is
+    # what the COLMAP reader opens, so the directory is looked for there --
+    # the synthesised frame_t scene does not always have one.
+    depth_dir = Path(source_scene) / "depth_npy"
+    if depth_dir.is_dir() and any(depth_dir.iterdir()):
+        cmd.extend(["--depths", "depth_npy", "--sapien_depth_is_metric"])
     dino_root = scene / "dinov3"
     if bool(args.use_dino) and _has_frame_cache(dino_root, int(frame_idx)):
         cmd.extend(["--use_dino_feature_field", "--dinov3_root", str(dino_root)])
@@ -198,8 +206,8 @@ def main() -> int:
     parser.add_argument("--input-root", default=str(REPO / "input"))
     parser.add_argument("--output-root", default=str(REPO / "output"))
     parser.add_argument("--log-dir", default=str(REPO / "output" / "static_endpoint_logs"))
-    parser.add_argument("--tag", default="static_endpoints_14k")
-    parser.add_argument("--iterations", type=int, default=14000)
+    parser.add_argument("--tag", default="static_endpoints_30k")
+    parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--only", default="", help="Comma-separated scene names.")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--fail-missing-gt", action="store_true")

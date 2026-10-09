@@ -107,7 +107,19 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
-        depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
+        # The extension is resolved, not assumed. These datasets store depth as
+        # float32 .npy in metres; the .png beside it is a normalised
+        # visualisation (0.76-1.0 after /2**16 on scissor), not a measurement.
+        # Hardcoding .png here is why --depths could never reach depth_npy/.
+        depth_path = ""
+        if depths_folder != "":
+            stem = os.path.join(depths_folder, extr.name[:-n_remove])
+            for ext in (".npy", ".npz", ".png"):
+                if os.path.exists(stem + ext):
+                    depth_path = stem + ext
+                    break
+            if depth_path == "":
+                depth_path = stem + ".png"
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
                               image_path=image_path, image_name=image_name, depth_path=depth_path,
@@ -209,6 +221,29 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+def _resolve_depths_folder(path, depths):
+    """Find the depth directory, under the COLMAP root or beside it.
+
+    `path` here is the COLMAP root, so the obvious join gives
+    `<scene>/colmap/depth_npy`. These datasets put the depth one level up, at
+    `<scene>/depth_npy`, next to `colmap/` rather than inside it -- which is
+    also where every other tool in this repository reads it from. Checking
+    both means `--depths depth_npy` works without the caller having to know
+    which layout it is looking at, and a wrong name still fails loudly
+    instead of silently resolving to nothing.
+    """
+    if depths == "":
+        return ""
+    for cand in (os.path.join(path, depths),
+                 os.path.join(os.path.dirname(os.path.abspath(path)), depths)):
+        if os.path.isdir(cand):
+            return cand
+    raise FileNotFoundError(
+        f"--depths {depths!r} matches no directory: looked in "
+        f"{os.path.join(path, depths)} and "
+        f"{os.path.join(os.path.dirname(os.path.abspath(path)), depths)}")
+
+
 def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, load_gt_parts=True):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
@@ -237,8 +272,15 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, 
                 depths_params[key]["med_scale"] = med_scale
 
         except FileNotFoundError:
-            print(f"Error: depth_params.json file not found at path '{depth_params_file}'.")
-            sys.exit(1)
+            # Not fatal. depth_params.json carries the per-image scale/offset
+            # that aligns MONOCULAR estimated inverse depth to the COLMAP
+            # scale. Depth that is already metric -- a sensor, or a simulator
+            # export -- needs no alignment, and refusing to train without the
+            # file blocks exactly the case that needs it least.
+            print(f"No depth_params.json at '{depth_params_file}'; using the "
+                  f"depth maps as they are. That is correct for metric depth "
+                  f"and wrong for unscaled monocular depth.")
+            depths_params = None
         except Exception as e:
             print(f"An unexpected error occurred when trying to open depth_params.json file: {e}")
             sys.exit(1)
@@ -261,7 +303,8 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, 
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
-        depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
+        depths_folder=_resolve_depths_folder(path, depths),
+        test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]

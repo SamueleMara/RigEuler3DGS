@@ -416,11 +416,20 @@ def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt,
     stats = {"rgb_l1": float(rgb_l1.detach()), "rgb_dssim": float(dssim.detach())}
 
     if depth_weight > 0 and camera.depth_reliable:
-        depth_loss = torch.abs(
-            (package["depth"] - camera.invdepthmap.cuda()) * camera.depth_mask.cuda()
-        ).mean()
+        mask = camera.depth_mask.cuda()
+        err = torch.abs(
+            (package["depth"] - camera.invdepthmap.cuda()) * mask)
+        # Averaged over the MEASURED pixels, not over the frame. These depth
+        # maps are sparse -- 1.3% of the frame on blade, 18.3% on oven -- so
+        # dividing by the pixel count makes the effective depth weight depend
+        # on how much of the image the object happens to fill, and differ by
+        # an order of magnitude between two scenes given the same
+        # --depth_l1_weight. Dividing by the mask makes the number mean "mean
+        # error where depth exists" and comparable across scenes.
+        depth_loss = err.sum() / mask.sum().clamp_min(1.0)
         total = total + depth_weight * depth_loss
         stats["depth_l1"] = float(depth_loss.detach())
+        stats["depth_pixels"] = float(mask.sum().detach())
     else:
         stats["depth_l1"] = 0.0
 

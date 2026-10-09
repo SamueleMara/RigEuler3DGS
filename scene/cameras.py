@@ -60,10 +60,30 @@ class Camera(nn.Module):
         self.invdepthmap = None
         self.depth_reliable = False
         if invdepthmap is not None:
-            self.depth_mask = torch.ones_like(self.alpha_mask)
             self.invdepthmap = cv2.resize(invdepthmap, resolution)
             self.invdepthmap[self.invdepthmap < 0] = 0
             self.depth_reliable = True
+
+            # The mask must be the VALID pixels, not every pixel. These
+            # datasets carry depth only where the sensor returned a hit: on
+            # the SAPIEN exports that is 1.3% to 18.3% of the frame, and the
+            # rest is stored as 0. An all-ones mask -- what this was -- makes
+            # the L1 term pull the rendered inverse depth toward 0 on all the
+            # background, which is to say it pushes that geometry to infinity.
+            # Supervising where there is no measurement is worse than not
+            # supervising at all.
+            valid = self.invdepthmap > 0
+            if valid.ndim == 3:
+                valid = valid[..., 0]
+            self.depth_mask = torch.from_numpy(
+                valid.astype(np.float32)[None]).to(self.data_device)
+            if self.alpha_mask is not None:
+                self.depth_mask = self.depth_mask * self.alpha_mask
+            self.depth_valid_fraction = float(valid.mean())
+            if self.depth_valid_fraction <= 0.0:
+                # nothing to supervise on: say so rather than contributing a
+                # loss of exactly zero that looks like a satisfied constraint
+                self.depth_reliable = False
 
             if depth_params is not None:
                 if depth_params["scale"] < 0.2 * depth_params["med_scale"] or depth_params["scale"] > 5 * depth_params["med_scale"]:
