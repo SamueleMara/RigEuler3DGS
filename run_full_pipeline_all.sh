@@ -107,23 +107,33 @@ scene_paths() {              # sets SROOT SHARED MODEL COH RIG SLOG
 # So: both endpoints, at the requested iteration, with depth recorded in the
 # model's own cfg_args.
 static_complete() {
-  local root="$1" iters="$2" ep
+  local root="$1" iters="$2" scene="${3:-}" ep
   for ep in frame0_static frame_t_static; do
     [ -f "$root/$ep/point_cloud/iteration_${iters}/point_cloud.ply" ] || return 1
     grep -q "sapien_depth_is_metric=True" "$root/$ep/cfg_args" 2>/dev/null || return 2
     grep -q "depths='[^']" "$root/$ep/cfg_args" 2>/dev/null || return 2
+    # Trained with object masks as ground-truth alpha. A model built before
+    # that lands is photometrically finished but carries the black border
+    # splats this flag exists to remove, and reusing it silently keeps them.
+    if [ -n "$scene" ] && [ -d "input/$scene/mask" ]; then
+      grep -q "masks='[^']" "$root/$ep/cfg_args" 2>/dev/null || return 3
+    fi
   done
   return 0
 }
 
 static_why() {
-  local root="$1" iters="$2" ep
+  local root="$1" iters="$2" scene="${3:-}" ep
   for ep in frame0_static frame_t_static; do
     if [ ! -f "$root/$ep/point_cloud/iteration_${iters}/point_cloud.ply" ]; then
       echo "$ep has no iteration_${iters} checkpoint"; return
     fi
     if ! grep -q "sapien_depth_is_metric=True" "$root/$ep/cfg_args" 2>/dev/null; then
       echo "$ep was trained without depth"; return
+    fi
+    if [ -n "$scene" ] && [ -d "input/$scene/mask" ] \
+       && ! grep -q "masks='[^']" "$root/$ep/cfg_args" 2>/dev/null; then
+      echo "$ep was trained without object masks"; return
     fi
   done
   echo "complete"
@@ -237,11 +247,11 @@ for S in $SCENES; do
 
   # --- [1] static 3DGS, both endpoints, with depth ----------------------
   if has_stage 1; then
-    if static_complete "$SHARED" "$ITERS"; then
+    if static_complete "$SHARED" "$ITERS" "$S"; then
       echo "  [1/5] static 3DGS t0 + tfinal @ ${ITERS} with depth: present, reusing"
     else
       echo "  [1/5] static 3DGS t0 + tfinal, ${ITERS} iters with depth"
-      echo "        (rebuilding: $(static_why "$SHARED" "$ITERS"))  -> $LOGDIR/${S}_static.log"
+      echo "        (rebuilding: $(static_why "$SHARED" "$ITERS" "$S"))  -> $LOGDIR/${S}_static.log"
       $PY tools/train_all_static_endpoints.py \
           --only "$S" --iterations "$ITERS" --tag "$TAG" \
           --output-root "$SROOT" \
@@ -274,9 +284,9 @@ for S in $SCENES; do
   if [ "$PER_SCENE" = "1" ] && [ -d "$SHARED" ] && [ ! -e "$SROOT/static" ]; then
     ln -s "${S}_${TAG}/shared" "$SROOT/static"
   fi
-  if ! static_complete "$SHARED" "$ITERS"; then
+  if ! static_complete "$SHARED" "$ITERS" "$S"; then
     STATUS+=("$S SKIPPED(static incomplete)")
-    echo "  !! static stage incomplete: $(static_why "$SHARED" "$ITERS")"
+    echo "  !! static stage incomplete: $(static_why "$SHARED" "$ITERS" "$S")"
     echo "     run with stage 1 enabled to build it"
     continue
   fi
@@ -344,7 +354,7 @@ printf "%-18s %-9s %-9s %-10s %-9s %-7s %-6s\n" \
 printf -- "------------------ --------- --------- ---------- --------- ------- ------\n"
 for S in $SCENES; do
   scene_paths "$S"
-  static_complete "$SHARED" "$ITERS" && A=ok || A=MISSING
+  static_complete "$SHARED" "$ITERS" "$S" && A=ok || A=MISSING
   NC=$(ls "$COH"/phase1_centers/centers_frame_*.npy 2>/dev/null | wc -l)
   [ "$NC" -ge "$FRAMES" ] && B="${NC}f" || B=MISSING
   if [ -f "$COH/predicted_support.json" ]; then

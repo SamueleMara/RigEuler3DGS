@@ -83,3 +83,6 @@ tests/**/*.zip
 tests/**/*.npy
 tests/**/*.ply
 tests/**/diagnostics/
+
+# Task specs written for a run, not part of the published code.
+CODEX_*.md

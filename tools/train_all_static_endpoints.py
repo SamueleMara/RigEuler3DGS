@@ -70,6 +70,14 @@ def _train_command(args, source_scene: Path, model_dir: Path, scene: Path, frame
     depth_dir = Path(source_scene) / "depth_npy"
     if depth_dir.is_dir() and any(depth_dir.iterdir()):
         cmd.extend(["--depths", "depth_npy", "--sapien_depth_is_metric"])
+    # Object masks as ground-truth alpha. Absolute, and taken from the ORIGINAL
+    # scene rather than source_scene: the synthesised frame_t scene has its own
+    # colmap/ but no mask/, and its images are symlinks back into <scene>/rgb/,
+    # so one mask tree serves both endpoints. Without this the RGB term scores
+    # background pixels against nothing and the silhouette grows black splats.
+    mask_dir = Path(scene) / "mask"
+    if mask_dir.is_dir() and any(mask_dir.iterdir()):
+        cmd.extend(["--masks", str(mask_dir.resolve())])
     dino_root = scene / "dinov3"
     if bool(args.use_dino) and _has_frame_cache(dino_root, int(frame_idx)):
         cmd.extend(["--use_dino_feature_field", "--dinov3_root", str(dino_root)])
