@@ -13,9 +13,171 @@ from scene.cameras import Camera
 import numpy as np
 from utils.graphics_utils import fov2focal
 from PIL import Image
+from pathlib import Path
+import os
 import cv2
+import torch
 
 WARNED = False
+
+MASK_SUFFIXES = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
+
+
+def object_mask_root(args):
+    """Absolute directory holding the object masks, or None when --masks is unset.
+
+    Read relative to --source_path, the way --images and --depths are, and
+    taken as given when absolute. The pipeline's scenes keep their masks at
+    <scene>/mask while COLMAP lives at <scene>/colmap, so the absolute form is
+    what the endpoint trainer passes: the synthesised frame_t scene has its own
+    colmap/ but no mask/ of its own.
+    """
+    masks = getattr(args, "masks", "") or ""
+    if not masks:
+        return None
+    root = Path(masks)
+    if not root.is_absolute():
+        root = Path(getattr(args, "source_path", "")) / root
+    root = Path(os.path.normpath(str(root)))
+    if not root.is_dir():
+        raise FileNotFoundError(
+            f"--masks points at {root}, which is not a directory. Give a path "
+            "relative to --source_path, or an absolute one.")
+    return root
+
+
+def image_root_candidates(args):
+    """Directories an image path may be relative to, most specific first."""
+    source = str(getattr(args, "source_path", "") or "")
+    if not source:
+        return []
+    images_dir = str(getattr(args, "images", "") or "images")
+    roots = []
+    try:
+        from scene.dynamic_sequence_dataset import infer_colmap_source_path
+        roots.append(Path(infer_colmap_source_path(source)) / images_dir)
+    except Exception:
+        pass
+    roots.append(Path(source) / images_dir)
+    roots.append(Path(source))
+    seen, unique = set(), []
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return unique
+
+
+def resolve_object_mask_path(image_path, args, mask_root):
+    """The one mask belonging to this image, or an exception.
+
+    Matching is on the path RELATIVE to the image root, never on the basename.
+    Every camera in these datasets names its frames identically --
+    cam_000/frame_000000.png and cam_001/frame_000000.png -- so a basename
+    match would hand one camera another camera's silhouette and the error
+    would look like a calibration problem, not a lookup bug.
+    """
+    image_path = Path(image_path)
+    roots = image_root_candidates(args)
+    rel = None
+    # abspath BEFORE resolve, and never only resolve: the synthesised frame_t
+    # scenes fill colmap/images/ with symlinks back into <scene>/rgb/, so
+    # resolving first silently rewrites cam_004/frame_000000.png into
+    # rgb/cam_004/frame_000000.png and then looks for mask/rgb/cam_004/... .
+    # The link's own path is the one the mask tree mirrors.
+    for normalise in (os.path.abspath, lambda q: str(Path(q).resolve())):
+        for root in roots:
+            try:
+                rel = Path(normalise(str(image_path))).relative_to(
+                    Path(normalise(str(root))))
+                break
+            except (ValueError, OSError):
+                continue
+        if rel is not None:
+            break
+    if rel is None:
+        raise ValueError(
+            f"Cannot place {image_path} under any image root "
+            f"({', '.join(str(r) for r in roots) or 'none known'}). The mask "
+            "tree mirrors the image tree, so an image outside it has no "
+            "unambiguous mask. Move it under the root, or drop --masks.")
+    found = []
+    for suffix in (image_path.suffix, *MASK_SUFFIXES):
+        if not suffix:
+            continue
+        candidate = mask_root / rel.with_suffix(suffix)
+        if candidate.is_file() and candidate.resolve() not in {f.resolve() for f in found}:
+            found.append(candidate)
+    if not found:
+        raise FileNotFoundError(
+            f"No mask for {image_path}. Expected {mask_root / rel}. --masks "
+            "requires one for every image: there is no all-ones fallback, "
+            "because a silent one supervises the whole background as object "
+            "and is indistinguishable from the bug it would cause.")
+    if len(found) > 1:
+        raise ValueError(
+            f"Ambiguous mask for {image_path}: "
+            + ", ".join(str(f) for f in found)
+            + ". Keep one file per image.")
+    return found[0]
+
+
+def load_object_alpha_premult(image, image_path, mask_path, resolution):
+    """Ground-truth alpha and premultiplied colour at the training resolution.
+
+    Background pixels in these renders are black, and black is not the
+    object's colour there -- it means "nothing was seen". Downsampling the
+    blacked-out RGB and the mask as two separate images averages that black
+    into the object's edge, which is the dark halo the border Gaussians then
+    faithfully learn. Premultiplying FIRST and resizing colour and coverage
+    with the same kernel keeps `premul + (1 - alpha) * b` equal to the area
+    average of the per-pixel composite, so the edge carries no colour the
+    camera never recorded.
+
+    Returns (premultiplied RGB [3,H,W], alpha [1,H,W]), both float32 in [0,1].
+    """
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    mask = np.asarray(Image.open(mask_path).convert("L"), dtype=np.uint8)
+    if mask.shape != rgb.shape[:2]:
+        raise ValueError(
+            "Mask and image disagree on size.\n"
+            f"  image {image_path} -> {rgb.shape[1]}x{rgb.shape[0]}\n"
+            f"  mask  {mask_path} -> {mask.shape[1]}x{mask.shape[0]}\n"
+            "They must match at source resolution; both are resized together "
+            "afterwards.")
+    off_binary = np.unique(mask[(mask != 0) & (mask != 255)])
+    if off_binary.size:
+        shown = ", ".join(str(int(v)) for v in off_binary[:8])
+        raise ValueError(
+            f"{mask_path} is not binary: it also holds {shown}"
+            + (", and more" if off_binary.size > 8 else "")
+            + ". White is foreground, black is background. Nothing is "
+              "thresholded here on purpose -- a guessed cut silently decides "
+              "which pixels are supervised as object.")
+
+    alpha0 = mask.astype(np.float32) / 255.0
+    premul0 = rgb * alpha0[..., None]
+
+    target_w, target_h = int(resolution[0]), int(resolution[1])
+    src_h, src_w = alpha0.shape
+    if (target_w, target_h) == (src_w, src_h):
+        premul, alpha = premul0, alpha0
+    else:
+        # INTER_AREA downward so edge alpha means coverage; never INTER_NEAREST,
+        # which would snap a half-covered edge pixel to fully object or fully
+        # background and put the halo straight back.
+        interp = cv2.INTER_AREA if (target_w < src_w or target_h < src_h) else cv2.INTER_LINEAR
+        premul = cv2.resize(premul0, (target_w, target_h), interpolation=interp)
+        alpha = cv2.resize(alpha0, (target_w, target_h), interpolation=interp)
+
+    premul_t = torch.from_numpy(
+        np.ascontiguousarray(premul.transpose(2, 0, 1))).float().clamp_(0.0, 1.0)
+    alpha_t = torch.from_numpy(
+        np.ascontiguousarray(alpha[None])).float().clamp_(0.0, 1.0)
+    if not (torch.isfinite(premul_t).all() and torch.isfinite(alpha_t).all()):
+        raise ValueError(f"Non-finite values after resizing {mask_path}")
+    return premul_t, alpha_t
 
 def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dataset):
     image = Image.open(cam_info.image_path)
@@ -109,6 +271,23 @@ def loadCam(args, id, cam_info, resolution_scale, is_nerf_synthetic, is_test_dat
     for attr in ["camera_id", "frame_id", "timestamp", "raw_timestamp", "mask_path", "depth_path"]:
         if hasattr(cam_info, attr):
             setattr(cam, attr, getattr(cam_info, attr))
+
+    # Object masks as ground-truth alpha. Attached only when --masks is given;
+    # without it every attribute below stays None and the camera is exactly
+    # what it was before. This is NOT cam.alpha_mask, which stays the
+    # loss-validity mask for the --train_test_exp half-image split.
+    mask_root = object_mask_root(args)
+    if mask_root is not None:
+        mask_path = resolve_object_mask_path(cam_info.image_path, args, mask_root)
+        premult, alpha = load_object_alpha_premult(
+            image, cam_info.image_path, mask_path, resolution)
+        if tuple(alpha.shape[-2:]) != (cam.image_height, cam.image_width):
+            raise ValueError(
+                f"{mask_path} resized to {tuple(alpha.shape[-2:])} but the "
+                f"camera is {(cam.image_height, cam.image_width)}")
+        cam.object_rgb_premult = premult.to(cam.data_device)
+        cam.object_alpha = alpha.to(cam.data_device)
+        cam.object_mask_path = str(mask_path)
     return cam
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args, is_nerf_synthetic, is_test_dataset):

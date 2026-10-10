@@ -387,7 +387,16 @@ def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb
                 use_trained_exp=dataset.train_test_exp,
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )["render"].clamp(0, 1)
-            target = camera.original_image.cuda().clamp(0, 1)
+            if getattr(camera, "object_alpha", None) is not None:
+                # Composite the reference over the SAME background the render
+                # just used. Comparing an object over black against a
+                # prediction over white reports a difference that is only the
+                # choice of background.
+                target = (camera.object_rgb_premult.cuda()
+                          + (1.0 - camera.object_alpha.cuda())
+                          * background[:, None, None]).clamp(0, 1)
+            else:
+                target = camera.original_image.cuda().clamp(0, 1)
             l1_value += float(l1_loss(image, target))
             psnr_value += float(psnr(image, target).mean())
         l1_value /= len(cameras)
@@ -401,15 +410,40 @@ def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb
 
 
 def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt, depth_weight):
+    # --masks turns on Splatfacto-style transparency carving for the RGB term
+    # and nothing else: the depth, semantic, DINO and SAM3 terms below are
+    # untouched and still see `background`.
+    object_alpha = getattr(camera, "object_alpha", None)
+    object_mode = object_alpha is not None
+    if object_mode:
+        # One random colour per iteration, used by BOTH the render and the
+        # ground truth. Over background the target is exactly that colour, so
+        # a Gaussian sitting there must reproduce a colour that changes every
+        # step. No fixed albedo can, and the only move that lowers the loss is
+        # to take its opacity to zero -- which is how the black border splats
+        # disappear without a silhouette loss, without touching the CUDA
+        # rasteriser, and without masking the prediction.
+        render_background = torch.rand(3, device="cuda")
+    else:
+        render_background = background
     package = render(
-        camera, gaussians, pipe, background,
+        camera, gaussians, pipe, render_background,
         use_trained_exp=dataset.train_test_exp,
         separate_sh=SPARSE_ADAM_AVAILABLE,
     )
     image = package["render"]
-    if camera.alpha_mask is not None:
-        image = image * camera.alpha_mask.cuda()
-    target = camera.original_image.cuda()
+    if object_mode:
+        # Deliberately no `image = image * object_alpha` and no masking of the
+        # target. Multiplying the prediction by the foreground mask is what let
+        # the background keep arbitrary geometry: nothing scored those pixels,
+        # so anything could sit there for free. Here the ordinary full-image
+        # RGB loss supervises them.
+        target = (camera.object_rgb_premult.cuda()
+                  + (1.0 - object_alpha.cuda()) * render_background[:, None, None])
+    else:
+        if camera.alpha_mask is not None:
+            image = image * camera.alpha_mask.cuda()
+        target = camera.original_image.cuda()
     rgb_l1 = l1_loss(image, target)
     dssim = 1.0 - ssim(image, target)
     total = (1.0 - opt.lambda_dssim) * rgb_l1 + opt.lambda_dssim * dssim

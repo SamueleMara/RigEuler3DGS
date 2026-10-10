@@ -53,6 +53,16 @@ class Camera(nn.Module):
             else:
                 self.alpha_mask[..., self.alpha_mask.shape[-1] // 2:] = 0
 
+        # Splatfacto-style transparency carving, populated by loadCam only when
+        # --masks is given. Kept separate from alpha_mask above on purpose:
+        # alpha_mask says which pixels COUNT (the --train_test_exp half-image
+        # split), object_alpha says how much object COVERS a pixel. Using one
+        # as the other either defeats the exposure protocol or stops scoring
+        # the background altogether, which is the bug this feature fixes.
+        self.object_alpha = None            # [1,H,W] coverage in [0,1], or None
+        self.object_rgb_premult = None      # [3,H,W] colour * coverage, or None
+        self.object_mask_path = None
+
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]

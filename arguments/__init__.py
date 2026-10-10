@@ -58,6 +58,16 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._depths = ""
+        # Per-image binary object masks (white = object, black = background),
+        # as a directory mirroring the image tree. Empty means the legacy path,
+        # byte for byte. When set, the mask is treated as ground-truth ALPHA
+        # and the RGB loss composites both sides over the same freshly sampled
+        # random background -- see _static_visual_loss in train.py.
+        #
+        # No leading underscore on purpose: ParamGroup turns `_name` into
+        # `--name` plus the short `-n`, and `-m` already belongs to
+        # _model_path. `--masks` is spelled in full.
+        self.masks = ""
         # Depth stored as metric distance rather than as inverse depth. The
         # renderer composites 1/z, so a metric map has to be inverted before
         # it can be compared with what comes out. Without this a .npy holding
