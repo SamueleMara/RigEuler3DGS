@@ -37,6 +37,10 @@ NG=${NG:-0}                   # 0 = every Gaussian
 CAMERA=${CAMERA:-1}
 BOOT=${BOOT:-12}              # Phase-1 IEKF iterations per frame
 KNN=${KNN:-12}                # ONE global coherence default; never per scene
+# Supernode COUNT, not size: the node count must not scale with how densely
+# the object happens to be modelled, or `k` stops meaning the same thing and
+# the moving body fragments. See the comment in run_motion_coherence_support.
+SNCOUNT=${SNCOUNT:-192}
 FOLDS=${FOLDS:-5}
 RIGID_ITERS=${RIGID_ITERS:-8}
 CG=${CG:-40}
@@ -287,7 +291,8 @@ for S in $SCENES; do
         --scene "$S" --model "$MODEL" --source "input/$S" \
         --frames "$FRAMES" --cameras "$CAMS" \
         --max-gaussians "$NG" --bootstrap-iters "$BOOT" \
-        --coherence-knn "$KNN" --cv-folds "$FOLDS" --frames-on-cpu \
+        --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
+        --cv-folds "$FOLDS" --frames-on-cpu \
         --out "$COH" > "$SLOG/${S}_coherence.log" 2>&1
     RC=$?
     if [ $RC -ne 0 ]; then

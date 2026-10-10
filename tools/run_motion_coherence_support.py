@@ -49,7 +49,24 @@ def main() -> int:
     ap.add_argument("--cameras", type=int, default=8)
     ap.add_argument("--max-gaussians", type=int, default=0)
     ap.add_argument("--bootstrap-iters", type=int, default=6)
-    ap.add_argument("--supernode-size", type=int, default=64)
+    # 0 means "size the graph by COUNT" -- see the comment at the call site.
+    # A positive value pins Gaussians-per-node instead, reproducing the older
+    # behaviour, and takes precedence.
+    ap.add_argument("--supernode-size", type=int, default=0)
+    ap.add_argument("--supernode-count", type=int, default=192,
+                    help="how many supernodes the coherence graph has, "
+                         "independent of how many Gaussians the model holds. "
+                         "ONE global value, never tuned per scene.")
+    # 192 was chosen by sweeping {128, 192, 256, 384} on five scenes and
+    # taking the best mean AND best worst case (mean F1 0.733 / worst 0.404,
+    # against 0.617 / 0.381 for the old fixed size of 64). 128 has the best
+    # single score, on USB, but collapses blade to F1 0.395 and storage to
+    # 0.191 -- too few nodes and the graph cannot resolve a boundary, so the
+    # selector takes the whole scene.
+    #
+    # Choosing it on GT F1 is tuning on GT, so it was then validated on the
+    # four scenes NOT in the sweep: +0.033 mean F1, better on three of four
+    # (scissor +0.098, oven +0.026, foldchair +0.013, fridge -0.006).
     ap.add_argument("--coherence-knn", type=int, default=12,
                     help="section 4: ONE global default for every dataset; "
                          "do not tune it per scene")
@@ -149,12 +166,38 @@ def main() -> int:
                     torch.as_tensor(p).double().cpu().numpy())
 
     # ---- sections 3-17: the coherence branch -----------------------------
+    #
+    # THE GRAPH IS SIZED BY NODE COUNT, NOT BY GAUSSIANS PER NODE.
+    #
+    # `target_size` makes the node count scale with the model: training the
+    # same object for 30k instead of 14k iterations roughly doubles the
+    # Gaussians, and with a fixed 64 per node the graph doubled too -- USB
+    # 177 -> 323 nodes, laptop 438 -> 722. The kNN degree `k` stayed at 12, so
+    # the same physical part came to span twice as many nodes at the same
+    # connectivity. The extracted component did NOT keep up (USB 93 -> 89
+    # nodes, laptop 120 -> 90), so it covered half the body and recall halved:
+    # USB 0.874 -> 0.446, blade 0.897 -> 0.555, storage 0.532 -> 0.283.
+    # Precision was unaffected, which is what rules out the selector being
+    # permissive -- the body fragmented and single linkage could no longer
+    # span it.
+    #
+    # Fixing the COUNT makes the graph the same shape whatever the Gaussian
+    # density, so `k` means the same thing and a result is comparable across
+    # models. `--supernode-size` still works and takes precedence when given,
+    # for reproducing an earlier run.
     mu0 = mu0.double().cpu()
-    part = build_supernodes(mu0.float(), target_size=args.supernode_size,
-                            seed=args.seed)
+    if args.supernode_size:
+        part = build_supernodes(mu0.float(), target_size=args.supernode_size,
+                                seed=args.seed)
+        how = f"target size {args.supernode_size}"
+    else:
+        want = min(int(args.supernode_count), int(mu0.shape[0]))
+        part = build_supernodes(mu0.float(), num_supernodes=want,
+                                seed=args.seed)
+        how = (f"target count {args.supernode_count}, "
+               f"{mu0.shape[0] / max(want, 1):.0f} Gaussians per node")
     sid = part.supernode_id.long().cpu()
-    print(f"  {int(sid.max()) + 1} supernodes (target size "
-          f"{args.supernode_size})")
+    print(f"  {int(sid.max()) + 1} supernodes ({how})")
     res = run_motion_coherence(positions, sid, knn=args.coherence_knn,
                                verbose=True)
 
@@ -214,7 +257,9 @@ def main() -> int:
         "dynamic_gaussians": dyn_g.tolist(),
         "predicted_dynamic_fraction": float(dyn_g.numel()) / max(int(mu0.shape[0]), 1),
         "graph_config": {**res["graph"], "coherence_knn": args.coherence_knn,
-                         "supernode_target_size": args.supernode_size},
+                         "supernode_target_size": args.supernode_size,
+                         "supernode_count": args.supernode_count,
+                         "num_supernodes_built": int(sid.max()) + 1},
         "component_stats": [{k: v for k, v in c.items() if k != "per_frame"}
                             for c in res["components"]],
         "identification": res["identification"],
