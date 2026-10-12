@@ -172,3 +172,79 @@ def to_original_order(values, direction):
     except TypeError as exc:
         raise TypeError(
             f"cannot reverse {type(values).__name__} into original order") from exc
+
+
+# ---------------------------------------------------------------------------
+# Updated execution order, step 2: one direction context every stage consumes.
+#
+# Phase 1, coherence, rigid Phase 2 and the reduction each need the same three
+# facts -- which way time runs, which endpoint the geometry came from, and what
+# the original frame numbers are. Letting each stage re-derive them is how two
+# of them end up disagreeing about frame 0, so they are derived once here and
+# passed down.
+# ---------------------------------------------------------------------------
+class DirectionContext:
+    """Direction, endpoint and index mapping, resolved once per run."""
+
+    def __init__(self, direction=FORWARD, total_frames: int = 0,
+                 canonical_endpoint_name=None, sequence_start: int = 0):
+        self.direction = normalise(direction)
+        self.endpoint = validate_endpoint(self.direction, canonical_endpoint_name)
+        self.total_frames = int(total_frames)
+        self.sequence_start = int(sequence_start)
+
+    @property
+    def is_backward(self) -> bool:
+        return self.direction == BACKWARD
+
+    def original_index(self, processing_index: int) -> int:
+        """Dataset frame number for a given step of this walk."""
+        if self.direction == FORWARD:
+            if not 0 <= processing_index < self.total_frames:
+                raise IndexError(
+                    f"processing index {processing_index} outside "
+                    f"[0, {self.total_frames})")
+            return self.sequence_start + processing_index
+        return self.sequence_start + original_frame_index(
+            processing_index, self.total_frames)
+
+    def processing_index(self, original: int) -> int:
+        """Inverse of `original_index`."""
+        local = int(original) - self.sequence_start
+        if not 0 <= local < self.total_frames:
+            raise IndexError(
+                f"original frame {original} outside the window "
+                f"[{self.sequence_start}, {self.sequence_start + self.total_frames})")
+        return local if self.direction == FORWARD else self.total_frames - 1 - local
+
+    def order(self) -> list[int]:
+        """Original frame numbers in the order this walk processes them."""
+        return [self.sequence_start + i
+                for i in frame_order(self.total_frames, self.direction)]
+
+    def to_original(self, values):
+        """Reorder per-step values into original chronological order."""
+        return to_original_order(values, self.direction)
+
+    def as_dict(self) -> dict:
+        return {
+            "direction": self.direction,
+            "canonical_endpoint": self.endpoint,
+            "total_frames": self.total_frames,
+            "sequence_start": self.sequence_start,
+            "processing_order_original_indices": self.order(),
+        }
+
+    def __repr__(self) -> str:
+        return (f"DirectionContext({self.direction}, endpoint={self.endpoint}, "
+                f"frames={self.total_frames}, start={self.sequence_start})")
+
+
+def context_from_frame_ids(frame_ids) -> DirectionContext:
+    """Rebuild the context from what a loaded sequence already recorded."""
+    return DirectionContext(
+        direction=frame_ids.get("sequence_direction", FORWARD),
+        total_frames=int(frame_ids.get("num_frames", len(frame_ids.get("frames", [])))),
+        canonical_endpoint_name=frame_ids.get("canonical_endpoint"),
+        sequence_start=int(frame_ids.get("sequence_start", 0)),
+    )
