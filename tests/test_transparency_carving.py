@@ -211,7 +211,9 @@ def test_flag_semantics() -> None:
     ModelParams(parser)
     OptimizationParams(parser)
     defaults = parser.parse_args(["-s", "/tmp"])
-    check("carving defaults off", defaults.splatfacto_carving is False)
+    check("carving defaults ON", defaults.splatfacto_carving is True)
+    off = parser.parse_args(["-s", "/tmp", "--no-splatfacto_carving"])
+    check("--no-splatfacto_carving opts out", off.splatfacto_carving is False)
     check("debug defaults off", defaults.carving_debug is False)
     check("debug interval default 1000", defaults.carving_debug_interval == 1000)
     check("background seed default 2026", defaults.carving_background_seed == 2026)
@@ -220,27 +222,51 @@ def test_flag_semantics() -> None:
 
 # --- 2. startup validation ------------------------------------------------
 def test_validation() -> None:
+    global CHECKS
     print("[2] option combinations that would answer the wrong question")
     import train as train_module
 
     dataset = SimpleNamespace(masks="")
     scene = SimpleNamespace(getTrainCameras=lambda: [])
 
-    raises("carving without --masks is rejected",
+    raises("carving EXPLICITLY requested without --masks is rejected",
            lambda: train_module._validate_carving_options(
                dataset, SimpleNamespace(splatfacto_carving=True, carving_debug=False,
-                                        random_background=False), scene),
+                                        random_background=False), scene,
+               explicitly_requested=True),
            "requires --masks")
+    # The default-on case must NOT fail a dataset that has no masks, or every
+    # maskless scene stops training the moment carving becomes the default.
+    CHECKS += 1
+    try:
+        train_module._validate_carving_options(
+            dataset, SimpleNamespace(splatfacto_carving=True, carving_debug=False,
+                                     random_background=False), scene,
+            explicitly_requested=False)
+    except Exception as exc:  # noqa: BLE001
+        FAILURES.append(f"default-on carving must tolerate a maskless dataset: {exc}")
+        print(f"  FAIL  default-on carving must tolerate a maskless dataset: {exc}")
+    # ... and --random_background must still work on such a dataset.
+    CHECKS += 1
+    try:
+        train_module._validate_carving_options(
+            dataset, SimpleNamespace(splatfacto_carving=True, carving_debug=False,
+                                     random_background=True), scene,
+            explicitly_requested=False)
+    except Exception as exc:  # noqa: BLE001
+        FAILURES.append(f"--random_background must still work without masks: {exc}")
+        print(f"  FAIL  --random_background must still work without masks: {exc}")
     raises("debug without --masks is rejected",
            lambda: train_module._validate_carving_options(
                dataset, SimpleNamespace(splatfacto_carving=False, carving_debug=True,
                                         random_background=False), scene),
            "requires --masks")
-    raises("carving with --random_background is rejected",
+    raises("carving with --random_background is rejected when masks exist",
            lambda: train_module._validate_carving_options(
                SimpleNamespace(masks="m"),
                SimpleNamespace(splatfacto_carving=True, carving_debug=False,
-                               random_background=True), scene),
+                               random_background=True), scene,
+               explicitly_requested=False),
            "random_background")
 
     without = SimpleNamespace(image_name="cam_000/frame_000000", object_alpha=None)
@@ -251,17 +277,18 @@ def test_validation() -> None:
                SimpleNamespace(masks="m"),
                SimpleNamespace(splatfacto_carving=True, carving_debug=False,
                                random_background=False),
-               SimpleNamespace(getTrainCameras=lambda: [withmask, without])),
+               SimpleNamespace(getTrainCameras=lambda: [withmask, without]),
+               explicitly_requested=False),
            "no mask")
 
     # Neither flag set: validation must not fire at all, masks or no masks.
-    global CHECKS
     CHECKS += 1
     try:
         train_module._validate_carving_options(
             SimpleNamespace(masks=""),
             SimpleNamespace(splatfacto_carving=False, carving_debug=False,
-                            random_background=True), scene)
+                            random_background=True), scene,
+            explicitly_requested=False)
     except Exception as exc:  # noqa: BLE001
         FAILURES.append(f"legacy path must not be validated: {exc}")
         print(f"  FAIL  legacy path must not be validated: {exc}")
@@ -558,8 +585,11 @@ def test_paired_run() -> None:
                 "--carving_debug", "--carving_debug_interval", "30",
                 "--disable_viewer", "--no_wandb",
             ]
-            if branch == "carving":
-                command.append("--splatfacto_carving")
+            # Carving is the default now, so the CONTROL is the branch that
+            # has to say something: --no-splatfacto_carving loads the masks
+            # and keeps the legacy loss.
+            command.append("--splatfacto_carving" if branch == "carving"
+                           else "--no-splatfacto_carving")
             result = subprocess.run(command, cwd=REPO, capture_output=True,
                                     text=True, timeout=2400)
             check(f"{branch} run completed", result.returncode == 0,

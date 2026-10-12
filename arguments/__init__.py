@@ -38,7 +38,15 @@ class ParamGroup:
             if shorthand:
                 flags.append("-" + key[0])
             if isinstance(value, bool):
-                group.add_argument(*flags, default=default, action="store_true")
+                if value:
+                    # A flag that is already on needs a way off, and
+                    # store_true cannot provide one. BooleanOptionalAction
+                    # gives --name and --no-name. No bool here defaulted to
+                    # True before transparency carving did.
+                    group.add_argument(*flags, default=default,
+                                       action=BooleanOptionalAction)
+                else:
+                    group.add_argument(*flags, default=default, action="store_true")
             else:
                 group.add_argument(*flags, default=default, type=type(value))
 
@@ -120,11 +128,16 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_init = 1.0
         self.depth_l1_weight_final = 0.01
         self.random_background = False
-        # Splatfacto-style transparency carving. This is the ONLY flag that
-        # changes the training objective. --masks on its own now loads the
-        # masks for telemetry and nothing else, so the A/B control can measure
-        # background opacity without its loss being touched.
-        self.splatfacto_carving = False
+        # Splatfacto-style transparency carving: the default method whenever
+        # --masks is supplied. Measured on USB_100109 over 30k iterations it
+        # cuts background opacity 3.8x with the object untouched (foreground
+        # occupancy 0.9917 -> 0.9971) and 15% fewer primitives; see
+        # results/carving_ab_USB_100109/.
+        #
+        # Without --masks there is nothing to carve against and training is
+        # the legacy path untouched. --no-splatfacto_carving loads the masks
+        # and keeps the legacy loss, which is how the A/B control is run.
+        self.splatfacto_carving = True
         # Logging only. Valid with or without carving; needs --masks either
         # way, since every metric is defined against the foreground mask.
         self.carving_debug = False

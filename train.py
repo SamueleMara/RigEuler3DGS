@@ -426,36 +426,48 @@ def _git_commit():
         return "unknown"
 
 
-def _validate_carving_options(dataset, opt, scene):
-    """Reject the option combinations that would quietly produce a bad A/B.
+def _validate_carving_options(dataset, opt, scene, explicitly_requested=None):
+    """Reject the option combinations that would quietly train the wrong thing.
 
-    Every one of these is a case where training would run to completion and
-    report plausible numbers that answer a different question than the one
-    asked, which is worse than a crash.
+    Carving is on by default, so "carving requested but no masks" is only an
+    error when the flag was actually typed. A dataset with no masks has
+    nothing to carve against and simply runs the legacy path -- failing those
+    runs would break every scene that has no mask directory.
     """
+    if explicitly_requested is None:
+        explicitly_requested = "--splatfacto_carving" in sys.argv
     carving = bool(getattr(opt, "splatfacto_carving", False))
     debug = bool(getattr(opt, "carving_debug", False))
-    if not (carving or debug):
+    has_masks = bool(str(getattr(dataset, "masks", "") or ""))
+    active = carving and has_masks
+
+    if explicitly_requested and not has_masks:
+        raise ValueError(
+            "--splatfacto_carving requires --masks: the mask IS the "
+            "ground-truth alpha the objective composites against.")
+    if debug and not has_masks:
+        raise ValueError(
+            "--carving_debug requires --masks. Every diagnostic -- background "
+            "leakage above all -- is defined against the foreground mask.")
+    if not active:
         return
-    if carving and bool(getattr(opt, "random_background", False)):
+    if bool(getattr(opt, "random_background", False)):
         raise ValueError(
-            "--splatfacto_carving and --random_background are two different "
-            "implementations of the same idea and would fight: carving needs "
-            "the render background and the composited target to be the SAME "
-            "sample, and --random_background draws its own. Pass one.")
-    if not str(getattr(dataset, "masks", "") or ""):
-        need = "--splatfacto_carving" if carving else "--carving_debug"
-        raise ValueError(
-            f"{need} requires --masks. Carving uses the mask as ground-truth "
-            "alpha, and every diagnostic is defined against it.")
+            "carving and --random_background are two implementations of one "
+            "idea and would fight: carving needs the render background and "
+            "the composited target to be the SAME sample, and "
+            "--random_background draws its own. Drop one, or pass "
+            "--no-splatfacto_carving.")
     missing = [c.image_name for c in scene.getTrainCameras()
                if getattr(c, "object_alpha", None) is None]
     if missing:
         raise ValueError(
             f"{len(missing)} of {len(scene.getTrainCameras())} training cameras "
             f"have no mask, first: {missing[:3]}. Carving would train those "
-            "views on the legacy objective and the diagnostics would average "
-            "two different experiments.")
+            "views on the legacy objective instead, which is two experiments "
+            "averaged together rather than one method.")
+    print(f"[carving] transparency carving ACTIVE on "
+          f"{len(scene.getTrainCameras())} cameras (masks: {dataset.masks})")
 
 
 def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt,
