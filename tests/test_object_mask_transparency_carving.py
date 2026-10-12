@@ -173,6 +173,35 @@ def test_mask_association() -> None:
         raises("missing mask dir fails loudly",
                lambda: object_mask_root(args_bad), "not a directory")
 
+        # One file reachable under two spellings is NOT ambiguous. A
+        # case-insensitive filesystem -- exFAT, which the external datasets
+        # live on -- reports both frame_000000.png and frame_000000.PNG for
+        # the same file, and comparing the path strings refused every scene
+        # on that drive. A hard link reproduces the identity relation on a
+        # case-sensitive filesystem.
+        import os
+        link_root = root / "mask_linked"
+        (link_root / "cam_000").mkdir(parents=True)
+        real = link_root / "cam_000" / "frame_000000.png"
+        real.write_bytes((root / "mask" / "cam_000" / "frame_000000.png").read_bytes())
+        os.link(real, link_root / "cam_000" / "frame_000000.PNG")
+        got = resolve_object_mask_path(
+            root / "colmap" / "images" / "cam_000" / "frame_000000.png",
+            args, link_root)
+        check("two spellings of one file resolve, not conflict",
+              os.path.samefile(got, real), str(got))
+
+        # Two genuinely different files under one stem stay an error.
+        split_root = root / "mask_split"
+        (split_root / "cam_000").mkdir(parents=True)
+        (split_root / "cam_000" / "frame_000000.png").write_bytes(real.read_bytes())
+        (split_root / "cam_000" / "frame_000000.jpg").write_bytes(b"different file")
+        raises("two distinct masks for one image still fail",
+               lambda: resolve_object_mask_path(
+                   root / "colmap" / "images" / "cam_000" / "frame_000000.png",
+                   args, split_root),
+               "ambiguous")
+
 
 # --- 3. mask validation ---------------------------------------------------
 def test_mask_validation() -> None:

@@ -107,7 +107,23 @@ def resolve_object_mask_path(image_path, args, mask_root):
         if not suffix:
             continue
         candidate = mask_root / rel.with_suffix(suffix)
-        if candidate.is_file() and candidate.resolve() not in {f.resolve() for f in found}:
+        if not candidate.is_file():
+            continue
+        # Deduplicate by file IDENTITY, not by path text. exFAT -- which every
+        # dataset on the external drive lives on -- is case-insensitive, so
+        # frame_000000.png and frame_000000.PNG are ONE file under two
+        # spellings, and resolve() keeps them apart because it normalises
+        # links, not case. Comparing the strings reported every mask on that
+        # drive as ambiguous and refused to train.
+        duplicate = False
+        for seen in found:
+            try:
+                duplicate = os.path.samefile(candidate, seen)
+            except OSError:
+                duplicate = False
+            if duplicate:
+                break
+        if not duplicate:
             found.append(candidate)
     if not found:
         raise FileNotFoundError(
