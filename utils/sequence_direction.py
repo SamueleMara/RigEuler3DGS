@@ -248,3 +248,88 @@ def context_from_frame_ids(frame_ids) -> DirectionContext:
         canonical_endpoint_name=frame_ids.get("canonical_endpoint"),
         sequence_start=int(frame_ids.get("sequence_start", 0)),
     )
+
+
+# ---------------------------------------------------------------------------
+# Section 6: endpoint/direction consistency enforced from PROVENANCE.
+#
+# A path called ".../final" proves nothing -- it is a directory name. What
+# proves which endpoint a model belongs to is the frame its cameras were
+# registered at, which the trained model records in cfg_args and which the
+# dataset records in its COLMAP images list. Both are read.
+# ---------------------------------------------------------------------------
+def endpoint_frame_of_colmap(colmap_dir) -> int | None:
+    """Original frame index a COLMAP model's images were registered at.
+
+    Returns None when the model registers more than one frame, which is what
+    an ordinary multi-frame reconstruction looks like and is not an endpoint.
+    """
+    import re
+    from pathlib import Path
+
+    images_txt = Path(colmap_dir) / "sparse" / "0" / "images.txt"
+    if not images_txt.is_file():
+        return None
+    frames = set()
+    for line in images_txt.read_text(errors="ignore").splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        match = re.search(r"frame_(\d+)\.(?:png|jpg|jpeg)", line)
+        if match:
+            frames.add(int(match.group(1)))
+    if len(frames) != 1:
+        return None
+    return frames.pop()
+
+
+def model_source_path(model_dir) -> str | None:
+    """The dataset a trained model was built from, out of its cfg_args."""
+    import re
+    from pathlib import Path
+
+    cfg = Path(model_dir) / "cfg_args"
+    if not cfg.is_file():
+        return None
+    match = re.search(r"source_path='([^']*)'", cfg.read_text(errors="ignore"))
+    return match.group(1) if match else None
+
+
+def verify_endpoint_provenance(direction, model_dir, *, total_frames=None,
+                               strict=True) -> dict:
+    """Check the model really is the endpoint this direction requires.
+
+    Returns the evidence either way. With `strict`, a contradiction raises:
+    running backward against the initial model produces a well-formed,
+    meaningless result, and the only moment it is cheap to catch is here.
+    """
+    direction = normalise(direction)
+    expected = canonical_endpoint(direction)
+    source = model_source_path(model_dir)
+    frame = endpoint_frame_of_colmap(source) if source else None
+
+    observed = None
+    if frame is not None:
+        if frame == 0:
+            observed = "initial"
+        elif total_frames is None or frame == int(total_frames) - 1:
+            observed = "final"
+    evidence = {
+        "direction": direction,
+        "expected_endpoint": expected,
+        "model_path": str(model_dir),
+        "dataset_colmap_path": source,
+        "endpoint_original_frame": frame,
+        "observed_endpoint": observed,
+        "consistent": observed is None or observed == expected,
+        "basis": ("COLMAP images.txt registers a single frame"
+                  if frame is not None else
+                  "could not determine the endpoint frame from provenance"),
+    }
+    if strict and observed is not None and observed != expected:
+        raise ValueError(
+            f"--direction {direction} requires the {expected} endpoint model, "
+            f"but {model_dir} was trained from {source}, whose COLMAP "
+            f"registers original frame {frame} ({observed} endpoint). "
+            "Running this combination produces a well-formed result that "
+            "answers neither direction's question.")
+    return evidence

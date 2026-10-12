@@ -38,7 +38,8 @@ def _csv(path: Path, header, rows):
         w.writerows(rows)
 
 
-def _write_phase1_direction_debug(out, frame_ids, ctx, scene, num_positions):
+def _write_phase1_direction_debug(out, frame_ids, ctx, scene, num_positions,
+                                  endpoint_evidence=None):
     """Debug for the backward Phase-1 phase.
 
     The failure this catches is silent: a trajectory saved under the wrong
@@ -59,6 +60,12 @@ def _write_phase1_direction_debug(out, frame_ids, ctx, scene, num_positions):
             "in the final gauge and only the time axis is restored"
             if ctx.is_backward else "initial endpoint model"),
         "frame_order_checks": report["checks"],
+        "endpoint_provenance": endpoint_evidence or {},
+        "trajectory_objects": {
+            "canonical_xyz": "endpoint model geometry, never a trajectory frame",
+            "positions_processing_order": "as the filter produced them",
+            "positions_original_order": "chronological, what coherence reads",
+        },
     }
     import json as _jsonlib
     (dbg / "phase1_direction.json").write_text(_jsonlib.dumps(payload, indent=1))
@@ -155,9 +162,38 @@ def main() -> int:
         if not files:
             raise SystemExit(f"no centers_frame_*.npy under {d}")
         positions = [torch.from_numpy(np.load(f)).double() for f in files]
-        mu0 = positions[0].clone()
+        # Section 5. The centers are named by ORIGINAL frame, so for a
+        # backward run centers_frame_0000 is the FINAL model's Gaussians
+        # transported to original frame 0 -- it is a pose of the canonical
+        # geometry, not the canonical geometry. Taking mu0 from it would put
+        # the whole solve in the wrong gauge while every array kept its
+        # shape. The canonical set is stored explicitly and read back.
+        manifest_path = d / "trajectory_manifest.json"
+        canonical_path = d / "canonical_xyz.npy"
+        manifest = (json.loads(manifest_path.read_text())
+                    if manifest_path.is_file() else {})
+        reload_direction = str(manifest.get("direction", "forward"))
+        if canonical_path.is_file():
+            mu0 = torch.from_numpy(np.load(canonical_path)).double()
+        elif reload_direction == "backward":
+            raise SystemExit(
+                f"{d} holds a BACKWARD trajectory but no canonical_xyz.npy. "
+                "Its centers are named by original frame, so frame 0 is the "
+                "final model transported to the start of the sequence, not "
+                "the canonical geometry. Re-run Phase 1 to write the "
+                "canonical set rather than guessing it.")
+        else:
+            # Legacy forward trajectories predate the manifest; there frame 0
+            # IS the canonical frame, so this stays compatible.
+            mu0 = positions[0].clone()
+        if manifest.get("trajectory_order") not in (None, "original_chronological"):
+            raise SystemExit(
+                f"{d} records trajectory_order="
+                f"{manifest.get('trajectory_order')!r}; this loader expects "
+                "original chronological order")
         print(f"  reusing {len(positions)} Phase-1 center frames from {d}"
-              f"  ({mu0.shape[0]} Gaussians, no renderer needed)")
+              f"  ({mu0.shape[0]} Gaussians, {reload_direction}, "
+              f"no renderer needed)")
     if positions is None:
         from estimator.sparse_iekf import IEKFConfig
         from tools.run_iekf_scene import (dataset_rgbd_frames, load_scene,
@@ -195,8 +231,18 @@ def main() -> int:
         frames_raw, frame_ids = dataset_rgbd_frames(
             cams_all[:ncam], cfg, ns, truth, Path(source),
             direction=args.direction)
-        from utils.sequence_direction import context_from_frame_ids
+        from utils.sequence_direction import (context_from_frame_ids,
+                                              verify_endpoint_provenance)
         ctx = context_from_frame_ids(frame_ids)
+        # Section 6: enforced in the runtime, not only documented. The check
+        # reads the model's cfg_args and the COLMAP images list rather than
+        # the directory name, because ".../final" is a string and proves
+        # nothing about which frame the cameras were registered at.
+        endpoint_evidence = verify_endpoint_provenance(
+            args.direction, model, total_frames=len(frames_raw), strict=True)
+        print(f"  endpoint check: {endpoint_evidence['observed_endpoint'] or 'unknown'}"
+              f" (frame {endpoint_evidence['endpoint_original_frame']}),"
+              f" expected {endpoint_evidence['expected_endpoint']}")
         cameras = frames_raw[0][1]
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
@@ -226,8 +272,36 @@ def main() -> int:
             original = order[processing_index]
             np.save(cdir / f"centers_frame_{original:04d}.npy",
                     torch.as_tensor(p).double().cpu().numpy())
+
+        # Section 4. Renaming the files did NOT reorder the trajectory that
+        # coherence consumes. Three objects, never interchangeable:
+        #
+        #   canonical_xyz             the endpoint model's own geometry
+        #   positions_processing      as the filter produced them
+        #   positions_original        chronological, what coherence reads
+        #
+        # For a backward run the canonical set is the FINAL model even though
+        # the chronological trajectory starts at original frame 0.
+        positions_processing = list(positions)
+        positions = list(ctx.to_original(positions_processing))
+        np.save(cdir / "canonical_xyz.npy", mu0.double().cpu().numpy())
+        np.save(cdir / "original_gaussian_indices.npy",
+                np.arange(int(mu0.shape[0]), dtype=np.int64))
+        (cdir / "trajectory_manifest.json").write_text(json.dumps({
+            "direction": ctx.direction,
+            "canonical_endpoint": ctx.endpoint,
+            "canonical_model_path": str(model),
+            "canonical_original_frame": (order[0] if ctx.is_backward else order[0]),
+            "trajectory_order": "original_chronological",
+            "processing_order_original_indices": order,
+            "num_frames": len(positions),
+            "num_gaussians": int(mu0.shape[0]),
+            "note": ("centers_frame_NNNN.npy is indexed by ORIGINAL frame. "
+                     "canonical_xyz.npy is the endpoint model's geometry and "
+                     "is NOT centers_frame_0000 for a backward run."),
+        }, indent=1))
         _write_phase1_direction_debug(out, frame_ids, ctx, args.scene,
-                                      len(positions))
+                                      len(positions), endpoint_evidence)
 
     # ---- sections 3-17: the coherence branch -----------------------------
     #

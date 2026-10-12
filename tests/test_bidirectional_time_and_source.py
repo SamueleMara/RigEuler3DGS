@@ -293,12 +293,90 @@ def test_readonly_source() -> None:
                "cameras")
 
 
+# --- 6. sections 4-6: trajectory objects and endpoint provenance ---------
+def test_trajectory_objects_and_provenance() -> None:
+    print("[6] three trajectory objects, and endpoint proven not assumed")
+    from utils.sequence_direction import (endpoint_frame_of_colmap,
+                                          model_source_path,
+                                          verify_endpoint_provenance)
+
+    # Section 4: reordering the FILES is not reordering the TRAJECTORY.
+    ctx = DirectionContext(BACKWARD, total_frames=4)
+    processing = [f"frame_{i}" for i in (3, 2, 1, 0)]   # as the filter made them
+    original = list(ctx.to_original(processing))
+    check("processing order starts at the last frame", processing[0] == "frame_3")
+    check("original order starts at frame 0", original[0] == "frame_0",
+          str(original))
+    check("original order is chronological",
+          original == ["frame_0", "frame_1", "frame_2", "frame_3"])
+    check("the two orders are genuinely different", processing != original)
+
+    # The canonical set is NOT the first chronological frame for backward.
+    canonical = "final_model_geometry"
+    check("canonical geometry is independent of the trajectory",
+          canonical != original[0] and canonical != processing[0])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name, frame in (("colmap", 0), ("colmap_final", 59)):
+            sparse = root / "scene" / name / "sparse" / "0"
+            sparse.mkdir(parents=True)
+            (sparse / "images.txt").write_text(
+                "# comment\n"
+                + "".join(f"{i} 0 0 0 1 0 0 0 {i} cam_{i:03d}/frame_{frame:06d}.png\n"
+                          f"100.0 100.0 1\n" for i in range(1, 9)))
+        for name, colmap in (("initial", "colmap"), ("final", "colmap_final")):
+            m = root / "models" / name
+            m.mkdir(parents=True)
+            (m / "cfg_args").write_text(
+                f"Namespace(source_path='{root / 'scene' / colmap}', images='../rgb')")
+
+        check("initial endpoint frame read from COLMAP",
+              endpoint_frame_of_colmap(root / "scene" / "colmap") == 0)
+        check("final endpoint frame read from COLMAP",
+              endpoint_frame_of_colmap(root / "scene" / "colmap_final") == 59)
+        check("source path read from cfg_args",
+              str(model_source_path(root / "models" / "final")).endswith("colmap_final"))
+
+        good = verify_endpoint_provenance("backward", root / "models" / "final",
+                                          total_frames=60)
+        check("backward + final is consistent",
+              good["consistent"] and good["observed_endpoint"] == "final")
+        raises("backward + initial is refused on provenance",
+               lambda: verify_endpoint_provenance(
+                   "backward", root / "models" / "initial", total_frames=60),
+               "requires the final endpoint")
+        raises("forward + final is refused on provenance",
+               lambda: verify_endpoint_provenance(
+                   "forward", root / "models" / "final", total_frames=60),
+               "requires the initial endpoint")
+
+        # A directory NAMED final but trained from the initial COLMAP must
+        # still be refused: the check reads provenance, not the path string.
+        liar = root / "models" / "final_by_name"
+        liar.mkdir(parents=True)
+        (liar / "cfg_args").write_text(
+            f"Namespace(source_path='{root / 'scene' / 'colmap'}')")
+        raises("a misleading directory name does not fool the check",
+               lambda: verify_endpoint_provenance("backward", liar, total_frames=60),
+               "requires the final endpoint")
+
+        # Unknown provenance is reported, not guessed at.
+        blind = root / "models" / "nocfg"
+        blind.mkdir(parents=True)
+        ev = verify_endpoint_provenance("backward", blind, total_frames=60)
+        check("unknown provenance is reported honestly",
+              ev["observed_endpoint"] is None and ev["consistent"]
+              and "could not determine" in ev["basis"], json.dumps(ev))
+
+
 def main() -> int:
     test_translation_signs()
     test_rotation_signs()
     test_twist_mechanics()
     test_direction_context()
     test_readonly_source()
+    test_trajectory_objects_and_provenance()
     print()
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} checks FAILED")
