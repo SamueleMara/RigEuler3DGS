@@ -227,7 +227,8 @@ def _count_dataset_frames(source: Path, cams_all) -> int:
     return max(len(sorted(d.glob(f"frame_*{ext}"))) for ext in RGB_EXTENSIONS)
 
 
-def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path):
+def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path, *,
+                        direction: str = "forward"):
     """V2 section 16: observations straight from the dataset's own RGB-D files.
 
     No synthetic motion is applied anywhere in this function -- that is the
@@ -309,7 +310,7 @@ def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path):
                     "dt_used_s": float(args.dt), "cameras": cam_ids})
 
     any_depth = any(c["depth_frame_id"] for f in ids for c in f["cameras"])
-    return frames, {
+    provenance = {
         "frames": ids, "num_frames": len(frames), "num_cameras": len(names),
         "cameras": names,
         "sequence_start": start, "sequence_length": length,
@@ -322,6 +323,14 @@ def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path):
                       f"({args.dt} s) and is persisted here"),
         "synthetic_motion_applied": False,
     }
+    # Sections 4-6: the backward pass reads the SAME files through the SAME
+    # loader and only reverses the order afterwards. Loading the dataset twice
+    # with two index conventions is how the two directions drift apart.
+    from utils.sequence_direction import (BACKWARD, annotate_forward,
+                                          normalise, reverse_sequence)
+    if normalise(direction) == BACKWARD:
+        return reverse_sequence(frames, provenance)
+    return frames, annotate_forward(provenance)
 
 
 def _jsonable(value):
