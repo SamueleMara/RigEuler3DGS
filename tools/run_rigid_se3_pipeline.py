@@ -111,6 +111,11 @@ def main() -> int:
                     help="skip the section 32 pose-space refinement")
     ap.add_argument("--frames-on-cpu", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--direction", choices=("forward", "backward"),
+                    default="forward",
+                    help="backward solves against the FINAL endpoint model as "
+                         "canonical geometry, warm starting from identity at "
+                         "the last original frame")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -175,11 +180,22 @@ def main() -> int:
         window_length=0, all_cameras=False, dt=1.0 / 30.0,
         max_gaussians=args.max_gaussians, no_model_error=False,
         model_error_beta=1.0, model_error_blur=1)
-    frames_raw, frame_ids = dataset_rgbd_frames(cams_all[:ncam], cfg, ns,
-                                                truth, Path(source))
+    frames_raw, frame_ids = dataset_rgbd_frames(
+        cams_all[:ncam], cfg, ns, truth, Path(source),
+        direction=args.direction)
+    from utils.sequence_direction import (context_from_frame_ids,
+                                          verify_endpoint_provenance)
+    ctx = context_from_frame_ids(frame_ids)
+    endpoint_evidence = verify_endpoint_provenance(
+        args.direction, model, total_frames=len(frames_raw), strict=True)
+    print(f"  direction {ctx.direction}, canonical endpoint "
+          f"{endpoint_evidence['observed_endpoint'] or 'unknown'} "
+          f"(frame {endpoint_evidence['endpoint_original_frame']})")
     obs_all = [[(o[0], o[1], o[2] if len(o) > 2 else None) if o is not None
                 else None for o in ob] for (ob, _s, _d) in frames_raw]
     T = len(obs_all)
+    # Canonical geometry comes from the loaded MODEL, which for a backward
+    # run is the final endpoint. It is never taken from a trajectory frame.
     mu0 = truth.mu.double()
     R0 = truth.R.double()
     cam_ids = list(range(ncam))
@@ -215,6 +231,15 @@ def main() -> int:
         if len(files) < T:
             raise SystemExit(f"{d} has {len(files)} center frames, need {T}")
         positions = [torch.from_numpy(np.load(f)).double() for f in files]
+        # The centers are stored by ORIGINAL frame index, so sorted() gives
+        # chronological order. The rigid solve walks in PROCESSING order --
+        # for a backward run that is 59..0, which is what lets it warm start
+        # from identity at the canonical frame instead of meeting the whole
+        # sequence displacement on its first step. Reorder to match the
+        # observations, which came from the loader already in processing
+        # order.
+        if ctx.is_backward:
+            positions = list(positions)[::-1]
         if positions[0].shape[0] != mu0.shape[0]:
             raise SystemExit(
                 f"{d} holds {positions[0].shape[0]} Gaussians but this run "
@@ -309,10 +334,32 @@ def main() -> int:
     p2 = out / "phase2_rigid"
     p2.mkdir(parents=True, exist_ok=True)
     poses = np.stack([_se3_matrix(part.R[t], part.p[t]) for t in range(T)])
-    np.save(p2 / "poses.npy", poses)
+    # Section 13: the authoritative arrays are in ORIGINAL chronological
+    # order, whatever order they were solved in. Everything downstream --
+    # the reduction, the forward/backward comparison, the fusion -- indexes
+    # by original frame, so a processing-order array here would silently run
+    # one of the two directions backwards through every later stage.
+    def _chrono(a):
+        return a[::-1].copy() if ctx.is_backward else a
+
+    if ctx.is_backward:
+        np.save(p2 / "poses_processing_order.npy", poses)
+    np.save(p2 / "poses.npy", _chrono(poses))
+    np.save(p2 / "poses_original_order.npy", _chrono(poses))
+    # Velocities are NOT reordered. They are per-step rates in processing
+    # time, so a backward run's stored twist is a reverse-time quantity and
+    # reversing the array would keep the wrong sign. The chronological twist
+    # is RECOMPUTED from the restored poses (section E).
+    if ctx.is_backward:
+        from utils.bidirectional_time import chronological_twists
+        chrono_xi = chronological_twists(
+            torch.from_numpy(_chrono(poses)).double(), float(ns.dt))
+        np.save(p2 / "chronological_twists.npy",
+                chrono_xi.cpu().numpy())
     np.save(p2 / "velocities.npy",
             torch.cat([part.v, part.omega], dim=1).numpy())
-    np.save(p2 / "pose_covariances.npy", res["pose_covariances"].numpy())
+    np.save(p2 / "pose_covariances.npy",
+            _chrono(res["pose_covariances"].numpy()))
     np.save(p2 / "state_covariances.npy", res["covariances"].numpy())
     np.save(p2 / "phase1_kabsch_poses.npy",
             np.stack([_se3_matrix(kabsch_R[t], kabsch_p[t])

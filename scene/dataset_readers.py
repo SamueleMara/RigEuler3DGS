@@ -147,9 +147,23 @@ def _load_matching_part_indices(path, positions):
         return None
 
     ply_path = Path(path).resolve()
-    candidates = [ply_path.with_name("points3D_parts.ply")]
+    # The FINAL endpoint keeps its labels under a different name. A scene
+    # exported with both endpoints has:
+    #
+    #     pointcloud/points3D_parts.ply          labels for colmap/
+    #     pointcloud/points3D_parts_final.ply    labels for colmap_final/
+    #
+    # Looking only for the first leaves every final-endpoint model with no
+    # GT at all, which does not affect training -- GT is diagnostics only --
+    # but empties the GT and metric panels of every debug page built from it.
+    # Which name to prefer is decided by the COLMAP directory the model was
+    # read from, never by guessing.
+    names = ["points3D_parts.ply"]
+    if any(part == "colmap_final" for part in ply_path.parts):
+        names.insert(0, "points3D_parts_final.ply")
+    candidates = [ply_path.with_name(n) for n in names]
     for parent in ply_path.parents:
-        candidates.append(parent / "pointcloud" / "points3D_parts.ply")
+        candidates.extend(parent / "pointcloud" / n for n in names)
 
     seen = set()
     for candidate in candidates:
