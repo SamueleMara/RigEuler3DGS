@@ -1,0 +1,40 @@
+{
+ "branch": "legacy",
+ "splatfacto_carving": false,
+ "carving_background_seed": 2026,
+ "random_background": false,
+ "iterations": 30000,
+ "start_iteration": 0,
+ "lambda_dssim": 0.2,
+ "depth_l1_weight_init": 0.0,
+ "depth_l1_weight_final": 0.0,
+ "resolution": 1,
+ "source_path": "/home/samuelemara/Joint3DGS/RigEuler3DGS/input/USB_100109",
+ "images": "images",
+ "masks": "/home/samuelemara/Joint3DGS/RigEuler3DGS/input/USB_100109/mask",
+ "num_initial_gaussians": 1380,
+ "num_train_cameras": 8,
+ "num_masks": 8,
+ "cameras": [
+  "cam_004/frame_000000.png",
+  "cam_001/frame_000000.png",
+  "cam_005/frame_000000.png",
+  "cam_002/frame_000000.png",
+  "cam_000/frame_000000.png",
+  "cam_003/frame_000000.png",
+  "cam_007/frame_000000.png",
+  "cam_006/frame_000000.png"
+ ],
+ "git_commit": "75b85f751b510764f568e6ecc2c6864983d2dfa1",
+ "initial_state_sha256": {
+  "per_tensor": {
+   "_xyz": "1f7da0a8e6a7d7a8a681996c0b21c3d5cb215c81e490e8b74fe89b7bd53cbd03",
+   "_features_dc": "1d293936412d707e36191c5b4eb7d74211051b514c08fdfb95f0c659ece74c56",
+   "_features_rest": "db0e39ae23bb14a33c8ebd72191f3b6166a0662ea4c08ee2a4a14e2697e8b7ac",
+   "_scaling": "6f28d73f5c7fb97ead0ebf38685c3569839fd58cb5eaedd78b6a35b8903fb603",
+   "_rotation": "458596678203fd9d877282e15fa1b6c1144a7394ebc4cbc6c03271458052b65c",
+   "_opacity": "6822173b3a5ce89e50f716ecd470bd7cbe175c109c1a174433cd346c7e7f203c"
+  },
+  "combined": "a31073dee762149fd39b164e85febad122511fded7e307089781ecf7f1b5561e"
+ }
+}
