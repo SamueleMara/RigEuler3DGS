@@ -552,8 +552,41 @@ def test_S20_hierarchy_has_no_balance_prior():
           not bad, "; ".join(sorted(bad)))
 
 
+def test_iekf_grouping_is_independent():
+    """The Phase-1 IEKF grouping must not follow the coherence-graph flag.
+
+    They shared --supernode-size until the count-based coherence default
+    landed. That dropped it to 0, build_supernodes turned `n // max(ts, 1)`
+    into one group per Gaussian, and Phase 1 went from 384 pose blocks to
+    24,582 on washer -- two orders of magnitude slower, with output that
+    still looked right.
+    """
+    import argparse, io as _io, re, sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from estimator.supernodes import build_supernodes
+    import torch
+
+    src = _io.open(Path(__file__).resolve().parents[1]
+                   / "tools" / "run_motion_coherence_support.py").read()
+    assert "supernode_size=args.iekf_supernode_size" in src, \
+        "the Phase-1 IEKF must read its own grouping flag"
+    assert "supernode_size=args.supernode_size," not in src, \
+        "the coherence-graph flag must not reach the Phase-1 IEKF"
+    assert re.search(r'--iekf-supernode-size".*?default=64', src, re.S), \
+        "the IEKF grouping default must stay 64"
+
+    x = torch.randn(4096, 3)
+    degenerate = int(build_supernodes(x, target_size=0, seed=0).supernode_id.max()) + 1
+    healthy = int(build_supernodes(x, target_size=64, seed=0).supernode_id.max()) + 1
+    assert degenerate == 4096, degenerate
+    assert healthy == 64, healthy
+    print("PASS Phase-1 IEKF grouping is independent of the coherence graph")
+
+
 def main():
-    for fn in (test_S1_static_plus_translation,
+    for fn in (test_iekf_grouping_is_independent,
+               test_S1_static_plus_translation,
                test_S2_static_plus_revolute_offset_axis,
                test_S3_speed_change_stop_restart_reversal,
                test_S4_chaotic_false_dynamics,

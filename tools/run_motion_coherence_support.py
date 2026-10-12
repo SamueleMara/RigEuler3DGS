@@ -92,6 +92,17 @@ def main() -> int:
     # A positive value pins Gaussians-per-node instead, reproducing the older
     # behaviour, and takes precedence.
     ap.add_argument("--supernode-size", type=int, default=0)
+    # SEPARATE from the coherence graph below. This one sizes the GROUPED
+    # STATE of the Phase-1 IEKF, which is a different object with a different
+    # job: it decides how many pose blocks the PCG solve carries. The two
+    # shared one flag until the count-based coherence default landed, at
+    # which point --supernode-size dropped to 0 and build_supernodes' own
+    # `n // max(target_size, 1)` turned that into ONE GROUP PER GAUSSIAN --
+    # 24,582 blocks instead of 384 on washer, and Phase 1 slowed by about two
+    # orders of magnitude while still producing correct-looking output.
+    ap.add_argument("--iekf-supernode-size", type=int, default=64,
+                    help="Gaussians per group in the Phase-1 IEKF state. Not "
+                         "the coherence graph; see --supernode-count.")
     ap.add_argument("--supernode-count", type=int, default=192,
                     help="how many supernodes the coherence graph has, "
                          "independent of how many Gaussians the model holds. "
@@ -221,7 +232,7 @@ def main() -> int:
             sequence_start=0, sequence_length=args.frames, all_frames=False,
             observation_source="dataset_rgbd", cameras=ncam,
             bootstrap_iters=args.bootstrap_iters,
-            supernode_size=args.supernode_size, seed=args.seed,
+            supernode_size=args.iekf_supernode_size, seed=args.seed,
             frames_on_cpu=bool(args.frames_on_cpu),
             frames_on_gpu=not args.frames_on_cpu, depth_sigma=None,
             joint_direct_rgbd=False, joint_direct_gaussian=False,
