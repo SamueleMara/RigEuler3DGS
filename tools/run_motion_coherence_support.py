@@ -38,6 +38,38 @@ def _csv(path: Path, header, rows):
         w.writerows(rows)
 
 
+def _write_phase1_direction_debug(out, frame_ids, ctx, scene, num_positions):
+    """Debug for the backward Phase-1 phase.
+
+    The failure this catches is silent: a trajectory saved under the wrong
+    frame numbers is well formed, loads cleanly and runs the sequence
+    backwards. So the mapping actually used is written out beside the centers
+    and checked, rather than trusted.
+    """
+    from debug.sequence_direction_debug import write_phase_debug
+
+    dbg = out / "phase1_direction"
+    report = write_phase_debug(dbg, frame_ids, scene=scene)
+    payload = {
+        **ctx.as_dict(),
+        "num_phase1_frames": int(num_positions),
+        "centers_named_by": "original_frame_index",
+        "canonical_geometry": (
+            "final endpoint model; NOT reordered -- the backward solve lives "
+            "in the final gauge and only the time axis is restored"
+            if ctx.is_backward else "initial endpoint model"),
+        "frame_order_checks": report["checks"],
+    }
+    import json as _jsonlib
+    (dbg / "phase1_direction.json").write_text(_jsonlib.dumps(payload, indent=1))
+    if not report["checks"]["passes"]:
+        print(f"  !! frame-order checks FAILED: {report['checks']}")
+    else:
+        print(f"  frame order verified ({ctx.direction}, "
+              f"{num_positions} frames) -> {report['html']}")
+    return payload
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -80,6 +112,15 @@ def main() -> int:
                          "cut, kept only for comparison")
     ap.add_argument("--cv-folds", type=int, default=5)
     ap.add_argument("--seed", type=int, default=0)
+    # Bidirectional: additive, forward stays the default and is unchanged.
+    ap.add_argument("--direction", choices=("forward", "backward"),
+                    default="forward",
+                    help="backward walks the sequence last-to-first from the "
+                         "FINAL endpoint model; --model must be that model")
+    ap.add_argument("--canonical-endpoint", choices=("initial", "final"),
+                    default=None,
+                    help="which endpoint --model is; defaults to the one the "
+                         "direction implies, and a mismatch is refused")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -151,19 +192,42 @@ def main() -> int:
             window_length=0, all_cameras=False, dt=1.0 / 30.0,
             max_gaussians=args.max_gaussians, no_model_error=False,
             model_error_beta=1.0, model_error_blur=1)
-        frames_raw, frame_ids = dataset_rgbd_frames(cams_all[:ncam], cfg, ns,
-                                                    truth, Path(source))
+        frames_raw, frame_ids = dataset_rgbd_frames(
+            cams_all[:ncam], cfg, ns, truth, Path(source),
+            direction=args.direction)
+        from utils.sequence_direction import context_from_frame_ids
+        ctx = context_from_frame_ids(frame_ids)
         cameras = frames_raw[0][1]
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
         print(f"  Phase 1 over {len(window)} frames ...")
         positions, _info = bootstrap_positions(truth, cameras, window, cfg,
                                                None, ns, verbose=True)
+        # Step 5: persist in ORIGINAL CHRONOLOGICAL indexing.
+        #
+        # `positions` comes back in PROCESSING order, so for a backward run
+        # positions[0] is original frame T-1. Saving that as
+        # centers_frame_0000 would hand every downstream stage a trajectory
+        # that runs the wrong way while looking perfectly well formed. The
+        # file name carries the ORIGINAL frame number in both directions, so
+        # a forward and a backward run can be compared file by file.
+        #
+        # The canonical geometry is NOT reordered: for backward it is the
+        # final endpoint's Gaussians, which is the gauge the whole backward
+        # solve lives in. Only the time axis is restored.
         cdir = out / "phase1_centers"
         cdir.mkdir(parents=True, exist_ok=True)
-        for t, p in enumerate(positions):
-            np.save(cdir / f"centers_frame_{t:04d}.npy",
+        order = ctx.order()
+        if len(order) != len(positions):
+            raise SystemExit(
+                f"{len(positions)} Phase-1 frames but the direction context "
+                f"describes {len(order)}; they must correspond one to one")
+        for processing_index, p in enumerate(positions):
+            original = order[processing_index]
+            np.save(cdir / f"centers_frame_{original:04d}.npy",
                     torch.as_tensor(p).double().cpu().numpy())
+        _write_phase1_direction_debug(out, frame_ids, ctx, args.scene,
+                                      len(positions))
 
     # ---- sections 3-17: the coherence branch -----------------------------
     #
