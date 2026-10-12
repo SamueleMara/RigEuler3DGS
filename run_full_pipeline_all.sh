@@ -117,6 +117,10 @@ static_complete() {
     # splats this flag exists to remove, and reusing it silently keeps them.
     if [ -n "$scene" ] && [ -d "input/$scene/mask" ]; then
       grep -q "masks='[^']" "$root/$ep/cfg_args" 2>/dev/null || return 3
+      # --masks alone no longer carves: a model trained with the masks merely
+      # loaded is photometrically the legacy model and still has the border
+      # splats. Both have to be on record.
+      grep -q "splatfacto_carving=True" "$root/$ep/cfg_args" 2>/dev/null || return 3
     fi
   done
   return 0
@@ -131,9 +135,13 @@ static_why() {
     if ! grep -q "sapien_depth_is_metric=True" "$root/$ep/cfg_args" 2>/dev/null; then
       echo "$ep was trained without depth"; return
     fi
-    if [ -n "$scene" ] && [ -d "input/$scene/mask" ] \
-       && ! grep -q "masks='[^']" "$root/$ep/cfg_args" 2>/dev/null; then
-      echo "$ep was trained without object masks"; return
+    if [ -n "$scene" ] && [ -d "input/$scene/mask" ]; then
+      if ! grep -q "masks='[^']" "$root/$ep/cfg_args" 2>/dev/null; then
+        echo "$ep was trained without object masks"; return
+      fi
+      if ! grep -q "splatfacto_carving=True" "$root/$ep/cfg_args" 2>/dev/null; then
+        echo "$ep loaded masks but did not carve"; return
+      fi
     fi
   done
   echo "complete"

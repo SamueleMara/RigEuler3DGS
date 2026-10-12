@@ -35,6 +35,11 @@ from arguments import (
 )
 from gaussian_renderer import network_gui, render
 from scene import GaussianModel, Scene
+from utils.carving_diagnostics import (
+    CarvingDebugWriter,
+    evaluate as carving_evaluate,
+    initial_state_fingerprint,
+)
 from utils.general_utils import get_expon_lr_func, safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import (
@@ -371,7 +376,8 @@ def _viewer_step(iteration, total, gaussians, pipe, background, dataset):
 
 
 @torch.no_grad()
-def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb_run):
+def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb_run,
+              carving=False):
     configurations = (
         ("test", scene.getTestCameras()),
         ("train", scene.getTrainCameras()[:: max(1, len(scene.getTrainCameras()) // 5)][:5]),
@@ -387,7 +393,7 @@ def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb
                 use_trained_exp=dataset.train_test_exp,
                 separate_sh=SPARSE_ADAM_AVAILABLE,
             )["render"].clamp(0, 1)
-            if getattr(camera, "object_alpha", None) is not None:
+            if carving and getattr(camera, "object_alpha", None) is not None:
                 # Composite the reference over the SAME background the render
                 # just used. Comparing an object over black against a
                 # prediction over white reports a difference that is only the
@@ -409,12 +415,59 @@ def _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb
             wb_run.log({"iteration": iteration, f"validation/{name}_l1": l1_value, f"validation/{name}_psnr": psnr_value}, step=iteration)
 
 
-def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt, depth_weight):
-    # --masks turns on Splatfacto-style transparency carving for the RGB term
-    # and nothing else: the depth, semantic, DINO and SAM3 terms below are
-    # untouched and still see `background`.
+def _git_commit():
+    """Recorded in initial_state.json so a comparison can be traced to code."""
+    import subprocess
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).parent,
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() if out.returncode == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _validate_carving_options(dataset, opt, scene):
+    """Reject the option combinations that would quietly produce a bad A/B.
+
+    Every one of these is a case where training would run to completion and
+    report plausible numbers that answer a different question than the one
+    asked, which is worse than a crash.
+    """
+    carving = bool(getattr(opt, "splatfacto_carving", False))
+    debug = bool(getattr(opt, "carving_debug", False))
+    if not (carving or debug):
+        return
+    if carving and bool(getattr(opt, "random_background", False)):
+        raise ValueError(
+            "--splatfacto_carving and --random_background are two different "
+            "implementations of the same idea and would fight: carving needs "
+            "the render background and the composited target to be the SAME "
+            "sample, and --random_background draws its own. Pass one.")
+    if not str(getattr(dataset, "masks", "") or ""):
+        need = "--splatfacto_carving" if carving else "--carving_debug"
+        raise ValueError(
+            f"{need} requires --masks. Carving uses the mask as ground-truth "
+            "alpha, and every diagnostic is defined against it.")
+    missing = [c.image_name for c in scene.getTrainCameras()
+               if getattr(c, "object_alpha", None) is None]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(scene.getTrainCameras())} training cameras "
+            f"have no mask, first: {missing[:3]}. Carving would train those "
+            "views on the legacy objective and the diagnostics would average "
+            "two different experiments.")
+
+
+def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt,
+                        depth_weight, bg_generator=None):
+    # --splatfacto_carving, and only it, changes the RGB term. --masks alone
+    # loads the masks and leaves the objective exactly as it was, so the A/B
+    # control can measure background opacity against the same masks the
+    # treatment trains on without its own loss being touched. The depth,
+    # semantic, DINO and SAM3 terms below are untouched in both branches and
+    # still see `background`.
     object_alpha = getattr(camera, "object_alpha", None)
-    object_mode = object_alpha is not None
+    object_mode = bool(getattr(opt, "splatfacto_carving", False)) and object_alpha is not None
     if object_mode:
         # One random colour per iteration, used by BOTH the render and the
         # ground truth. Over background the target is exactly that colour, so
@@ -423,7 +476,16 @@ def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt,
         # to take its opacity to zero -- which is how the black border splats
         # disappear without a silhouette loss, without touching the CUDA
         # rasteriser, and without masking the prediction.
-        render_background = torch.rand(3, device="cuda")
+        #
+        # Drawn from a DEDICATED generator when one is supplied. On the global
+        # RNG the treatment would consume random numbers the control does not,
+        # so the two runs would diverge in camera order and in densify/split
+        # decisions, and the comparison would no longer isolate compositing.
+        if bg_generator is not None:
+            render_background = torch.rand(
+                3, device="cuda", dtype=background.dtype, generator=bg_generator)
+        else:
+            render_background = torch.rand(3, device="cuda")
     else:
         render_background = background
     package = render(
@@ -514,6 +576,44 @@ def train_static(
     )
     use_sparse = opt.optimizer_type == "sparse_adam" and SPARSE_ADAM_AVAILABLE
     ema_losses = {}
+
+    carving = bool(getattr(opt, "splatfacto_carving", False))
+    branch = "carving" if carving else "legacy"
+    bg_generator = None
+    if carving:
+        bg_generator = torch.Generator(device="cuda")
+        bg_generator.manual_seed(int(getattr(opt, "carving_background_seed", 2026)))
+    debug = CarvingDebugWriter(scene.model_path, branch,
+                               bool(getattr(opt, "carving_debug", False)))
+    debug_interval = max(1, int(getattr(opt, "carving_debug_interval", 1000)))
+    if debug.enabled:
+        fingerprint = initial_state_fingerprint(gaussians)
+        debug.initial_state({
+            "branch": branch,
+            "splatfacto_carving": carving,
+            "carving_background_seed": int(getattr(opt, "carving_background_seed", 2026)),
+            "random_background": bool(getattr(opt, "random_background", False)),
+            "iterations": total_iterations,
+            "start_iteration": int(start_iteration),
+            "lambda_dssim": float(opt.lambda_dssim),
+            "depth_l1_weight_init": float(opt.depth_l1_weight_init),
+            "depth_l1_weight_final": float(opt.depth_l1_weight_final),
+            "resolution": int(getattr(dataset, "resolution", -1)),
+            "source_path": str(getattr(dataset, "source_path", "")),
+            "images": str(getattr(dataset, "images", "")),
+            "masks": str(getattr(dataset, "masks", "")),
+            "num_initial_gaussians": int(gaussians.get_xyz.shape[0]),
+            "num_train_cameras": len(cameras),
+            "num_masks": sum(1 for c in cameras
+                             if getattr(c, "object_alpha", None) is not None),
+            "cameras": [c.image_name for c in cameras],
+            "git_commit": _git_commit(),
+            "initial_state_sha256": fingerprint,
+        })
+        # Iteration 0: BEFORE any parameter update, so both runs are measured
+        # on identical Gaussians and the row is a true common baseline.
+        carving_evaluate(cameras, gaussians, pipe, 0, branch, debug, previews=2)
+
     progress = tqdm(range(start_iteration + 1, total_iterations + 1), desc="Phase 0: canonical 3DGS")
     for iteration in progress:
         if viewer_enabled:
@@ -524,9 +624,11 @@ def train_static(
         if not stack:
             stack = cameras.copy()
         camera = stack.pop(randint(0, len(stack) - 1))
+        debug.trace(iteration, camera.image_name)
         bg = torch.rand(3, device="cuda") if opt.random_background else background
         total, stats, package = _static_visual_loss(
-            camera, gaussians, pipe, bg, dataset, args, opt, depth_schedule(iteration)
+            camera, gaussians, pipe, bg, dataset, args, opt, depth_schedule(iteration),
+            bg_generator=bg_generator,
         )
         total.backward()
 
@@ -575,12 +677,26 @@ def train_static(
         )
         if iteration % 10 == 0:
             progress.set_postfix(postfix)
+        if debug.enabled and (iteration % debug_interval == 0
+                              or iteration == total_iterations):
+            # After the update, so the row describes the model as it now
+            # stands. metrics.csv documents this boundary; iteration 0 is the
+            # only pre-update row.
+            carving_evaluate(
+                cameras, gaussians, pipe, iteration, branch, debug,
+                photometric={"L1": stats.get("rgb_l1", ""),
+                             "SSIM": 1.0 - float(stats.get("rgb_dssim", 0.0)),
+                             "total": stats.get("total", "")},
+                previews=2 if iteration == total_iterations else 0,
+            )
         if iteration in test_iterations:
-            _validate(scene, gaussians, pipe, background, dataset, iteration, writer, wb_run)
+            _validate(scene, gaussians, pipe, background, dataset, iteration, writer,
+                      wb_run, carving=carving)
         if iteration in save_iterations:
             scene.save(iteration)
         if iteration in checkpoint_iterations:
             torch.save((gaussians.capture(), iteration), Path(scene.model_path) / f"chkpnt{iteration}.pth")
+    debug.close()
 
 
 def _load_start_state(scene, gaussians, opt, args, checkpoint):
@@ -614,6 +730,7 @@ def training(dataset, opt, pipe, args, checkpoint, save_iterations, checkpoint_i
 
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
     scene = Scene(dataset, gaussians, dynamic_args=None)
+    _validate_carving_options(dataset, opt, scene)
     dino_dim = args.dino_feature_field_dim if args.use_dino_feature_field else 0
     sam3_dim = args.sam3_feature_dim if args.use_sam3_feature_field else 0
     gaussians.init_semantic_and_feature_fields(

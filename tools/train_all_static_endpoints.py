@@ -77,7 +77,11 @@ def _train_command(args, source_scene: Path, model_dir: Path, scene: Path, frame
     # background pixels against nothing and the silhouette grows black splats.
     mask_dir = Path(scene) / "mask"
     if mask_dir.is_dir() and any(mask_dir.iterdir()):
-        cmd.extend(["--masks", str(mask_dir.resolve())])
+        # Both flags. --masks only LOADS the masks now; --splatfacto_carving is
+        # what changes the objective. They were split so the A/B control can
+        # measure background opacity against the same masks without its loss
+        # being touched, which means production has to ask for carving by name.
+        cmd.extend(["--masks", str(mask_dir.resolve()), "--splatfacto_carving"])
     dino_root = scene / "dinov3"
     if bool(args.use_dino) and _has_frame_cache(dino_root, int(frame_idx)):
         cmd.extend(["--use_dino_feature_field", "--dinov3_root", str(dino_root)])
