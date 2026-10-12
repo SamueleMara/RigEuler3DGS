@@ -46,6 +46,19 @@ FORCE=${FORCE:-0}
 FORCE_STATIC=${FORCE_STATIC:-$FORCE}
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
+
+# A trained static model counts as present only when its checkpoint is a
+# plausible PLY. "The file exists" is not enough: an interrupted write leaves
+# a short or empty file that passes -f and then fails at load time, halfway
+# through a batch, with an error that points at the loader rather than at the
+# truncated file.
+static_ready() {
+  local ply="$1/point_cloud/iteration_${ITERS}/point_cloud.ply"
+  [ -f "$ply" ] || return 1
+  [ "$(stat -c %s "$ply" 2>/dev/null || echo 0)" -gt 100000 ] || return 1
+  head -c 400 "$ply" 2>/dev/null | grep -qi "^ply" || return 1
+  return 0
+}
 run() {
   local log="$1"; shift
   if [ "$DRY" = "1" ]; then printf '  + %s\n' "$*"; return 0; fi
@@ -75,9 +88,8 @@ for S in $SCENES; do
     for END in initial final; do
       [ "$END" = initial ] && CM="colmap" || CM="colmap_final"
       M="$OUT/static_bidi/$END"
-      if [ "$FORCE_STATIC" != "1" ] \
-         && [ -f "$M/point_cloud/iteration_${ITERS}/point_cloud.ply" ]; then
-        echo "  [static/$END] present, reusing"
+      if [ "$FORCE_STATIC" != "1" ] && static_ready "$M"; then
+        echo "  [static/$END] present, reusing  ($(du -h "$M/point_cloud/iteration_${ITERS}/point_cloud.ply" | cut -f1))"
       else
         echo "  [static/$END] training ${ITERS} iters  $(date +%T)"
         rm -rf "$M"; mkdir -p "$M"
@@ -98,7 +110,7 @@ for S in $SCENES; do
 
   # Everything below needs both models.
   for END in initial final; do
-    if [ ! -f "$OUT/static_bidi/$END/point_cloud/iteration_${ITERS}/point_cloud.ply" ]; then
+    if ! static_ready "$OUT/static_bidi/$END"; then
       echo "  !! static/$END missing -- cannot run the dynamic stages"
       STATUS+=("$S SKIPPED(static/$END absent)"); continue 3
     fi
