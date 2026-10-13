@@ -76,11 +76,33 @@ class IEKSConfig:
     # ||b|| relative to the objective value. A stall with a large gradient is
     # STALLED; only genuine stationarity is CONVERGED.
     grad_rel_tol: float = 1e-3
-    # A stationary STATE is convergence only if the gradient has also come
-    # down from where it started. A tiny step with an undiminished gradient
-    # is a stall: the measured contrast is |g|/|g_0| ~ 1e-7 on a fixture that
-    # reached the optimum against ~1.0 on one that moved 0.57% and stopped.
+    # DIAGNOSTIC ONLY since the certificate below replaced it. |g|/|g_0| made
+    # the verdict a property of the initialisation: a fixture whose noise was
+    # enlarged crossed this threshold without the solver stopping anywhere
+    # different.
     grad_decay_tol: float = 1e-3
+    # The stationarity certificate. 0.5 b'A^-1 b -- the quadratic model's
+    # prediction of ALL remaining reduction -- as a fraction of the current
+    # objective. It depends on the current point alone, so it cannot be moved
+    # by changing where the run started. 1e-6 is the float32 rendering
+    # reproducibility floor measured in tests/test_unified_streaming_window.py
+    # (~2e-7 relative, three resident-vs-resident rebuilds): below it the
+    # model predicts less improvement than the renderer can resolve.
+    decrement_tol: float = 1e-6
+    # ... OR the renderer's own reproducibility, measured per run. The
+    # rasterizer composites in float32 with a non-reproducible tile order, so
+    # evaluating the same nominal twice gives two different objectives. A
+    # model that predicts less reduction than THAT is predicting something
+    # the renderer cannot resolve, and the solve has reached the floor of
+    # what this arithmetic can say. Measured at the start, from two
+    # evaluations of the warm start, so it is a property of the scene rather
+    # than a constant guessed for it.
+    measure_objective_noise: bool = True
+    noise_factor: float = 1.0
+    # A tiny step is only a stall if it PERSISTS while the certificate stays
+    # unmet. Breaking on the first one declared a stall at a point where the
+    # model still predicted progress and the next few steps delivered it.
+    tiny_step_patience: int = 6
     # STATE stationarity. The gradient cannot be the sole criterion here:
     # it floors at the float32 rendering noise (measured ~4e-2 on a fixture
     # whose objective had already reached 6e-8), while the step norm falls to
@@ -294,11 +316,22 @@ class UnifiedFreeIEKS:
         trace = []
         damping = self.cfg.damping
         initial_grad = None
+        tiny_steps = 0
         current = trajectory
         energy = self.evaluate(current)
+        objective_noise = 0.0
+        if self.cfg.measure_objective_noise:
+            repeat = self.evaluate(current)
+            objective_noise = abs(repeat["E_total"] - energy["E_total"])
         status = MAX_ITERS
         started = time.time()
 
+        if self.cfg.verbose and self.cfg.measure_objective_noise:
+            print(f"  renderer objective reproducibility: {objective_noise:.3e} "
+                  f"absolute on E_total={energy['E_total']:.6e} "
+                  f"({objective_noise / max(abs(energy['E_total']), 1e-30):.2e} "
+                  "relative); a predicted reduction below it is below what "
+                  "the renderer can resolve")
         if self.cfg.verbose:
             print(f"  IEKS start  E_total={energy['E_total']:.6e} "
                   f"(rgb {energy['E_rgb']:.4e}, depth {energy['E_depth']:.4e}, "
@@ -349,10 +382,37 @@ class UnifiedFreeIEKS:
             step_norm = float(step.norm())
             if initial_grad is None:
                 initial_grad = grad_norm
+            # ||g_final|| / ||g_initial|| is kept as a DIAGNOSTIC and no
+            # longer decides anything. It made the verdict a property of
+            # where the run started: enlarging a fixture's initialisation
+            # noise moved the ratio across the threshold without changing the
+            # point the solver stopped at.
             decayed = grad_norm <= self.cfg.grad_decay_tol * max(initial_grad, 1e-30)
-            if step_norm < self.cfg.step_tol:
-                status = CONVERGED if decayed else STALLED
+            # The certificate instead. For an exact Newton step d = A^-1 b,
+            #     b.d - 0.5 d'A d = 0.5 b'A^-1 b
+            # is the quadratic model's prediction of ALL the reduction that
+            # remains -- the Newton decrement, which depends on the current
+            # point alone. Below a tolerance times the objective, the model
+            # says there is nothing left to gain and the state is stationary;
+            # above it the solver stopped somewhere the model still expects
+            # progress, which is a stall however small the step was.
+            predicted_full = -directional - 0.5 * curvature_quadratic
+            objective_scale = max(abs(energy["E_total"]), 1.0)
+            decrement_ratio = predicted_full / objective_scale
+            noise_floor = self.cfg.noise_factor * objective_noise
+            certified = (0.0 <= predicted_full
+                         <= max(self.cfg.decrement_tol * objective_scale,
+                                noise_floor))
+            if step_norm < self.cfg.step_tol and certified:
+                status = CONVERGED
                 break
+            if step_norm < self.cfg.step_tol:
+                tiny_steps += 1
+                if tiny_steps >= self.cfg.tiny_step_patience:
+                    status = STALLED
+                    break
+            else:
+                tiny_steps = 0
 
 
             accepted = False
@@ -418,6 +478,11 @@ class UnifiedFreeIEKS:
                       "scaled_projected_gradient": scaled_gradient,
                       "curvature_quadratic": curvature_quadratic,
                       "step_norm": step_norm, "directional": directional,
+                      "predicted_full_reduction": predicted_full,
+                      "decrement_ratio": decrement_ratio,
+                      "objective_noise": objective_noise,
+                      "certified": certified,
+                      "gradient_decay_ratio": grad_norm / max(initial_grad, 1e-30),
                       "pcg_iterations": solve_info["iterations"],
                       "pcg_residual": solve_info["residual"],
                       "pcg_residual_kind": solve_info.get("residual_kind"),
@@ -440,19 +505,26 @@ class UnifiedFreeIEKS:
                 continue
 
             if accepted and trace[-1]["step_norm"] * trials[-1]["scale"] < self.cfg.step_tol:
-                status = CONVERGED if decayed else STALLED
-                break
+                if certified:
+                    status = CONVERGED
+                    break
+                tiny_steps += 1
+                if tiny_steps >= self.cfg.tiny_step_patience:
+                    status = STALLED
+                    break
             if len(trace) >= 2 and trace[-2].get("accepted"):
                 rel = abs(trace[-2]["E_total"] - energy["E_total"]) / max(
                     abs(trace[-2]["E_total"]), 1e-30)
+                if rel < self.cfg.rel_objective_tol and not certified:
+                    tiny_steps += 1
+                    if tiny_steps < self.cfg.tiny_step_patience:
+                        continue
                 if rel < self.cfg.rel_objective_tol:
                     # A flat objective is NOT convergence on its own. If the
                     # gradient is still large the optimiser has stalled, and
                     # reporting that as CONVERGED is exactly the misreport the
                     # review warns about.
-                    scaled_grad = grad_norm / max(abs(energy["E_total"]), 1.0)
-                    status = (CONVERGED if (decayed or scaled_grad < self.cfg.grad_rel_tol)
-                              else STALLED)
+                    status = CONVERGED if certified else STALLED
                     break
 
         if status == MAX_ITERS and trace and not any(r["accepted"] for r in trace):
@@ -462,6 +534,7 @@ class UnifiedFreeIEKS:
             status = LINE_SEARCH_FAILED
         return {"status": status, "energy": energy, "trace": trace,
                 "converged": status == CONVERGED,
+                "objective_noise": objective_noise,
                 "trajectory": current, "factor_inventory": inventory,
                 "wall_time_s": time.time() - started,
                 "covariance_contract": {

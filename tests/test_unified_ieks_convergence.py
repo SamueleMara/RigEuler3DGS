@@ -181,10 +181,11 @@ def main() -> int:
           "limitation rather than hidden by a smaller fixture.")
     check("and it is not misreported as converged",
           big["status"] != CONVERGED,
-          f"status {big['status']} -- a stationary step with an undiminished "
-          "gradient is a stall, and must not be labelled convergence")
+          f"status {big['status']} -- the quadratic model still predicts "
+          "reduction, so the stationarity certificate is not met and the run "
+          "must not be labelled converged whatever its step norm did")
 
-    print("\n[4] a flat objective with a large gradient is STALLED, not CONVERGED")
+    print("\n[4] a flat objective with an uncertified decrement is not CONVERGED")
     stalled = [r for r in big["trace"] if not r["accepted"]]
     check("the stalling run recorded rejected steps", len(stalled) >= 1,
           f"{len(stalled)} rejections")
