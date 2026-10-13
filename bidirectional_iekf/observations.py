@@ -348,7 +348,9 @@ def adjoint_defect(observation: FreeRGBDObservation, cache: FrameCache,
 # converged optimum as an unidentifiable one.
 # ---------------------------------------------------------------------------
 ZERO_INFORMATION = "ZERO_INFORMATION"
-STATIONARY_OBSERVABLE = "STATIONARY_OBSERVABLE"
+INFORMATIVE_STATIONARY_DIRECTION = "INFORMATIVE_STATIONARY_DIRECTION"
+# Kept as an alias so existing imports do not break.
+STATIONARY_OBSERVABLE = INFORMATIVE_STATIONARY_DIRECTION
 WEAKLY_OBSERVABLE = "WEAKLY_OBSERVABLE"
 OBSERVABLE = "OBSERVABLE"
 
@@ -381,9 +383,12 @@ def classify_direction(observation, cache, u: torch.Tensor, gradient_dot: float,
             "note": {
                 ZERO_INFORMATION: "the image constrains nothing in this direction",
                 WEAKLY_OBSERVABLE: "small but nonzero image information",
-                STATIONARY_OBSERVABLE: ("image information is present and the "
-                                        "gradient is near zero -- an optimum, "
-                                        "NOT an unobservable direction"),
+                INFORMATIVE_STATIONARY_DIRECTION: (
+                    "image information is present and the directional "
+                    "gradient is near zero. That makes THIS DIRECTION "
+                    "stationary and informative; it says nothing about the "
+                    "whole state being at an optimum, which would need every "
+                    "free direction to be stationary."),
                 OBSERVABLE: "informative and away from stationarity",
             }[label]}
 

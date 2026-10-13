@@ -294,6 +294,17 @@ class UnifiedFreeIEKS:
 
             # Armijo needs g^T d < 0 with g = -b the true gradient.
             directional = -float((b * step).sum())
+            # d' A0 d with the damping removed: A_damped = A0 + lambda*D, so
+            # A0 d = A_damped d - lambda * D d exactly.
+            Ad = operator.information_matvec(step)
+            if damping:
+                Ad = Ad - damping * operator.curvature_scale() * step
+            curvature_quadratic = float((step * Ad).sum())
+            # 3.4: scaled projected stationarity ||D^-1/2 g||, with D the
+            # undamped curvature diagonal. A raw gradient norm mixes metres,
+            # radians and rates and cannot be compared across directions.
+            scaled_gradient = float(
+                (b / operator.curvature_scale().clamp_min(1e-30).sqrt()).norm())
             step_norm = float(step.norm())
             if initial_grad is None:
                 initial_grad = grad_norm
@@ -312,11 +323,19 @@ class UnifiedFreeIEKS:
                              + self.cfg.armijo_c * scale * directional)
                 ok = (math.isfinite(trial_energy["E_total"])
                       and trial_energy["E_total"] <= threshold)
-                # Predicted reduction from the local quadratic model, against
-                # the measured one. A large mismatch says the model is bad
-                # there, which is what LM damping is for -- it is reported,
-                # not absorbed.
-                predicted = -self.cfg.armijo_c * scale * directional
+                # The quadratic model's PREDICTED REDUCTION, which is not
+                # the Armijo requirement. For m(d) = F + g'd + 1/2 d'A0 d the
+                # predicted decrease along alpha*d is
+                #
+                #     pred = -alpha g'd - 0.5 alpha^2 d'A0 d
+                #
+                # with A0 the UNDAMPED operator. The previous code recorded
+                # -armijo_c * alpha * g'd, which is the sufficient-decrease
+                # threshold; calling that the model's prediction makes the
+                # ratio rho meaningless. Armijo is still checked separately
+                # below, as it should be.
+                predicted = (-scale * directional
+                             - 0.5 * scale * scale * curvature_quadratic)
                 trials.append({
                     "scale": scale, "threshold": threshold,
                     "accepted": bool(ok),
@@ -329,6 +348,12 @@ class UnifiedFreeIEKS:
                         "depth_support", {}).get("total"),
                     "predicted_reduction": predicted,
                     "actual_reduction": energy["E_total"] - trial_energy["E_total"],
+                    # rho is only defined for a model that predicts a decrease.
+                    "rho": ((energy["E_total"] - trial_energy["E_total"]) / predicted
+                            if predicted > 0 else None),
+                    "depth_support_change": (
+                        trial_energy.get("depth_support", {}).get("total", 0)
+                        - energy.get("depth_support", {}).get("total", 0)),
                     "finite": bool(math.isfinite(trial_energy["E_total"]))})
                 if ok:
                     # On acceptance only: the nominal moves and the next outer
@@ -349,6 +374,8 @@ class UnifiedFreeIEKS:
 
             record = {"outer": outer, "accepted": accepted,
                       "damping": damping, "grad_norm": grad_norm,
+                      "scaled_projected_gradient": scaled_gradient,
+                      "curvature_quadratic": curvature_quadratic,
                       "step_norm": step_norm, "directional": directional,
                       "pcg_iterations": solve_info["iterations"],
                       "pcg_residual": solve_info["residual"],
