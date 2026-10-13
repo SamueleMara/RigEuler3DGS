@@ -134,7 +134,13 @@ def main() -> int:
         ("depth only", build(False, True, False, False)),
         ("full sum", build(True, True, True, True)),
     ]
+    # The probe MUST touch frame 0, or the prior term contributes exactly
+    # zero and its "verification" is a 0/0 comparison that proves nothing.
+    # The earlier version probed frames 1, 2 and 3 only.
     direction = torch.zeros(T, N, 12, dtype=torch.float64, device="cuda")
+    direction[0, 0, 0] = 0.7        # frame-0 translation  -> prior
+    direction[0, 1, 4] = 0.4        # frame-0 ORIENTATION  -> SO(3) prior
+    direction[0, 2, 8] = 0.2        # frame-0 velocity     -> prior
     direction[2, 0, 0] = 1.0        # translation at a mid frame
     direction[3, 1, 5] = 0.5        # orientation at a later frame
     direction[1, 0, 7] = 0.3        # a velocity direction, process-only signal
@@ -156,6 +162,11 @@ def main() -> int:
         print(f"       {label:14s} analytic {analytic:+.6e}  best rel {best:.3e}")
         check(f"gradient term verified ({label})", best < 0.05,
               f"relative error {best:.3e}")
+        if label == "prior only":
+            check("the prior gradient probe is NONZERO",
+                  abs(analytic) > 1e-6,
+                  f"analytic {analytic:+.6e}; a zero/zero comparison is a "
+                  "trivial control, never the evidence for a pass")
         if label == "full sum":
             check("the parts sum to the whole",
                   abs(analytic - analytic_sum) / max(abs(analytic), 1e-12) < 1e-6,
@@ -163,53 +174,63 @@ def main() -> int:
                   "a total that agreed while two terms cancelled would pass a "
                   "whole-objective test and fail this one")
 
-    print("\n[2] Taylor expansion: the residual must shrink like alpha^2")
-    solver = variants[-1][1]
+    print("\n[2] Taylor expansion against the ANALYTIC quadratic model")
+    print("        R(a) = F(X+au) - F(X) - a g'u  must equal 0.5 a^2 u'A0 u,")
+    print("        with A0 the undamped operator. Comparing R against an")
+    print("        independently computed quantity tests the gradient AND the")
+    print("        curvature; a ratio test alone tests neither against a known")
+    print("        value. Signed residuals and R/a, R/a^2 are reported so a")
+    print("        residual linear term would be visible as a constant R/a.")
     operator, _ = solver.build_system(nominal, damping=0.0)
     b = operator.rhs()
     base = solver.evaluate(nominal)["E_total"]
     gdotu = -float((b * direction).sum())
-    # The objective is evaluated by rendering in float32, so repeated
-    # evaluations at the SAME state differ. That noise is the floor of any
-    # Taylor residual, and alphas whose quadratic term sits under it measure
-    # the renderer, not the expansion. The floor is measured, not assumed.
-    # Two floors matter and only the second binds. Re-evaluating at a FIXED
-    # state is deterministic here, so that variance is zero. What limits the
-    # expansion is the granularity of F as a function of STATE: a float32
-    # render changes in discrete steps, so F along a direction is a staircase
-    # at small alpha. Estimated from the spread of F over a cluster of
-    # nearby states at the smallest alpha of interest.
-    repeats = [solver.evaluate(nominal)["E_total"] for _ in range(3)]
-    fixed_state_noise = max(repeats) - min(repeats)
-    probe = 8e-4
-    nearby = [solver.evaluate(nominal.retract(direction, probe * (1 + 1e-3 * k)))["E_total"]
-              for k in range(4)]
-    floor = max(nearby) - min(nearby)
-    print(f"       fixed-state evaluation variance: {fixed_state_noise:.3e}")
-    print(f"       state-granularity floor near alpha={probe:.0e}: {floor:.4e} "
-          f"(objective {base:.4e})")
-    previous, ratios = None, []
-    for alpha in (1.28e-2, 6.4e-3, 3.2e-3, 1.6e-3):
+    uAu = float((direction * operator.information_matvec(direction)).sum())
+    check("the curvature along the probe is positive", uAu > 0, f"u'A0u = {uAu:.4e}")
+
+    rows = []
+    for alpha in (2.56e-2, 1.28e-2, 6.4e-3, 3.2e-3, 1.6e-3, 8e-4, 4e-4):
         value = solver.evaluate(nominal.retract(direction, alpha))["E_total"]
-        residual = abs(value - base - alpha * gdotu)
-        above = residual > 10.0 * max(floor, 1e-30)
-        if previous is not None and above:
-            ratios.append(previous / max(residual, 1e-30))
-        print(f"       alpha {alpha:.1e}  |F(X+au) - F - a g'u| = {residual:.4e}"
-              + (f"   ratio {ratios[-1]:.2f}" if ratios and above else "")
-              + ("" if above else "   (below 10x the noise floor, excluded)"))
-        previous = residual if above else None
-    import math
-    slopes = [math.log2(r) for r in ratios]
-    print("       implied order (log2 of each ratio): "
-          + ", ".join(f"{x:.2f}" for x in slopes))
-    check("the residual is second order where it is measurable",
-          bool(slopes) and max(slopes) > 1.7,
-          f"best implied order {max(slopes):.2f} (exactly 2.0 is ideal; a "
-          "wrong gradient leaves a linear term and gives 1.0). The order "
-          f"degrades to {min(slopes):.2f} at the smallest alpha, where the "
-          "residual approaches the render's state granularity -- reported "
-          "rather than hidden by quoting only the best point.")
+        residual = value - base - alpha * gdotu       # SIGNED
+        quadratic = 0.5 * alpha * alpha * uAu
+        rows.append((alpha, residual, quadratic))
+        print(f"        a {alpha:8.2e}  R {residual:+11.4e}  "
+              f"0.5a^2u'A0u {quadratic:11.4e}  R/a {residual / alpha:10.3e}  "
+              f"R/a^2 {residual / alpha ** 2:10.3e}")
+
+    # The floor is estimated from where R DEPARTS from the analytic model, and
+    # from the non-monotonicity of that departure -- not from the spread of F
+    # over nearby states, which contains a genuine derivative and was the
+    # wrong estimator used previously.
+    excess = [abs(r - q) for _, r, q in rows]
+    tail = excess[-3:]
+    floor = max(tail)
+    monotone_excess = all(tail[i] <= tail[i - 1] for i in range(1, len(tail)))
+    print(f"        |R - quadratic| across the sweep: "
+          + ", ".join(f"{e:.2e}" for e in excess))
+    print(f"        estimated evaluation granularity: {floor:.3e} "
+          f"(from the small-alpha excess, which is "
+          f"{'monotone' if monotone_excess else 'NON-monotone -> noise, not a linear term'})")
+    check("the small-alpha excess is non-monotone, i.e. noise not a linear term",
+          not monotone_excess,
+          "a genuine linear error in g would give a residual growing steadily "
+          "as R/a -> const; the measured excess instead jumps up and down")
+
+    above = [(a, r, q) for a, r, q in rows if abs(r) > 10.0 * floor]
+    check("there is an above-noise range to test", len(above) >= 3,
+          f"{len(above)} of {len(rows)} alphas have |R| > 10x the granularity")
+    worst = max(abs(r - q) / max(abs(q), 1e-30) for _, r, q in above)
+    print(f"        above-noise alphas: "
+          + ", ".join(f"{a:.2e}" for a, _, _ in above))
+    check("R matches the analytic quadratic model where measurable",
+          worst < 0.20,
+          f"worst relative deviation {worst:.3f} over {len(above)} alphas; "
+          "this validates g'u AND u'A0u together")
+    below = [a for a, r, _ in rows if abs(r) <= 10.0 * floor]
+    if below:
+        print(f"        NUMERICALLY_INCONCLUSIVE below a = {max(below):.1e}: the "
+              "residual there is at the render's evaluation granularity, so no "
+              "order can be established, and none is claimed.")
 
     print("\n[3] local convergence from a near-truth start, rotations included")
     obs = FreeRGBDObservation(cameras, observations, frame_ids=list(range(T)))
