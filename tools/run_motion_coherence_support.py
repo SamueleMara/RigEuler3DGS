@@ -140,6 +140,16 @@ def main() -> int:
                     help="which endpoint --model is; defaults to the one the "
                          "direction implies, and a mismatch is refused")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--full-state-out", default=None,
+                    help="also export the FULL 12-DOF free state (mu, R as a "
+                         "unit quaternion, v, omega) at every original frame, "
+                         "plus the prior information translation block the "
+                         "filter's own observer provides. Output only: it "
+                         "attaches bidirectional_iekf.free_state."
+                         "FullStateRecorder as the existing observer hook and "
+                         "changes nothing in the filter. phase1_centers/ "
+                         "stores centers alone, which forces every downstream "
+                         "stage to invent R and the rates.")
     args = ap.parse_args()
 
     model, source = args.model, args.source
@@ -258,8 +268,14 @@ def main() -> int:
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
         print(f"  Phase 1 over {len(window)} frames ...")
+        recorder = None
+        if args.full_state_out:
+            from bidirectional_iekf.free_state import FullStateRecorder
+            recorder = FullStateRecorder(expected_frames=len(window))
+            print(f"  recording the full 12-DOF state to {args.full_state_out}")
         positions, _info = bootstrap_positions(truth, cameras, window, cfg,
-                                               None, ns, verbose=True)
+                                               None, ns, verbose=True,
+                                               observer=recorder)
         # Step 5: persist in ORIGINAL CHRONOLOGICAL indexing.
         #
         # `positions` comes back in PROCESSING order, so for a backward run
@@ -311,6 +327,33 @@ def main() -> int:
                      "canonical_xyz.npy is the endpoint model's geometry and "
                      "is NOT centers_frame_0000 for a backward run."),
         }, indent=1))
+        if recorder is not None:
+            import hashlib
+            ply = (Path(model) / "point_cloud"
+                   / f"iteration_{args.iteration if hasattr(args, 'iteration') else 30000}"
+                   / "point_cloud.ply")
+            digest = ""
+            if ply.is_file():
+                h = hashlib.sha256()
+                with open(ply, "rb") as handle:
+                    for chunk in iter(lambda: handle.read(1 << 20), b""):
+                        h.update(chunk)
+                digest = h.hexdigest()
+            fs = recorder.write(
+                args.full_state_out, direction=ctx.direction,
+                canonical_endpoint=ctx.endpoint,
+                processing_order_original_indices=order,
+                dt_seconds=float(ns.dt), dt_is_measured=False,
+                model_path=str(model), source_path=str(source),
+                ply_sha256=digest, scene=args.scene,
+                extra={"max_gaussians": int(args.max_gaussians),
+                       "seed": int(args.seed),
+                       "num_cameras": int(ncam),
+                       "subset_applied": bool(args.max_gaussians
+                                              and truth.mu.shape[0] < mu0.shape[0])})
+            print(f"  full state: {fs['num_frames']} frames x "
+                  f"{fs['num_gaussians']} Gaussians, rates "
+                  f"{fs['rate_convention']}")
         _write_phase1_direction_debug(out, frame_ids, ctx, args.scene,
                                       len(positions), endpoint_evidence)
 

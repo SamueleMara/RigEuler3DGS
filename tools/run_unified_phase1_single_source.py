@@ -62,6 +62,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 SINGLE_SOURCE = "SINGLE_SOURCE"
+CENTER_ONLY = "CENTER_ONLY_APPROXIMATE"
 ENDPOINT_DIRECTION = {"initial": "forward", "final": "backward"}
 
 
@@ -84,6 +85,18 @@ def main() -> int:
     ap.add_argument("--source", required=True, help="dataset root for the scene")
     ap.add_argument("--out-root", required=True,
                     help="the scene's result root, e.g. .../ours/washer_103776")
+    ap.add_argument("--warm-start", choices=("center_only", "full_12d"),
+                    default="center_only",
+                    help="center_only rebuilds R from the endpoint model, v "
+                         "from central differences and omega from nothing; it "
+                         "is a DIAGNOSTIC. full_12d reads the filter's own "
+                         "state from --full-state. Measured on a synthetic "
+                         "rotating fixture, the centre-only start STALLS at a "
+                         "0.825 rad sweep while the real Washer sweep is "
+                         "1.331 rad (tests/test_unified_full_state_export.py)")
+    ap.add_argument("--full-state", default=None,
+                    help="a bidirectional_iekf.free_state export; default "
+                         "<out-root>/bidirectional/<direction>/phase1_full_state")
     ap.add_argument("--phase1-centers", default=None,
                     help="default <out-root>/bidirectional/<direction>/phase1_centers")
     ap.add_argument("--out", default=None,
@@ -186,9 +199,11 @@ def main() -> int:
 
     frame_ids = list(range(args.frame_start, args.frame_start + args.frames))
     center_files = [centers_dir / f"centers_frame_{f:04d}.npy" for f in frame_ids]
-    missing = [f for f in center_files if not f.is_file()]
-    if missing:
-        raise SystemExit(f"missing Phase-1 centers: {[str(m) for m in missing]}")
+    if args.warm_start == "center_only":
+        missing = [f for f in center_files if not f.is_file()]
+        if missing:
+            raise SystemExit(
+                f"missing Phase-1 centers: {[str(m) for m in missing]}")
 
     # ---- the scene ---------------------------------------------------------
     from estimator.covariance import invert_blocks, make_process_noise
@@ -237,29 +252,96 @@ def main() -> int:
             "same physical frames or the warm start belongs to another time.")
 
     # ---- the warm start ----------------------------------------------------
-    centers = []
-    for f in center_files:
-        c = torch.from_numpy(np.load(f)).to(truth.mu.device, torch.float32)
-        if c.shape[0] != N_full:
-            raise SystemExit(f"{f} holds {c.shape[0]} rows but the model has "
-                             f"{N_full}")
-        centers.append(c if keep is None else c[keep.to(c.device)])
+    full_state_dir = Path(args.full_state or out_root / "bidirectional"
+                          / direction / "phase1_full_state")
+    if args.warm_start == "full_12d":
+        from bidirectional_iekf.free_state import (FULL_12D, load_full_state,
+                                                   trajectory_from_full_state)
+        if not (full_state_dir / "full_state_manifest.json").is_file():
+            raise SystemExit(
+                f"--warm-start full_12d needs a full-state export at "
+                f"{full_state_dir}, and there is none. Produce one with\n"
+                f"  python tools/run_motion_coherence_support.py --scene "
+                f"{args.scene} --direction {direction} "
+                f"--canonical-endpoint {args.endpoint} "
+                f"--full-state-out '{full_state_dir}' ...\n"
+                "phase1_centers/ holds centers only; reconstructing R and "
+                "omega from them is the center_only mode, and it is a "
+                "diagnostic, not this one.")
+        loaded = load_full_state(full_state_dir, frames=frame_ids,
+                                 device=truth.mu.device, dtype=truth.mu.dtype)
+        fs_manifest = loaded["manifest"]
+        if fs_manifest.get("canonical_endpoint") != args.endpoint:
+            raise SystemExit(
+                f"{full_state_dir} is the "
+                f"{fs_manifest.get('canonical_endpoint')!r} endpoint")
+        if loaded["mu"].shape[1] != N_full:
+            raise SystemExit(
+                f"{full_state_dir} holds {loaded['mu'].shape[1]} Gaussians but "
+                f"the model has {N_full}; a warm start must be the same "
+                "population in the same row order")
+        if keep is not None:
+            index = keep.to(loaded["mu"].device)
+            for key in ("mu", "R", "v", "omega"):
+                loaded[key] = loaded[key][:, index].contiguous()
+        warm = trajectory_from_full_state(
+            loaded, dt=float(args.dt),
+            appearance={"colors": truth.colors, "opacity": truth.opacity,
+                        "scales": truth.scales})
+        T = warm.T
+        warm_start_record = {
+            "mode": FULL_12D,
+            "source": str(full_state_dir),
+            "rate_convention": fs_manifest["rate_convention"],
+            "rotation_convention": fs_manifest["rotation_convention"],
+            "dt_is_measured": fs_manifest["dt_is_measured"],
+            "note": ("mu, R, v and omega as the free IEKF computed them; "
+                     "nothing is reconstructed"),
+        }
+        print(f"  warm start: {FULL_12D} from {full_state_dir}")
+    else:
+        warm, T, warm_start_record = None, None, None
+
     dt = float(args.dt)
-    T = len(centers)
-    velocities = []
-    for t in range(T):
-        if T == 1:
-            velocities.append(torch.zeros_like(centers[0]))
-        elif t == 0:
-            velocities.append((centers[1] - centers[0]) / dt)
-        elif t == T - 1:
-            velocities.append((centers[-1] - centers[-2]) / dt)
-        else:
-            velocities.append((centers[t + 1] - centers[t - 1]) / (2.0 * dt))
-    warm_states = [GaussianMotionState(
-        mu=centers[t].contiguous(), R=truth.R.clone(), v=velocities[t].contiguous(),
-        omega=torch.zeros_like(centers[t]), colors=truth.colors,
-        opacity=truth.opacity, scales=truth.scales) for t in range(T)]
+    if warm is None:
+        centers = []
+        for f in center_files:
+            c = torch.from_numpy(np.load(f)).to(truth.mu.device, torch.float32)
+            if c.shape[0] != N_full:
+                raise SystemExit(f"{f} holds {c.shape[0]} rows but the model "
+                                 f"has {N_full}")
+            centers.append(c if keep is None else c[keep.to(c.device)])
+        T = len(centers)
+        velocities = []
+        for t in range(T):
+            if T == 1:
+                velocities.append(torch.zeros_like(centers[0]))
+            elif t == 0:
+                velocities.append((centers[1] - centers[0]) / dt)
+            elif t == T - 1:
+                velocities.append((centers[-1] - centers[-2]) / dt)
+            else:
+                velocities.append((centers[t + 1] - centers[t - 1]) / (2.0 * dt))
+        warm_states = [GaussianMotionState(
+            mu=centers[t].contiguous(), R=truth.R.clone(),
+            v=velocities[t].contiguous(), omega=torch.zeros_like(centers[t]),
+            colors=truth.colors, opacity=truth.opacity, scales=truth.scales)
+            for t in range(T)]
+        warm_start_record = {
+            "mode": CENTER_ONLY,
+            "source": str(centers_dir),
+            "mu": "phase1_centers, chronological, verbatim",
+            "R": "the endpoint model's own rotations, constant",
+            "v": "central differences of mu in physical time",
+            "omega": "zero",
+            "note": ("Phase 1 persisted centers only. No rate sign flip is "
+                     "applied: the stored centers are already in original "
+                     "chronological order for both directions, so the "
+                     "difference quotient is already a physical-time rate. "
+                     "This mode is a DIAGNOSTIC: on a synthetic rotating "
+                     "fixture it STALLS at a 0.825 rad sweep, and the real "
+                     "Washer sweep is 1.331 rad."),
+        }
 
     from bidirectional_iekf.ieks import (IEKSConfig, Trajectory,
                                          UnifiedFreeIEKS, save_run)
@@ -304,7 +386,8 @@ def main() -> int:
         process_factors_on_cpu=bool(args.process_factors_on_cpu),
         diagonal_preconditioner=bool(args.diagonal_preconditioner),
         verbose=True))
-    warm = Trajectory(states=warm_states, frame_ids=frame_ids, dt=dt)
+    if warm is None:
+        warm = Trajectory(states=warm_states, frame_ids=frame_ids, dt=dt)
 
     torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
@@ -350,16 +433,25 @@ def main() -> int:
         "source_pose_policy": policy,
         "anchor_original_frame": anchor_original,
         "anchor_window_indices": list(anchor_frames),
-        "warm_start": {
-            "mu": "phase1_centers, chronological, verbatim",
-            "R": "the endpoint model's own rotations, constant",
-            "v": "central differences of mu in physical time",
-            "omega": "zero",
-            "note": ("Phase 1 persisted centers only. No rate sign flip is "
-                     "applied: the stored centers are already in original "
-                     "chronological order for both directions, so the "
-                     "difference quotient is already a physical-time rate."),
+        "warm_start": warm_start_record,
+        "likelihood": {
+            "name": "GAUSSIAN_RGBD",
+            "robust": False,
+            "why_it_is_named": ("production IEKFConfig advertises "
+                                "robust_measurement=True with a Student-t "
+                                "nu=5 IRLS. This run uses the Gaussian "
+                                "likelihood instead -- legitimate, but a "
+                                "DIFFERENT posterior, and the two must not be "
+                                "compared as if they were one. "
+                                "UnifiedFreeIEKS refuses robust=True rather "
+                                "than approximating it."),
         },
+        "dt_is_measured": False,
+        "dt_note": ("job_config_resolved.yaml records fps: null and "
+                    "duration_sec: null. What the dataset spaces evenly is "
+                    "the joint coordinate q (0.0225608954 rad per frame over "
+                    "60 frames); dt is a declared convention and rescales v, "
+                    "omega and Q together."),
         "factor_inventory": inventory,
         "frame_provenance": provenance,
         "warm_start_energy": {k: v for k, v in start_energy.items()
