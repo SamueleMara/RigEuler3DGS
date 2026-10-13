@@ -376,9 +376,29 @@ def block_jacobi_preconditioner(operator: FullWindowFreeOperator, damping=None,
     return apply
 
 
+def _finish(operator, b, x, r, b_norm, iterations, status, history,
+            true_residual):
+    info = {"iterations": iterations, "status": status,
+            "residual": float(r.norm()) / b_norm, "history": history,
+            "residual_kind": "recursive, ||r_k|| / ||b||"}
+    if true_residual:
+        info["true_residual"] = float(
+            (b - operator.information_matvec(x)).norm()) / b_norm
+    return info
+
+
 def pcg(operator: FullWindowFreeOperator, b, preconditioner=None,
-        max_iters: int = 200, tol: float = 1e-10):
-    """Matrix-free preconditioned conjugate gradients on the full window."""
+        max_iters: int = 200, tol: float = 1e-10, true_residual: bool = False):
+    """Matrix-free preconditioned conjugate gradients on the full window.
+
+    `residual` is the RECURSIVE one, `||r_k||/||b||` with r updated by
+    `r - alpha A p`. It is what CG has available for free and what the
+    stopping rule uses, but it drifts from the real thing as rounding
+    accumulates, and on a stiff system it can read small while the iterate is
+    not a solution. `true_residual=True` recomputes `||b - A x||/||b||` with
+    one extra matvec and reports it separately, under its own name. Neither
+    value is ever written over the other.
+    """
     x = operator.zeros()
     r = b.clone()
     z = preconditioner(r) if preconditioner else r.clone()
@@ -390,19 +410,19 @@ def pcg(operator: FullWindowFreeOperator, b, preconditioner=None,
         Ap = operator.information_matvec(p)
         pAp = float((p * Ap).sum())
         if pAp <= 0:
-            return x, {"iterations": iteration, "status": "NON_POSITIVE_CURVATURE",
-                       "residual": float(r.norm()) / b_norm, "history": history}
+            return x, _finish(operator, b, x, r, b_norm, iteration,
+                              "NON_POSITIVE_CURVATURE", history, true_residual)
         alpha = rz / pAp
         x = x + alpha * p
         r = r - alpha * Ap
         rel = float(r.norm()) / b_norm
         history.append(rel)
         if rel < tol:
-            return x, {"iterations": iteration + 1, "status": "CONVERGED",
-                       "residual": rel, "history": history}
+            return x, _finish(operator, b, x, r, b_norm, iteration + 1,
+                              "CONVERGED", history, true_residual)
         z = preconditioner(r) if preconditioner else r
         rz_new = float((r * z).sum())
         p = z + (rz_new / rz) * p
         rz = rz_new
-    return x, {"iterations": max_iters, "status": "MAX_ITERS",
-               "residual": float(r.norm()) / b_norm, "history": history}
+    return x, _finish(operator, b, x, r, b_norm, max_iters, "MAX_ITERS",
+                      history, true_residual)

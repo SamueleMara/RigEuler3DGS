@@ -120,6 +120,12 @@ class IEKSConfig:
     # which is 1.70 GiB each at 60 frames and 24,582 Gaussians, while the
     # diagonal form holds [T,N,12] -- 142 MiB.
     diagonal_preconditioner: bool = False
+    # Recompute ||b - A d|| / ||b|| at the end of every PCG solve. One extra
+    # matvec per outer iteration. The recursive residual CG carries is what
+    # the stopping rule uses, but it drifts, and on a stiff window it can
+    # read small while the iterate is not a solution -- so a run that claims
+    # convergence should be able to show the real number.
+    pcg_true_residual: bool = False
     verbose: bool = True
 
 
@@ -315,7 +321,8 @@ class UnifiedFreeIEKS:
                 preconditioner=block_jacobi_preconditioner(
                     operator, damping=damping,
                     diagonal_only=self.cfg.diagonal_preconditioner),
-                max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol)
+                max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol,
+                true_residual=self.cfg.pcg_true_residual)
             if solve_info["status"] == "NON_POSITIVE_CURVATURE":
                 damping *= self.cfg.damping_up
                 trace.append({"outer": outer, "accepted": False,
@@ -413,6 +420,8 @@ class UnifiedFreeIEKS:
                       "step_norm": step_norm, "directional": directional,
                       "pcg_iterations": solve_info["iterations"],
                       "pcg_residual": solve_info["residual"],
+                      "pcg_residual_kind": solve_info.get("residual_kind"),
+                      "pcg_true_residual": solve_info.get("true_residual"),
                       "pcg_status": solve_info["status"],
                       "trials": trials, **energy}
             trace.append(record)

@@ -116,6 +116,16 @@ def main() -> int:
                     choices=("fixed_conditional", "optimizable_reference"),
                     default="fixed_conditional")
     ap.add_argument("--frames-on-cpu", action="store_true")
+    ap.add_argument("--pcg-true-residual", action="store_true",
+                    help="recompute ||b - A d|| / ||b|| at the end of every "
+                         "PCG solve (one extra matvec) and record it beside "
+                         "the recursive estimate the stopping rule uses")
+    ap.add_argument("--allow-missing-anchor", action="store_true",
+                    help="permit a window that does not contain the source "
+                         "endpoint's own frame. Without it such a window is "
+                         "REFUSED: silently downgrading fixed_conditional to "
+                         "optimizable_reference would drop the source "
+                         "constraint while the manifest still named a policy")
     ap.add_argument("--diagonal-preconditioner", action="store_true",
                     help="precondition on the diagonal instead of the 12x12 "
                          "blocks: 142 MiB instead of 1.70 GiB held three times "
@@ -134,6 +144,12 @@ def main() -> int:
                          "fit in 8 GiB; streaming re-renders instead, with the "
                          "same arithmetic (tests/test_unified_streaming_window.py)")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--diagnose-objective", action="store_true",
+                    help="before solving, attribute the warm start's energy: "
+                         "image against process, the process term block by "
+                         "block, the per-frame position sigma the prior "
+                         "implies, and the per-frame centre jump the data "
+                         "actually has. Reports; changes nothing")
     ap.add_argument("--dry-run", action="store_true",
                     help="load, seal the inventory, report sizes, do not solve")
     args = ap.parse_args()
@@ -369,19 +385,38 @@ def main() -> int:
     # precision, and every reported uncertainty is conditional on that.
     anchor_original = 0 if args.endpoint == "initial" else p1["num_frames"] - 1
     anchor_frames = tuple(i for i, f in enumerate(frame_ids) if f == anchor_original)
-    if args.source_pose_policy == "fixed_conditional" and not anchor_frames:
-        print(f"  NOTE: the {args.endpoint} anchor is original frame "
-              f"{anchor_original}, which is outside this window "
-              f"[{frame_ids[0]}, {frame_ids[-1]}]. There is no source-time "
-              "pose to eliminate here, so the policy is recorded as "
-              "'optimizable_reference' for this rung.")
+    anchor_outside = (args.source_pose_policy == "fixed_conditional"
+                      and not anchor_frames)
+    if anchor_outside and not args.allow_missing_anchor:
+        raise SystemExit(
+            f"the {args.endpoint} source is anchored at original frame "
+            f"{anchor_original}, which is outside this window "
+            f"[{frame_ids[0]}, {frame_ids[-1]}]. There is no source-time pose "
+            "to eliminate, so --source-pose-policy fixed_conditional cannot "
+            "be honoured here.\n"
+            "Quietly running optimizable_reference instead would drop the "
+            "source constraint while the manifest still named a policy, and "
+            "the objective would be a DIFFERENT one than the label claims. "
+            "The correct boundary prior is the marginal of the omitted "
+            "frames, which this tool does not yet propagate.\n"
+            "Either include the source frame in the window "
+            f"(--frame-start {max(0, anchor_original - args.frames + 1)} "
+            f"--frames {args.frames} reaches frame {anchor_original}), or "
+            "pass --allow-missing-anchor to run the UNANCHORED objective "
+            "with that fact recorded.")
     policy = (args.source_pose_policy if anchor_frames
               else "optimizable_reference")
+    if anchor_outside:
+        print(f"  WARNING: the {args.endpoint} anchor (original frame "
+              f"{anchor_original}) is outside [{frame_ids[0]}, "
+              f"{frame_ids[-1]}]. Running UNANCHORED by explicit request; "
+              "this is a different objective and the manifest says so.")
 
     ieks = UnifiedFreeIEKS(obs, Q_inv, config=IEKSConfig(
         max_outer=args.max_outer, damping=args.damping,
         pcg_max_iters=args.pcg_iters, pcg_tol=args.pcg_tol,
         source_pose_policy=policy, anchor_frames=anchor_frames,
+        pcg_true_residual=bool(args.pcg_true_residual),
         stream_frames=bool(args.stream_frames),
         process_factors_on_cpu=bool(args.process_factors_on_cpu),
         diagonal_preconditioner=bool(args.diagonal_preconditioner),
@@ -398,6 +433,61 @@ def main() -> int:
           f"proc {start_energy['E_process']:.4e}); "
           f"{start_energy['depth_support']['total']} covered depth pixels; "
           f"peak {load_peak:.0f} MiB after one full evaluation")
+
+    diagnosis = None
+    if args.diagnose_objective:
+        from bidirectional_iekf.process_factors import process_residual
+        blocks = {"mu": slice(0, 3), "phi": slice(3, 6),
+                  "v": slice(6, 9), "omega": slice(9, 12)}
+        attribution = {k: 0.0 for k in blocks}
+        norms = {k: 0.0 for k in blocks}
+        for t in range(T - 1):
+            e = process_residual(warm.states[t], warm.states[t + 1], dt).double()
+            for name, sl in blocks.items():
+                masked = torch.zeros_like(e)
+                masked[:, sl] = e[:, sl]
+                attribution[name] += 0.5 * float(
+                    torch.einsum("ni,nij,nj->", masked, Q_inv, masked))
+                norms[name] = max(norms[name],
+                                  float(e[:, sl].norm(dim=1).max()))
+        qdiag = torch.diagonal(Q_inv[0])
+        sigma_mu = float(torch.diagonal(Q[0])[0].sqrt())
+        jumps = [float((warm.states[t + 1].mu - warm.states[t].mu)
+                       .norm(dim=1).max()) for t in range(T - 1)]
+        image = start_energy["E_rgb"] + start_energy["E_depth"]
+        diagnosis = {
+            "image_energy": image,
+            "process_energy": start_energy["E_process"],
+            "process_fraction_of_total": (start_energy["E_process"]
+                                          / max(start_energy["E_total"], 1e-30)),
+            "process_energy_by_block": attribution,
+            "process_block_attribution_is_not_additive": (
+                "Q carries the white-noise-acceleration mu/v cross terms, so "
+                "zeroing all but one block and summing OVERCOUNTS; the "
+                "numbers locate the cost, they do not partition it"),
+            "max_process_residual_by_block": norms,
+            "Q_inv_diagonal": {k: float(qdiag[s.start]) for k, s in blocks.items()},
+            "implied_position_sigma_per_frame_m": sigma_mu,
+            "observed_max_centre_jump_per_frame_m": max(jumps) if jumps else 0.0,
+            "sigma_mismatch_factor": (max(jumps) / sigma_mu) if jumps and sigma_mu
+                                     else None,
+            "note": ("process_noise_pos is a continuous-time density; over "
+                     "dt it gives the per-frame position sigma above. The "
+                     "production value was chosen for the PER-FRAME filter, "
+                     "where each step starts from a fresh covariance. A "
+                     "full-window smoother applies it between every "
+                     "consecutive pair at once, which is a different "
+                     "prior strength. This is reported, not retuned."),
+        }
+        print(f"  objective at the warm start: image {image:.4e}, process "
+              f"{start_energy['E_process']:.4e} "
+              f"({100 * diagnosis['process_fraction_of_total']:.1f}% of the total)")
+        print("    process energy located in: "
+              + ", ".join(f"{k} {v:.3e}" for k, v in attribution.items()))
+        print(f"    the prior allows {sigma_mu:.3e} m of unexplained position "
+              f"per frame; the data moves up to "
+              f"{max(jumps) if jumps else 0.0:.3e} m "
+              f"({diagnosis['sigma_mismatch_factor']:.0f} sigma)")
 
     out.mkdir(parents=True, exist_ok=True)
     base = {
@@ -431,8 +521,16 @@ def main() -> int:
         "process_factors_on_cpu": bool(args.process_factors_on_cpu),
         "diagonal_preconditioner": bool(args.diagonal_preconditioner),
         "source_pose_policy": policy,
+        "source_pose_policy_requested": args.source_pose_policy,
         "anchor_original_frame": anchor_original,
         "anchor_window_indices": list(anchor_frames),
+        "anchor_in_window": bool(anchor_frames),
+        "objective_caveat": (None if not anchor_outside else
+                             "UNANCHORED: the source frame is outside this "
+                             "window, the boundary marginal of the omitted "
+                             "frames is NOT propagated, and the objective is "
+                             "therefore not the one fixed_conditional names"),
+        "pcg_true_residual_requested": bool(args.pcg_true_residual),
         "warm_start": warm_start_record,
         "likelihood": {
             "name": "GAUSSIAN_RGBD",
@@ -458,6 +556,7 @@ def main() -> int:
                               if k != "depth_support"},
         "depth_support_at_warm_start": start_energy["depth_support"]["total"],
         "peak_cuda_mib_after_one_evaluation": load_peak,
+        "warm_start_objective_diagnosis": diagnosis,
     }
     if args.dry_run:
         base["status"] = "DRY_RUN"
@@ -501,8 +600,11 @@ def main() -> int:
         "outer_iterations": len(result["trace"]),
         "accepted_steps": sum(1 for r in result["trace"] if r["accepted"]),
         "final_pcg": {k: result["trace"][-1].get(k) for k in
-                      ("pcg_iterations", "pcg_residual", "pcg_status",
+                      ("pcg_iterations", "pcg_residual",
+                       "pcg_residual_kind", "pcg_true_residual", "pcg_status",
                        "grad_norm", "step_norm", "damping")},
+        "pcg_true_residual_trace": [r.get("pcg_true_residual")
+                                    for r in result["trace"]],
         "max_center_change_from_warm_start": moved,
     })
     (out / "single_source_manifest.json").write_text(
