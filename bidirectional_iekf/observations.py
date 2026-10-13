@@ -167,9 +167,15 @@ class FreeRGBDObservation:
                 precisions.append(None)
                 continue
             rgb_gt, depth_gt, valid = observed
+            # The frames may live on the CPU: at 60 frames x 8 cameras the
+            # observations alone are about 2.5 GiB, and the dataset loader's
+            # --frames-on-cpu exists for exactly that. Move the depth GT and
+            # its validity mask onto the render's device once, here, rather
+            # than letting `valid & (alpha > gate)` below meet a CPU tensor.
+            depth_gt = depth_gt.to(depth_hat)
+            valid = valid.to(depth_hat.device)
             r_rgb = rgbd_residual(rgb_gt.to(rgb_hat), rgb_hat)
-            r_depth = rgbd_residual(depth_gt.to(depth_hat), depth_hat,
-                                    valid_mask=valid)
+            r_depth = rgbd_residual(depth_gt, depth_hat, valid_mask=valid)
             # Exactly the call the existing IEKF makes, including the empty
             # sigma_rgb for the depth-only channel: the layout decides which
             # sensor model applies, and a stray RGB sigma against a

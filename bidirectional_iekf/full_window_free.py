@@ -108,7 +108,7 @@ class FullWindowFreeOperator:
                  process_factors, measurement_factors,
                  prior_information: torch.Tensor | None = None,
                  prior_residual: torch.Tensor | None = None,
-                 damping: float = 0.0):
+                 damping: float = 0.0, work_device=None):
         self.T = int(num_frames)
         self.N = int(num_gaussians)
         self.process = list(process_factors)
@@ -116,6 +116,15 @@ class FullWindowFreeOperator:
         self.prior_information = prior_information  # [N,12,12] on frame 0
         self.prior_residual = prior_residual        # [N,12]
         self.damping = float(damping)
+        # The device the SOLVE runs on. It used to be read off the first
+        # process factor, which is the same thing whenever the factors sit
+        # beside the state. They need not: a long window keeps its dense
+        # [N,12,12] Jacobians in host memory and moves one pair at a time, and
+        # inferring the solve's device from their storage would quietly move
+        # the whole PCG to the CPU.
+        self.work_device = (torch.device(work_device) if work_device is not None
+                            else (self.process[0].A.device if self.process
+                                  else torch.device("cpu")))
         for factor in self.process:
             if not 0 <= factor.frame < self.T - 1:
                 raise ValueError(
@@ -127,15 +136,13 @@ class FullWindowFreeOperator:
 
     # -- shape helpers ----------------------------------------------------
     def zeros(self) -> torch.Tensor:
-        device = (self.process[0].A.device if self.process
-                  else torch.device("cpu"))
         return torch.zeros(self.T, self.N, ERROR_DIM, dtype=torch.float64,
-                           device=device)
+                           device=self.work_device)
 
     def _check(self, u: torch.Tensor) -> torch.Tensor:
         u = torch.as_tensor(u).double()
-        if self.process and u.device != self.process[0].A.device:
-            u = u.to(self.process[0].A.device)
+        if u.device != self.work_device:
+            u = u.to(self.work_device)
         if u.shape != (self.T, self.N, ERROR_DIM):
             raise ValueError(
                 f"trajectory tangent must be [{self.T},{self.N},{ERROR_DIM}], "
@@ -268,16 +275,64 @@ def schur_forward_backward(diag, upper, rhs_blocks):
     return x
 
 
-def block_jacobi_preconditioner(operator: FullWindowFreeOperator, damping=None):
+def _diagonal_jacobi_preconditioner(operator, damping=None):
+    """The diagonal of the same matrix, inverted entrywise."""
+    device = getattr(operator, "work_device", None) or (
+        operator.process[0].A.device if operator.process
+        else torch.device("cpu"))
+    diag = torch.ones(operator.T, operator.N, ERROR_DIM, dtype=torch.float64,
+                      device=device)
+    if operator.prior_information is not None:
+        diag[0] += operator.prior_information.to(diag).diagonal(dim1=-2, dim2=-1)
+    if hasattr(operator, "measurement_diagonal"):
+        diag += operator.measurement_diagonal().to(diag)
+    elif hasattr(operator, "measurement_block_diagonal"):
+        diag += operator.measurement_block_diagonal().to(diag).diagonal(
+            dim1=-2, dim2=-1)
+    lam = operator.damping if damping is None else damping
+    if lam and hasattr(operator, "curvature_scale"):
+        diag = diag + lam * operator.curvature_scale().to(diag.device)
+    elif lam:
+        diag = diag + lam
+    for factor in operator.process:
+        t = factor.frame
+        A, B, Q = (factor.A.to(diag.device), factor.B.to(diag.device),
+                   factor.Q_inv.to(diag.device))
+        diag[t] += torch.einsum("nji,njk,nki->ni", A, Q, A)
+        diag[t + 1] += torch.einsum("nji,njk,nki->ni", B, Q, B)
+    # Same guard as the block form: an unobserved Gaussian contributes nothing
+    # at that frame, so its entry can be zero.
+    floor = 1e-9 * diag.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+    inv = 1.0 / diag.clamp_min(floor)
+
+    def apply(z):
+        return inv * torch.as_tensor(z).double().to(inv.device)
+
+    return apply
+
+
+def block_jacobi_preconditioner(operator: FullWindowFreeOperator, damping=None,
+                                diagonal_only: bool = False):
     """Per-frame, per-Gaussian inverse of the diagonal blocks.
 
     A PRECONDITIONER. It discards the temporal off-diagonals and the
     cross-Gaussian pixel coupling, so it is not the posterior covariance and
     must never be reported as one.
+
+    `diagonal_only` keeps the 12 diagonal entries instead of the 12x12 block.
+    PCG converges to the same solution under any symmetric positive definite
+    preconditioner -- the preconditioner sets the rate, not the answer -- so
+    this is a memory/iteration trade. It exists because the block form needs
+    [T,N,12,12] float64 for the Fisher, again for the blocks and again for
+    their inverse: 1.70 GiB apiece on the real 60-frame 24,582-Gaussian
+    window, against 142 MiB for the diagonal.
     """
+    if diagonal_only:
+        return _diagonal_jacobi_preconditioner(operator, damping)
     size = ERROR_DIM
-    device = (operator.process[0].A.device if operator.process
-              else torch.device("cpu"))
+    device = getattr(operator, "work_device", None) or (
+        operator.process[0].A.device if operator.process
+        else torch.device("cpu"))
     blocks = torch.zeros(operator.T, operator.N, size, size,
                          dtype=torch.float64, device=device)
     eye = torch.eye(size, dtype=torch.float64, device=device)
@@ -303,8 +358,10 @@ def block_jacobi_preconditioner(operator: FullWindowFreeOperator, damping=None):
                                           device=blocks.device)
     for factor in operator.process:
         t = factor.frame
-        blocks[t] += torch.einsum("nji,njk,nkl->nil", factor.A, factor.Q_inv, factor.A)
-        blocks[t + 1] += torch.einsum("nji,njk,nkl->nil", factor.B, factor.Q_inv, factor.B)
+        A, B, Q = (factor.A.to(blocks.device), factor.B.to(blocks.device),
+                   factor.Q_inv.to(blocks.device))
+        blocks[t] += torch.einsum("nji,njk,nkl->nil", A, Q, A)
+        blocks[t + 1] += torch.einsum("nji,njk,nkl->nil", B, Q, B)
     # A Gaussian unobserved at a frame contributes nothing, so its block can
     # be singular; ridge it rather than inverting a singular matrix.
     ridge = 1e-9 * blocks.diagonal(dim1=-2, dim2=-1).abs().amax(

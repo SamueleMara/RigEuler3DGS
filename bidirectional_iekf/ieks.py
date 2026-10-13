@@ -96,6 +96,30 @@ class IEKSConfig:
     # Tangent columns held at zero. A DIAGNOSTIC ablation, not a model: used
     # to isolate whether a stall comes from the weakly observed rate blocks.
     frozen_columns: tuple = ()
+    # Keep ONE frame's rasterizer cache resident instead of the whole window.
+    # Measured on the real Washer scene (24,582 Gaussians, 640x480, 8 GiB
+    # card): 878 MiB at 4 (frame, camera) factors, 1901 MiB at 16, and an
+    # out-of-memory at 64 -- about 85 MiB a factor, so the 480 factors of a
+    # 60-frame 8-camera window need roughly 41 GiB and cannot fit. Streaming
+    # re-renders each frame instead of reading its cache; the arithmetic is
+    # unchanged and tests/test_unified_streaming_window.py checks that.
+    stream_frames: bool = False
+    # Keep the per-frame-pair process Jacobians in host memory and move one
+    # pair at a time. A and B are dense [N,12,12] float64, so at 24,582
+    # Gaussians one pair is 2 x 28 MiB and a 60-frame window is 3.3 GiB of
+    # device memory that the rasterizer then cannot have. Streaming the frames
+    # alone is not enough: with 30 frames x 8 cameras the window evaluates in
+    # 544 MiB but the system build still ran out at 4438 MiB on an 8 GiB card.
+    # The transfer is about 4% of a matvec whose renders dominate.
+    process_factors_on_cpu: bool = False
+    # Precondition on the DIAGONAL instead of the 12x12 blocks. A
+    # preconditioner changes how fast PCG converges, never what it converges
+    # to, so this is a memory/iteration trade and not a modelling choice. It
+    # is what the full real window needs: the block form holds [T,N,12,12]
+    # float64 three times over (the Fisher memo, the blocks, their inverse),
+    # which is 1.70 GiB each at 60 frames and 24,582 Gaussians, while the
+    # diagonal form holds [T,N,12] -- 142 MiB.
+    diagonal_preconditioner: bool = False
     verbose: bool = True
 
 
@@ -225,17 +249,24 @@ class UnifiedFreeIEKS:
 
     # -- linearisation -----------------------------------------------------
     def build_system(self, trajectory: Trajectory, damping: float):
-        caches = [self.obs.linearize_frame(trajectory.states[t], t)
-                  for t in range(trajectory.T)]
+        caches = (_StreamedCaches(self.obs, trajectory.states)
+                  if self.cfg.stream_frames
+                  else [self.obs.linearize_frame(trajectory.states[t], t)
+                        for t in range(trajectory.T)])
 
+        host = (torch.device("cpu") if self.cfg.process_factors_on_cpu
+                else None)
         process_factors = []
         for t in range(trajectory.T - 1):
             A, B = process_residual_jacobians(
                 trajectory.states[t], trajectory.states[t + 1], trajectory.dt)
             e = process_residual(trajectory.states[t], trajectory.states[t + 1],
                                  trajectory.dt)
-            process_factors.append(ProcessFactor(
-                frame=t, A=A, B=B, Q_inv=self.Q_inv.to(A.device), residual=e))
+            Q = self.Q_inv.to(A.device)
+            if host is not None:
+                A, B, Q, e = A.to(host), B.to(host), Q.to(host), e.to(host)
+            process_factors.append(ProcessFactor(frame=t, A=A, B=B, Q_inv=Q,
+                                                 residual=e))
 
         operator = _CudaWindowOperator(
             num_frames=trajectory.T, num_gaussians=trajectory.N,
@@ -246,7 +277,8 @@ class UnifiedFreeIEKS:
             damping=damping,
             frozen_frames=(tuple(self.cfg.anchor_frames)
                            if self.cfg.source_pose_policy == "fixed_conditional"
-                           else ()))
+                           else ()),
+            work_device=trajectory.states[0].mu.device)
         return operator, caches
 
     # -- the outer loop ----------------------------------------------------
@@ -280,7 +312,9 @@ class UnifiedFreeIEKS:
 
             step, solve_info = pcg(
                 operator, b,
-                preconditioner=block_jacobi_preconditioner(operator, damping=damping),
+                preconditioner=block_jacobi_preconditioner(
+                    operator, damping=damping,
+                    diagonal_only=self.cfg.diagonal_preconditioner),
                 max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol)
             if solve_info["status"] == "NON_POSITIVE_CURVATURE":
                 damping *= self.cfg.damping_up
@@ -431,22 +465,67 @@ class UnifiedFreeIEKS:
                 }}
 
 
+class _StreamedCaches:
+    """One frame's linearisation resident at a time, rebuilt on demand.
+
+    The resident path holds every frame's frozen rasterizer cache alive for
+    the whole outer iteration, which is what makes the full real window
+    impossible on an 8 GiB card (see `IEKSConfig.stream_frames` for the
+    measured numbers). This provider answers `caches[t]` by relinearising
+    frame `t` at the SAME nominal state the resident path used, and lets the
+    previous one go.
+
+    It is not an approximation and not a reduced state: `linearize_frame` is
+    the same call with the same arguments, so the operator's action is
+    identical. What it costs is one render per frame per pass -- a matvec that
+    used to read T cached linearisations now rebuilds them.
+
+    `build_inventory` is deliberately NOT touched here: the factor set is
+    sealed once, and relinearisation updates factors rather than adding them.
+    """
+
+    def __init__(self, observation, states):
+        self.obs = observation
+        self.states = list(states)
+        self.rebuilds = 0
+
+    def __len__(self) -> int:
+        return len(self.states)
+
+    def __getitem__(self, index: int):
+        if isinstance(index, slice):
+            raise TypeError(
+                "a streamed window is read one frame at a time; slicing it "
+                "would materialise exactly the residency this avoids")
+        t = int(index)
+        if t < 0:
+            t += len(self.states)
+        if not 0 <= t < len(self.states):
+            raise IndexError(t)
+        self.rebuilds += 1
+        return self.obs.linearize_frame(self.states[t], t)
+
+
 class _CudaWindowOperator(FullWindowFreeOperator):
     """FullWindowFreeOperator whose measurement blocks are the real renderer."""
 
     def __init__(self, *, num_frames, num_gaussians, process_factors,
                  observation, caches, prior_information, prior_residual,
-                 damping, frozen_frames=(), frozen_columns=()):
+                 damping, frozen_frames=(), frozen_columns=(),
+                 work_device=None):
         super().__init__(num_frames=num_frames, num_gaussians=num_gaussians,
                          process_factors=process_factors,
                          measurement_factors=[],
                          prior_information=prior_information,
-                         prior_residual=prior_residual, damping=damping)
+                         prior_residual=prior_residual, damping=damping,
+                         work_device=work_device)
         self.obs = observation
         self.caches = caches
         self.frozen = tuple(frozen_frames)
         self.frozen_columns = tuple(frozen_columns)
         self._curvature = None
+        self._measurement_blocks = None
+        self._measurement_diag = None
 
     def _freeze(self, u: torch.Tensor) -> torch.Tensor:
         """Exact elimination of a conditionally fixed source-time pose.
@@ -465,13 +544,44 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         return out
 
     def measurement_block_diagonal(self) -> torch.Tensor:
-        """Per-frame, per-Gaussian measurement Fisher, for preconditioning."""
+        """Per-frame, per-Gaussian measurement Fisher, for preconditioning.
+
+        Memoised: the curvature scale and the block-Jacobi preconditioner both
+        ask for it within one outer iteration, and under `stream_frames` each
+        ask would otherwise re-render the whole window. The operator is rebuilt
+        from scratch at every outer iteration, so the memo never outlives the
+        linearisation it belongs to.
+        """
+        if self._measurement_blocks is not None:
+            return self._measurement_blocks
         blocks = torch.zeros(self.T, self.N, ERROR_DIM, ERROR_DIM,
-                             dtype=torch.float64,
-                             device=self.process[0].A.device if self.process else "cpu")
+                             dtype=torch.float64, device=self.work_device)
         for t, cache in enumerate(self.caches):
             blocks[t] = self.obs.block_fisher(cache).to(blocks.device)
+        self._measurement_blocks = blocks
         return blocks
+
+    def measurement_diagonal(self) -> torch.Tensor:
+        """Just diag(H'R^-1 H) per frame, [T,N,12].
+
+        The full blocks are [T,N,12,12]; on the real window that is 1.70 GiB
+        against 142 MiB, and the LM scaling and the diagonal preconditioner
+        only ever use the diagonal. One frame's blocks are materialised at a
+        time and dropped, so the peak is one [N,12,12] rather than T of them.
+        """
+        if self._measurement_diag is not None:
+            return self._measurement_diag
+        if self._measurement_blocks is not None:
+            self._measurement_diag = self._measurement_blocks.diagonal(
+                dim1=-2, dim2=-1).clone()
+            return self._measurement_diag
+        diag = torch.zeros(self.T, self.N, ERROR_DIM, dtype=torch.float64,
+                           device=self.work_device)
+        for t, cache in enumerate(self.caches):
+            diag[t] = self.obs.block_fisher(cache).diagonal(
+                dim1=-2, dim2=-1).to(diag.device)
+        self._measurement_diag = diag
+        return diag
 
     def curvature_scale(self) -> torch.Tensor:
         """diag(A) per tangent coordinate, for Levenberg-Marquardt damping.
@@ -486,13 +596,15 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         direction relative to its own curvature, which is what LM is for.
         """
         if self._curvature is None:
-            diag = self.measurement_block_diagonal().diagonal(dim1=-2, dim2=-1).clone()
+            diag = self.measurement_diagonal().clone()
             for factor in self.process:
                 t = factor.frame
-                AtQA = torch.einsum("nji,njk,nkl->nil", factor.A, factor.Q_inv, factor.A)
-                BtQB = torch.einsum("nji,njk,nkl->nil", factor.B, factor.Q_inv, factor.B)
-                diag[t] += AtQA.diagonal(dim1=-2, dim2=-1)
-                diag[t + 1] += BtQB.diagonal(dim1=-2, dim2=-1)
+                A, B, Q = (factor.A.to(diag.device), factor.B.to(diag.device),
+                           factor.Q_inv.to(diag.device))
+                # einsum straight to the diagonal: the full AtQA is [N,12,12]
+                # and only its 12 diagonal entries are wanted.
+                diag[t] += torch.einsum("nji,njk,nki->ni", A, Q, A)
+                diag[t + 1] += torch.einsum("nji,njk,nki->ni", B, Q, B)
             if self.prior_information is not None:
                 diag[0] += self.prior_information.double().to(diag.device).diagonal(
                     dim1=-2, dim2=-1)
@@ -510,11 +622,13 @@ class _CudaWindowOperator(FullWindowFreeOperator):
             out[t] += contribution.double()
         for factor in self.process:
             t = factor.frame
-            Ku = (torch.einsum("nij,nj->ni", factor.A, u[t])
-                  + torch.einsum("nij,nj->ni", factor.B, u[t + 1]))
-            QKu = torch.einsum("nij,nj->ni", factor.Q_inv, Ku)
-            out[t] += torch.einsum("nji,nj->ni", factor.A, QKu)
-            out[t + 1] += torch.einsum("nji,nj->ni", factor.B, QKu)
+            A, B, Q = (factor.A.to(u.device), factor.B.to(u.device),
+                       factor.Q_inv.to(u.device))
+            Ku = (torch.einsum("nij,nj->ni", A, u[t])
+                  + torch.einsum("nij,nj->ni", B, u[t + 1]))
+            QKu = torch.einsum("nij,nj->ni", Q, Ku)
+            out[t] += torch.einsum("nji,nj->ni", A, QKu)
+            out[t + 1] += torch.einsum("nji,nj->ni", B, QKu)
         if self.damping:
             out += self.damping * self.curvature_scale() * u
         return self._freeze(out)
@@ -529,9 +643,11 @@ class _CudaWindowOperator(FullWindowFreeOperator):
             b[t] += self.obs.gradient(cache).double()
         for factor in self.process:
             t = factor.frame
-            Qe = torch.einsum("nij,nj->ni", factor.Q_inv, factor.residual.double())
-            b[t] -= torch.einsum("nji,nj->ni", factor.A, Qe)
-            b[t + 1] -= torch.einsum("nji,nj->ni", factor.B, Qe)
+            A, B, Q = (factor.A.to(b.device), factor.B.to(b.device),
+                       factor.Q_inv.to(b.device))
+            Qe = torch.einsum("nij,nj->ni", Q, factor.residual.double().to(b.device))
+            b[t] -= torch.einsum("nji,nj->ni", A, Qe)
+            b[t + 1] -= torch.einsum("nji,nj->ni", B, Qe)
         return self._freeze(b)
 
     def dense_information(self):

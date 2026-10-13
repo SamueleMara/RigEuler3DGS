@@ -224,7 +224,15 @@ def main() -> int:
     # ---------------------------------------------------------------------
     print("\n[2] a real full-window IEKS from a noisy, in-capture warm start")
     mid = T // 2
-    noise = 0.008 * torch.randn(N, 3, generator=g, dtype=torch.float64)
+    # 0.018, not 0.008. The run is CONVERGED by state stationarity, and that
+    # verdict also requires the gradient to have come DOWN from where it
+    # started (grad_decay_tol = 1e-3). The converged gradient floors at the
+    # float32 rendering noise and does not move, so the ratio is set by the
+    # START: at 0.008 the initial gradient landed within a few percent of
+    # 1e+03 times the floor and the status flipped between CONVERGED and
+    # STALLED run to run. A larger -- still in-capture -- warm-start error
+    # puts the ratio clear of the gate instead of weakening it.
+    noise = 0.018 * torch.randn(N, 3, generator=g, dtype=torch.float64)
     warm_mu = truth[mid].mu.double().cpu() + noise
     warm = Trajectory(
         states=[make(warm_mu, truth[mid].R.double().cpu(),
@@ -260,6 +268,11 @@ def main() -> int:
     low_err = max(float((est.states[t].mu[is_low]
                          - truth[t].mu[is_low]).norm(dim=1).max())
                   for t in range(T))
+    print(f"       |g| {result['trace'][0]['grad_norm']:.3e} -> "
+          f"{result['trace'][-1]['grad_norm']:.3e}, a ratio of "
+          f"{result['trace'][-1]['grad_norm'] / result['trace'][0]['grad_norm']:.2e} "
+          f"against the 1e-03 grad_decay_tol that separates CONVERGED from "
+          f"STALLED")
     for row in result["trace"][-3:]:
         print(f"       outer {row['outer']:>3} E {row['E_total']:.4e} "
               f"|g| {row['grad_norm']:.3e} |d| {row.get('step_norm', float('nan')):.3e} "
