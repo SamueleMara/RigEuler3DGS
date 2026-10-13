@@ -127,10 +127,15 @@ class FullWindowFreeOperator:
 
     # -- shape helpers ----------------------------------------------------
     def zeros(self) -> torch.Tensor:
-        return torch.zeros(self.T, self.N, ERROR_DIM, dtype=torch.float64)
+        device = (self.process[0].A.device if self.process
+                  else torch.device("cpu"))
+        return torch.zeros(self.T, self.N, ERROR_DIM, dtype=torch.float64,
+                           device=device)
 
     def _check(self, u: torch.Tensor) -> torch.Tensor:
         u = torch.as_tensor(u).double()
+        if self.process and u.device != self.process[0].A.device:
+            u = u.to(self.process[0].A.device)
         if u.shape != (self.T, self.N, ERROR_DIM):
             raise ValueError(
                 f"trajectory tangent must be [{self.T},{self.N},{ERROR_DIM}], "
@@ -271,8 +276,11 @@ def block_jacobi_preconditioner(operator: FullWindowFreeOperator):
     must never be reported as one.
     """
     size = ERROR_DIM
-    blocks = torch.zeros(operator.T, operator.N, size, size, dtype=torch.float64)
-    eye = torch.eye(size, dtype=torch.float64)
+    device = (operator.process[0].A.device if operator.process
+              else torch.device("cpu"))
+    blocks = torch.zeros(operator.T, operator.N, size, size,
+                         dtype=torch.float64, device=device)
+    eye = torch.eye(size, dtype=torch.float64, device=device)
     for t in range(operator.T):
         blocks[t] = eye
     if operator.prior_information is not None:

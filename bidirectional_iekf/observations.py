@@ -112,7 +112,7 @@ class FreeRGBDObservation:
                  sigma_rgb: float = 1.0, depth_sigma_model="constant",
                  robust: bool = False, nu: float = 5.0,
                  use_rgb: bool = True, use_depth: bool = True,
-                 eps_depth: float = 1e-6):
+                 eps_depth: float = 1e-6, min_alpha_for_depth: float = 0.05):
         self.cameras = list(cameras)
         self.observations = list(observations)
         self.frame_ids = (list(frame_ids) if frame_ids is not None
@@ -128,6 +128,12 @@ class FreeRGBDObservation:
         self.use_rgb = bool(use_rgb)
         self.use_depth = bool(use_depth)
         self.eps_depth = float(eps_depth)
+        # Section 27's coverage gate, the production default. D = Z/(A+eps)
+        # is ill-conditioned where the renderer barely covers a pixel: A -> 0
+        # makes the quotient enormous and its residual swamps every other
+        # term. Omitting this gate is what made a synthetic depth energy read
+        # 3.95e7 against an RGB energy of 194.
+        self.min_alpha_for_depth = float(min_alpha_for_depth)
         self.inventory = FactorInventory()
         self._inventory_built = False
 
@@ -144,8 +150,8 @@ class FreeRGBDObservation:
         per_cam = self.observations[frame_index]
 
         residuals, precisions, used = [], [], []
-        for camera_index, ((rgb_hat, depth_hat), observed) in enumerate(
-                zip(predicted, per_cam)):
+        for camera_index, ((rgb_hat, depth_hat), view, observed) in enumerate(
+                zip(predicted, lin.views, per_cam)):
             if observed is None:
                 residuals.append(None)
                 precisions.append(None)
@@ -166,9 +172,11 @@ class FreeRGBDObservation:
             else:
                 p_rgb = torch.zeros_like(r_rgb)
             if self.use_depth:
+                covered = valid & (view.alpha > self.min_alpha_for_depth)
                 p_depth = build_precision(
-                    r_depth.unsqueeze(0), valid_mask=valid.unsqueeze(0),
+                    r_depth.unsqueeze(0), valid_mask=covered.unsqueeze(0),
                     sigma_rgb=(), depth_sigma_model=self.depth_sigma_model,
+                    depth_range=depth_gt.unsqueeze(0),
                     robust=self.robust, nu=self.nu,
                     layout=("depth",), channel_dim=0).squeeze(0)
             else:
@@ -230,10 +238,22 @@ class FreeRGBDObservation:
 
     def information_apply(self, cache: FrameCache, delta_x: torch.Tensor) -> torch.Tensor:
         """H^T R^-1 H u for one frame, all cameras, matrix-free."""
+        if not cache.cameras:
+            return torch.zeros(cache.num_gaussians, STATE_DIM,
+                               dtype=torch.float64, device=delta_x.device)
         return self.vjp(cache, self.precision_apply(cache, self.jvp(cache, delta_x)))
 
     def gradient(self, cache: FrameCache) -> torch.Tensor:
-        """H^T R^-1 r for one frame, all cameras."""
+        """H^T R^-1 r for one frame, all cameras.
+
+        A frame with no observation at all contributes nothing. That is the
+        correct behaviour and not an error: it is exactly how a held-out
+        frame is removed for the late-observation ablation.
+        """
+        if not cache.cameras:
+            return torch.zeros(cache.num_gaussians, STATE_DIM,
+                               dtype=torch.float64,
+                               device=cache.linearization.views[0].rgb.device)
         weighted = []
         for residual, precision in zip(cache.residuals, cache.precisions):
             if residual is None or precision is None:

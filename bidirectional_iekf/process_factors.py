@@ -95,7 +95,8 @@ def process_residual(current: GaussianMotionState, nxt: GaussianMotionState,
     R_p, _ = predicted_rotation(current, dt)
     mu_p = current.mu.double() + current.v.double() * step.unsqueeze(-1)
 
-    residual = torch.zeros(n, ERROR_DIM, dtype=torch.float64)
+    residual = torch.zeros(n, ERROR_DIM, dtype=torch.float64,
+                           device=current.mu.device)
     residual[:, DELTA_SLICE_MU] = nxt.mu.double() - mu_p
     residual[:, DELTA_SLICE_PHI] = so3_log(
         nxt.R.double() @ R_p.transpose(-1, -2))
@@ -117,9 +118,10 @@ def process_residual_jacobians(current: GaussianMotionState,
     e = process_residual(current, nxt, dt)
     e_R = e[:, DELTA_SLICE_PHI]
 
-    A = torch.zeros(n, ERROR_DIM, ERROR_DIM, dtype=torch.float64)
-    B = torch.zeros(n, ERROR_DIM, ERROR_DIM, dtype=torch.float64)
-    eye3 = torch.eye(3, dtype=torch.float64).expand(n, 3, 3)
+    device = current.mu.device
+    A = torch.zeros(n, ERROR_DIM, ERROR_DIM, dtype=torch.float64, device=device)
+    B = torch.zeros(n, ERROR_DIM, ERROR_DIM, dtype=torch.float64, device=device)
+    eye3 = torch.eye(3, dtype=torch.float64, device=device).expand(n, 3, 3)
 
     # Euclidean rows: the residual is linear, so these are exactly -F and I.
     for block in (DELTA_SLICE_MU, DELTA_SLICE_V, DELTA_SLICE_OMEGA):
@@ -148,7 +150,8 @@ def zero_innovation_reduces_to_minus_F(current: GaussianMotionState, dt,
     predicted = process_predict(current, dt)
     A, B = process_residual_jacobians(current, predicted, dt, mode=mode)
     F = error_state_transition(current, dt, mode=mode).double()
-    eye = torch.eye(ERROR_DIM, dtype=torch.float64).expand_as(B)
+    eye = torch.eye(ERROR_DIM, dtype=torch.float64,
+                    device=B.device).expand_as(B)
     dA = float((A + F).abs().max())
     dB = float((B - eye).abs().max())
     return {"max_abs_A_plus_F": dA, "max_abs_B_minus_I": dB,
