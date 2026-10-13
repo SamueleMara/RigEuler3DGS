@@ -171,3 +171,119 @@ rigid stage consumed. Both are historical regression references here.
 * **Memory.** 60 x 45,920 x 12 = 33,062,400 tangent scalars. Nothing dense of
   that size may be allocated; the adapter keeps centers on the CPU in float64
   and never holds more than one frame of CUDA state.
+
+---
+
+# Results of this pass
+
+Written after the work, with the numbers the runs produced.
+
+## 6. The gate matrix, as it now stands
+
+| Gate | Status | Evidence |
+|---|---|---|
+| G1A | PASS, retained | nonzero prior gradient incl SO(3), rel 1.30e-05 |
+| G1B | **corrected** | `tests/test_unified_curvature_and_observability.py` |
+| G2 | **corrected** | same file; image rate blocks are identically zero |
+| T5 | PASS (scoped) | unchanged |
+| T6 synthetic | bounded diagnostic | unchanged |
+| T8 | PASS local; large-displacement stress fails | unchanged |
+| T9 | PASS on nonoverlap | unchanged |
+| T9 source-T | **PASS** | terminal anchor eliminated exactly, both ends at once |
+| T10 | **PASS** | `tests/test_unified_coherence_t10.py`, 42 checks |
+| T11-source-only | **RUNS** | real 60x8 window at 2265 MiB; command below |
+| Washer forward | **present, verified** | not missing; see section 3 |
+| T11-merged | **UNRESOLVED_SCENE_REPRESENTATION** | 86-95% doubly covered pixels |
+| Rigid P2 | not demonstrated | unchanged |
+| Joint P3 | not demonstrated | unchanged |
+| Joint P4 | not demonstrated | unchanged |
+
+Full suite, all passing, every one executed:
+
+    test_unified_source_index                 22
+    test_unified_process_jacobians            32
+    test_unified_full_window_map              18
+    test_unified_cuda_renderer_jvp_vjp        22   real CUDA
+    test_unified_nonlinear_ieks               32   real CUDA
+    test_unified_ieks_convergence             10   real CUDA
+    test_unified_ieks_gradient_components     24   real CUDA
+    test_unified_ieks_observability            8   real CUDA
+    test_unified_direction_invariance         22   real CUDA
+    test_unified_coherence_t10                42   real CUDA, real extractor
+    test_unified_streaming_window             23   real CUDA
+    test_unified_curvature_and_observability  24   real CUDA
+    test_bidirectional_sequence_direction     54
+    test_bidirectional_time_and_source        63
+    test_motion_coherence_support             41
+
+## 7. Memory on the real window, measured
+
+`washer_103776` / final, 24,582 Gaussians, 640x480, RTX 4070 Laptop 8 GiB.
+Peak CUDA at the system build, one outer iteration, two PCG iterations.
+
+| frames x cameras | factors | resident | + stream_frames | + host process factors | + diagonal preconditioner |
+|---|---|---|---|---|---|
+| 4 x 1 | 4 | 878 MiB | | | |
+| 8 x 2 | 16 | 1901 MiB | | | |
+| 16 x 4 | 64 | **OOM** 4147 MiB | 3611 MiB | | |
+| 30 x 8 | 240 | | **OOM** 3950 MiB | 4504 MiB, 22.2 s | |
+| 60 x 8 | 480 | | | **OOM** 4155 MiB | **2265 MiB, 43.6 s** |
+
+The resident path costs about 85 MiB per `(frame, camera)` factor, so the real
+window would need of the order of 41 GiB. The three options are bounded
+streaming, not reduced states: the arithmetic is identical and
+`tests/test_unified_streaming_window.py` checks it against a measured
+float32 reproducibility floor rather than bitwise.
+
+## 8. Commands for the runs that belong to the user
+
+    REPO=/home/samuelemara/Joint3DGS/RigEuler3DGS
+    PY=/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python
+    SRC='/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear/washer_103776'
+    OUT='/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours/washer_103776'
+
+SINGLE_SOURCE on the full real window, source final (hours, not minutes):
+
+    cd $REPO && $PY tools/run_unified_phase1_single_source.py \
+      --endpoint final --frame-start 0 --frames 60 --cameras 8 \
+      --stream-frames --frames-on-cpu --process-factors-on-cpu \
+      --diagonal-preconditioner \
+      --max-outer 8 --pcg-iters 40 \
+      --source "$SRC" --out-root "$OUT"
+
+The same for source initial, which anchors at original frame 0:
+
+    cd $REPO && $PY tools/run_unified_phase1_single_source.py \
+      --endpoint initial --frame-start 0 --frames 60 --cameras 8 \
+      --stream-frames --frames-on-cpu --process-factors-on-cpu \
+      --diagonal-preconditioner \
+      --max-outer 8 --pcg-iters 40 \
+      --source "$SRC" --out-root "$OUT"
+
+A short rung first, if preferred (minutes):
+
+    cd $REPO && $PY tools/run_unified_phase1_single_source.py \
+      --endpoint final --frame-start 52 --frames 8 --cameras 2 \
+      --max-outer 8 --pcg-iters 40 \
+      --source "$SRC" --out-root "$OUT"
+
+The representation gate, already run and recorded under
+`$OUT/unified_phase1_tests/representation_gate/`:
+
+    cd $REPO && $PY tools/run_unified_representation_gate.py \
+      --source "$SRC" --out-root "$OUT" --frames 0 15 30 45 59 \
+      --cameras 4 --save-images
+
+## 9. What is still blocked, and by what
+
+* **T11-merged.** 86-95% of covered pixels receive coverage from both endpoint
+  models. The union is two reconstructions of the same surfaces, so a merged
+  IEKS would count those surfaces twice and nothing in the theory says which
+  copy is physical. Resolving it needs a representation decision that the
+  directive forbids being made silently -- not more compute.
+* **Unified coherence on real data.** T10 runs on accepted states and is
+  validated synthetically. On Washer it needs an accepted two-source
+  trajectory, which the gate blocks. A SINGLE_SOURCE accepted trajectory can
+  be fed to it today, and that is a one-source result, not the unified core.
+* **P2, P3, P4.** Untouched. Each needs its own state space and its own
+  acceptance gate; none is demonstrated and none is claimed.
