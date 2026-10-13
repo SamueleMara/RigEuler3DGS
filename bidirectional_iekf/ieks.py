@@ -403,13 +403,38 @@ class UnifiedFreeIEKS:
             certified = (0.0 <= predicted_full
                          <= max(self.cfg.decrement_tol * objective_scale,
                                 noise_floor))
+            # The certificate has to be VISIBLE. Breaking here used to leave
+            # the last trace row belonging to the previous iteration, so the
+            # numbers a CONVERGED verdict rests on were not in the record.
+            def terminal(verdict):
+                trace.append({
+                    "outer": outer, "accepted": False, "terminal": True,
+                    "status": verdict, "damping": damping,
+                    "grad_norm": grad_norm,
+                    "scaled_projected_gradient": scaled_gradient,
+                    "curvature_quadratic": curvature_quadratic,
+                    "step_norm": step_norm, "directional": directional,
+                    "predicted_full_reduction": predicted_full,
+                    "decrement_ratio": decrement_ratio,
+                    "decrement_threshold": max(
+                        self.cfg.decrement_tol * objective_scale, noise_floor),
+                    "objective_noise": objective_noise,
+                    "certified": certified,
+                    "gradient_decay_ratio": grad_norm / max(initial_grad, 1e-30),
+                    "pcg_iterations": solve_info["iterations"],
+                    "pcg_residual": solve_info["residual"],
+                    "pcg_true_residual": solve_info.get("true_residual"),
+                    "pcg_status": solve_info["status"], **energy})
+
             if step_norm < self.cfg.step_tol and certified:
                 status = CONVERGED
+                terminal(status)
                 break
             if step_norm < self.cfg.step_tol:
                 tiny_steps += 1
                 if tiny_steps >= self.cfg.tiny_step_patience:
                     status = STALLED
+                    terminal(status)
                     break
             else:
                 tiny_steps = 0
@@ -480,6 +505,8 @@ class UnifiedFreeIEKS:
                       "step_norm": step_norm, "directional": directional,
                       "predicted_full_reduction": predicted_full,
                       "decrement_ratio": decrement_ratio,
+                      "decrement_threshold": max(
+                          self.cfg.decrement_tol * objective_scale, noise_floor),
                       "objective_noise": objective_noise,
                       "certified": certified,
                       "gradient_decay_ratio": grad_norm / max(initial_grad, 1e-30),
@@ -507,10 +534,12 @@ class UnifiedFreeIEKS:
             if accepted and trace[-1]["step_norm"] * trials[-1]["scale"] < self.cfg.step_tol:
                 if certified:
                     status = CONVERGED
+                    terminal(status)
                     break
                 tiny_steps += 1
                 if tiny_steps >= self.cfg.tiny_step_patience:
                     status = STALLED
+                    terminal(status)
                     break
             if len(trace) >= 2 and trace[-2].get("accepted"):
                 rel = abs(trace[-2]["E_total"] - energy["E_total"]) / max(
@@ -525,6 +554,7 @@ class UnifiedFreeIEKS:
                     # reporting that as CONVERGED is exactly the misreport the
                     # review warns about.
                     status = CONVERGED if certified else STALLED
+                    terminal(status)
                     break
 
         if status == MAX_ITERS and trace and not any(r["accepted"] for r in trace):

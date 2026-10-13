@@ -86,3 +86,6 @@ tests/**/diagnostics/
 
 # Task specs written for a run, not part of the published code.
 CODEX_*.md
+
+# machine-produced test logs; the ledger json/md are committed, the raw logs are not
+docs/test_ledger_logs/

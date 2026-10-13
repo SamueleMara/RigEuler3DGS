@@ -579,7 +579,15 @@ def extract_moving_component(traj: Tensor, edge_i: Tensor, edge_j: Tensor,
             "candidates": [{k: v for k, v in c.items() if k != "members"}
                            | {"num_members": c["num_nodes"]} for c in pool],
             "candidate_members": {c["candidate_id"]: c["members"] for c in pool},
+            # `recruited` used to be dropped here, which made it impossible
+            # to say whether a member of the core came from the selected
+            # candidate or from section 19's refinement. The node list is now
+            # carried so a report can attribute each one to its stage.
             "refinement": ({k: v for k, v in recruit.items()
-                            if k != "recruited"} if recruit else None),
+                            if k != "recruited"}
+                           | {"recruited_nodes": recruit["recruited"].tolist()}
+                           if recruit else None),
+            "seed_core_nodes": (sorted(chosen["members"])
+                                if sel["status"] == "RESOLVED" else []),
             "num_merge_candidates": len(cands),
             "method": "coherence_single_linkage_heldout_rigid"}
