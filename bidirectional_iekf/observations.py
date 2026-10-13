@@ -108,8 +108,16 @@ class FreeRGBDObservation:
     valid [H,W]) exactly as the dataset loader produces them.
     """
 
+    # Production sensor model, from estimator/sparse_iekf.py::IEKFConfig:
+    # rgb_sigma 0.1, depth_sigma_model "constant" with a = 0.02, b = 0.
+    # The first version of this adapter defaulted to sigma_rgb = 1.0 and let
+    # the depth model fall back to its own a = 0.01, which weights depth
+    # against RGB by a factor of about 400 relative to production and makes
+    # the full-window problem badly scaled -- the optimiser then rejects
+    # nearly every step for reasons that have nothing to do with the method.
     def __init__(self, cameras, observations, *, frame_ids=None,
-                 sigma_rgb: float = 1.0, depth_sigma_model="constant",
+                 sigma_rgb: float = 0.1,
+                 depth_sigma_model=None,
                  robust: bool = False, nu: float = 5.0,
                  use_rgb: bool = True, use_depth: bool = True,
                  eps_depth: float = 1e-6, min_alpha_for_depth: float = 0.05):
@@ -122,7 +130,9 @@ class FreeRGBDObservation:
                 f"{len(self.observations)} frames of observations but "
                 f"{len(self.frame_ids)} frame ids")
         self.sigma_rgb = sigma_rgb
-        self.depth_sigma_model = depth_sigma_model
+        self.depth_sigma_model = (
+            depth_sigma_model if depth_sigma_model is not None
+            else {"kind": "constant", "a": 0.02, "b": 0.0})
         self.robust = bool(robust)
         self.nu = float(nu)
         self.use_rgb = bool(use_rgb)
@@ -236,12 +246,35 @@ class FreeRGBDObservation:
             out.append((p_rgb * d_rgb, p_depth * d_depth))
         return out
 
+    def block_fisher(self, cache: FrameCache) -> torch.Tensor:
+        """Per-Gaussian 6x6 measurement Fisher, summed over cameras -> [N,12,12].
+
+        Reuses the bridge's own build_block_fisher. This is the measurement
+        part of the diagonal that a block preconditioner needs: without it the
+        preconditioner sees only the prior and process blocks, which are
+        around a millionth of the measurement information here, and PCG is
+        left effectively unpreconditioned on a very stiff system.
+        """
+        if not cache.cameras:
+            return torch.zeros(cache.num_gaussians, STATE_DIM, STATE_DIM,
+                               dtype=torch.float64)
+        precisions = [p for p in cache.precisions if p is not None]
+        pose = cache.linearization.build_block_fisher(precisions).double()
+        out = torch.zeros(cache.num_gaussians, STATE_DIM, STATE_DIM,
+                          dtype=torch.float64, device=pose.device)
+        out[:, :POSE_DIM, :POSE_DIM] = pose
+        return out
+
     def information_apply(self, cache: FrameCache, delta_x: torch.Tensor) -> torch.Tensor:
         """H^T R^-1 H u for one frame, all cameras, matrix-free."""
         if not cache.cameras:
             return torch.zeros(cache.num_gaussians, STATE_DIM,
                                dtype=torch.float64, device=delta_x.device)
-        return self.vjp(cache, self.precision_apply(cache, self.jvp(cache, delta_x)))
+        # The renderer kernels are float32; a float64 probe reaches them as a
+        # dtype error rather than a cast.
+        reference = cache.linearization.views[0].rgb
+        tangent = delta_x.to(dtype=reference.dtype, device=reference.device)
+        return self.vjp(cache, self.precision_apply(cache, self.jvp(cache, tangent)))
 
     def gradient(self, cache: FrameCache) -> torch.Tensor:
         """H^T R^-1 r for one frame, all cameras.
@@ -299,3 +332,75 @@ def adjoint_defect(observation: FreeRGBDObservation, cache: FrameCache,
     scale = max(abs(lhs), abs(rhs), 1e-30)
     return {"lhs": lhs, "rhs": rhs, "abs_error": abs(lhs - rhs),
             "rel_error": abs(lhs - rhs) / scale}
+
+
+# ---------------------------------------------------------------------------
+# Observability, as distinct from stationarity (review section A1).
+#
+# A direction with u^T grad F = 0 may sit exactly at a well-observed optimum.
+# What decides whether the IMAGE constrains a direction is the Fisher
+# quadratic form
+#
+#     ||R^{-1/2} H u||^2 = u^T H^T R^-1 H u
+#
+# which is what `information_apply` already computes. Calling a zero-gradient
+# direction "unobservable" conflates the two and would license reporting a
+# converged optimum as an unidentifiable one.
+# ---------------------------------------------------------------------------
+ZERO_INFORMATION = "ZERO_INFORMATION"
+STATIONARY_OBSERVABLE = "STATIONARY_OBSERVABLE"
+WEAKLY_OBSERVABLE = "WEAKLY_OBSERVABLE"
+OBSERVABLE = "OBSERVABLE"
+
+
+def direction_information(observation, cache, u: torch.Tensor) -> float:
+    """||R^{-1/2} H u||^2 for one frame: the image information in u."""
+    return float((u * observation.information_apply(cache, u)).sum())
+
+
+def classify_direction(observation, cache, u: torch.Tensor, gradient_dot: float,
+                       *, zero_tol: float = 1e-9, weak_tol: float = 1e-3,
+                       reference: float | None = None) -> dict:
+    """Separate 'no information' from 'at an optimum'.
+
+    `reference` scales the weak/zero cut; without one the strongest probe in
+    the caller's set should be supplied, because an absolute threshold on a
+    Fisher value means nothing across scenes.
+    """
+    fisher = direction_information(observation, cache, u)
+    scale = reference if reference else max(fisher, 1.0)
+    if fisher <= zero_tol:
+        label = ZERO_INFORMATION
+    elif fisher < weak_tol * scale:
+        label = WEAKLY_OBSERVABLE
+    elif abs(gradient_dot) < 1e-6 * max(abs(scale), 1.0):
+        label = STATIONARY_OBSERVABLE
+    else:
+        label = OBSERVABLE
+    return {"fisher": fisher, "gradient_dot": gradient_dot, "class": label,
+            "note": {
+                ZERO_INFORMATION: "the image constrains nothing in this direction",
+                WEAKLY_OBSERVABLE: "small but nonzero image information",
+                STATIONARY_OBSERVABLE: ("image information is present and the "
+                                        "gradient is near zero -- an optimum, "
+                                        "NOT an unobservable direction"),
+                OBSERVABLE: "informative and away from stationarity",
+            }[label]}
+
+
+def depth_support(observation, cache) -> dict:
+    """How many pixels actually carry depth, per camera and in total.
+
+    Recorded at every objective evaluation so that an 'improvement' obtained
+    by dropping valid depth terms through the alpha > min_alpha_for_depth
+    gate is visible rather than silent.
+    """
+    per_camera, total = [], 0
+    for precision in cache.precisions:
+        if precision is None:
+            per_camera.append(0)
+            continue
+        count = int((precision[1] > 0).sum())
+        per_camera.append(count)
+        total += count
+    return {"per_camera": per_camera, "total": total}

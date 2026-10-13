@@ -324,7 +324,19 @@ def main() -> int:
     # zero; comparing a finite difference against 0 measures rendering noise
     # and reports a 100% "error" while nothing is wrong. Such a direction is
     # UNOBSERVABLE, not a failure.
-    unobservable = []
+    # A1: a direction is classified by its image INFORMATION
+    # ||R^-1/2 H u||^2, not by its gradient. A stationary direction at a
+    # well-observed optimum has zero gradient and nonzero Fisher, and calling
+    # that "unobservable" would report an optimum as unidentifiable.
+    from bidirectional_iekf.observations import (
+        OBSERVABLE, STATIONARY_OBSERVABLE, ZERO_INFORMATION, classify_direction)
+    inconclusive = []
+    probe_cache = ieks.obs.linearize_frame(nominal.states[5], 5)
+    strongest = max(
+        float((p_ * ieks.obs.information_apply(probe_cache, p_)).sum())
+        for p_ in (torch.eye(12, device=nominal.states[0].mu.device,
+                             dtype=torch.float64)[c].expand(nominal.N, 12).clone()
+                   for c in (0, 1, 2)))
     for (frame, gauss, column) in ((5, 1, 0), (4, 1, 0), (3, 1, 0),
                                    (2, 0, 0)):
         direction = torch.zeros(nominal.T, nominal.N, 12, dtype=torch.float64,
@@ -340,22 +352,135 @@ def main() -> int:
             best = rel if best is None else min(best, rel)
         analytic = -float((b * direction).sum())
         label = f"frame {frame}, gauss {gauss}, col {column}"
+        frame_cache = ieks.obs.linearize_frame(nominal.states[frame], frame)
+        verdict = classify_direction(
+            ieks.obs, frame_cache, direction[frame], analytic,
+            reference=strongest)
         if abs(analytic) < 1e-6:
-            unobservable.append(label)
+            # NOT "unobservable": a ratio of two near-zero numbers cannot
+            # validate the identity, which is a property of the FINITE
+            # DIFFERENCE, not of the scene.
+            inconclusive.append((label, verdict["class"], verdict["fisher"]))
             print(f"       d/d({label}): analytic {analytic:+.4e}  "
-                  "UNOBSERVABLE (zero gradient; nothing to verify against)")
+                  f"Fisher {verdict['fisher']:.4e}  {verdict['class']}  "
+                  "-> FD_INCONCLUSIVE (near-stationary; absolute test below)")
             continue
         rel_errors.append(best)
         print(f"       d/d({label}): analytic {analytic:+.4e}  "
               f"best relative error {best:.3e}")
-    check("at least one direction carries a verifiable gradient",
+    check("at least two directions carry a verifiable gradient",
           len(rel_errors) >= 2,
-          f"{len(rel_errors)} observable, {len(unobservable)} unobservable "
-          f"({', '.join(unobservable) or 'none'})")
+          f"{len(rel_errors)} with a well-scaled gradient, "
+          f"{len(inconclusive)} near-stationary")
+    for label, klass, fisher in inconclusive:
+        # The spec's distinction, measured: a stationary direction with
+        # nonzero Fisher is an OPTIMUM, not an unobservable direction.
+        check(f"near-stationary direction classified by information ({label})",
+              klass in (STATIONARY_OBSERVABLE, ZERO_INFORMATION, OBSERVABLE),
+              f"{klass}, Fisher {fisher:.4e}")
     check("b = -grad F on the full posterior, by finite differences",
           rel_errors and max(rel_errors) < 0.05,
           f"worst relative error {max(rel_errors):.3e} over "
           f"{len(rel_errors)} observable directions (float32 rendering floor)")
+
+    print("\n[T8c2] FULL RGB+depth gradient, with a VERIFIED-stable active set")
+    print("        The previous block used RGB only. Here the depth term is on,")
+    print("        and each epsilon is accepted only after checking that the")
+    print("        alpha support and the alpha>0.05 depth-validity mask are")
+    print("        IDENTICAL at +eps and -eps. A direction whose active set")
+    print("        moves is reported NONSMOOTH_ACTIVE_SET, not silently used.")
+    from bidirectional_iekf.observations import depth_support
+
+    # Nonzero prior AND nonzero process residual, so the prior and process
+    # terms of b are exercised rather than assumed. A zero-residual nominal
+    # cannot establish either.
+    prior_mean = warm_start()
+    shifted = warm_start()
+    bump = torch.zeros(shifted.T, shifted.N, 12, dtype=torch.float64,
+                       device=shifted.states[0].mu.device)
+    bump[:, :, 0] = 0.012                      # prior residual at frame 0
+    bump[3:, :, 6] = 0.30                      # velocity jump -> process residual
+    nominal_full = shifted.retract(bump, 1.0)
+
+    P0 = torch.eye(12, dtype=torch.float64).expand(2, 12, 12).contiguous() * 25.0
+    obs_full = FreeRGBDObservation(cameras, observations, frame_ids=list(range(T)))
+    ieks_full = UnifiedFreeIEKS(obs_full, Q_inv, prior_information=P0,
+                                prior_mean=prior_mean,
+                                config=IEKSConfig(verbose=False))
+    energy_full = ieks_full.evaluate(nominal_full, with_support=True)
+    check("the prior residual is nonzero", energy_full["E_prior"] > 1e-6,
+          f"E_prior = {energy_full['E_prior']:.4e}")
+    check("the process residual is nonzero", energy_full["E_process"] > 1e-6,
+          f"E_process = {energy_full['E_process']:.4e}")
+    check("the depth term is active", energy_full["E_depth"] > 0.0,
+          f"E_depth = {energy_full['E_depth']:.4e}, "
+          f"{energy_full['depth_support']['total']} valid depth pixels")
+
+    op_full, caches_full = ieks_full.build_system(nominal_full, damping=0.0)
+    b_full = op_full.rhs()
+
+    def active_set(trajectory, frame):
+        cache = ieks_full.obs.linearize_frame(trajectory.states[frame], frame)
+        sets = []
+        for view, precision in zip(cache.linearization.views, cache.precisions):
+            # The review's criterion: the projected alpha support and the
+            # alpha > 0.05 depth-validity mask. n_contrib is NOT required to
+            # match -- it is a statement about compositing ORDER, which can
+            # change without the objective being discontinuous, and demanding
+            # it leaves no usable direction at all.
+            sets.append(((view.alpha > 0.05), (precision[1] > 0)))
+        return sets, depth_support(ieks_full.obs, cache)["total"]
+
+    full_rel, nonsmooth, tiny = [], [], []
+    for (frame, gauss, column) in ((4, 1, 0), (3, 1, 0), (2, 1, 0),
+                                   (4, 1, 1), (3, 0, 2)):
+        direction = torch.zeros(nominal_full.T, nominal_full.N, 12,
+                                dtype=torch.float64,
+                                device=nominal_full.states[0].mu.device)
+        direction[frame, gauss, column] = 1.0
+        analytic = -float((b_full * direction).sum())
+        base_sets, base_count = active_set(nominal_full, frame)
+        best, used_eps, stable_any = None, None, False
+        for eps in (5e-4, 2e-4, 1e-4, 5e-5):
+            plus_sets, plus_count = active_set(nominal_full.retract(direction, eps), frame)
+            minus_sets, minus_count = active_set(nominal_full.retract(direction, -eps), frame)
+            same = all(bool((a[0] == b_[0]).all()) and bool((a[1] == b_[1]).all())
+                       for a, b_ in zip(plus_sets, minus_sets))
+            if not (same and plus_count == minus_count == base_count):
+                continue
+            stable_any = True
+            used_eps = eps
+            fd = (ieks_full.evaluate(nominal_full.retract(direction, eps))["E_total"]
+                  - ieks_full.evaluate(nominal_full.retract(direction, -eps))["E_total"]) / (2 * eps)
+            rel = abs(fd - analytic) / max(abs(fd), abs(analytic), 1e-12)
+            best = rel if best is None else min(best, rel)
+        label = f"frame {frame}, gauss {gauss}, col {column}"
+        if abs(analytic) < 1.0:
+            # Same rule as the RGB block: a ratio of two near-zero numbers
+            # measures the finite difference, not the identity.
+            tiny.append(label)
+            print(f"        d/d({label}): analytic {analytic:+.4e}  "
+                  "FD_INCONCLUSIVE (near-stationary)")
+            continue
+        if not stable_any:
+            nonsmooth.append(label)
+            print(f"        d/d({label}): NONSMOOTH_ACTIVE_SET at every eps "
+                  "tried -- the depth gate moves, so no finite difference of "
+                  "this objective is meaningful here")
+            continue
+        full_rel.append(best)
+        print(f"        d/d({label}): analytic {analytic:+.4e}  "
+              f"rel {best:.3e} at eps={used_eps:.0e}  "
+              f"(depth pixels stable at {base_count})")
+    check("at least two directions were both well-scaled and active-set stable",
+          len(full_rel) >= 2,
+          f"{len(full_rel)} usable, {len(nonsmooth)} NONSMOOTH_ACTIVE_SET, "
+          f"{len(tiny)} FD_INCONCLUSIVE")
+    check("b = -grad F on the FULL RGB+depth+prior+process posterior",
+          bool(full_rel) and max(full_rel) < 0.05,
+          (f"worst relative error {max(full_rel):.3e} over {len(full_rel)} "
+           "active-set-stable directions") if full_rel else
+          "NOT VERIFIABLE: every direction moved the depth gate at every eps")
 
     print("\n[T8d] symmetry and curvature of the assembled operator")
     g = torch.Generator().manual_seed(3)

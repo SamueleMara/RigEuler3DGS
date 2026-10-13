@@ -46,6 +46,7 @@ import torch
 from estimator.state import GaussianMotionState, boxplus
 
 from .full_window_free import (
+    ERROR_DIM,
     FullWindowFreeOperator,
     ProcessFactor,
     block_jacobi_preconditioner,
@@ -54,6 +55,7 @@ from .full_window_free import (
 from .process_factors import process_residual, process_residual_jacobians
 
 CONVERGED = "CONVERGED"
+STALLED = "STALLED"
 MAX_ITERS = "MAX_ITERS"
 LINE_SEARCH_FAILED = "LINE_SEARCH_FAILED"
 PCG_FAILED = "PCG_FAILED"
@@ -71,13 +73,29 @@ class IEKSConfig:
     backtracking: tuple = (1.0, 0.5, 0.25, 0.1, 0.03)
     armijo_c: float = 1e-4
     grad_tol: float = 1e-8
-    step_tol: float = 1e-10
+    # ||b|| relative to the objective value. A stall with a large gradient is
+    # STALLED; only genuine stationarity is CONVERGED.
+    grad_rel_tol: float = 1e-3
+    # A stationary STATE is convergence only if the gradient has also come
+    # down from where it started. A tiny step with an undiminished gradient
+    # is a stall: the measured contrast is |g|/|g_0| ~ 1e-7 on a fixture that
+    # reached the optimum against ~1.0 on one that moved 0.57% and stopped.
+    grad_decay_tol: float = 1e-3
+    # STATE stationarity. The gradient cannot be the sole criterion here:
+    # it floors at the float32 rendering noise (measured ~4e-2 on a fixture
+    # whose objective had already reached 6e-8), while the step norm falls to
+    # ~2e-7 and the state has genuinely stopped moving. Requiring |g| -> 0
+    # would report a converged estimate as MAX_ITERS forever.
+    step_tol: float = 1e-5
     rel_objective_tol: float = 1e-10
     # Section 3.1: which policy anchors the source pose. 'fixed_conditional'
     # eliminates those tangent columns exactly; it never fakes a huge prior
     # precision to imitate a constraint.
     source_pose_policy: str = "optimizable_reference"
     anchor_frames: tuple = ()
+    # Tangent columns held at zero. A DIAGNOSTIC ablation, not a model: used
+    # to isolate whether a stall comes from the weakly observed rate blocks.
+    frozen_columns: tuple = ()
     verbose: bool = True
 
 
@@ -155,10 +173,32 @@ class UnifiedFreeIEKS:
         from estimator.state import boxminus
         return boxminus(trajectory.states[0], self.prior_mean.states[0]).double()
 
-    def evaluate(self, trajectory: Trajectory) -> dict:
-        """The TRUE nonlinear posterior. Rerenders every frame."""
+    def evaluate(self, trajectory: Trajectory, *, with_support: bool = False) -> dict:
+        """The TRUE nonlinear posterior. Rerenders every frame.
+
+        `with_support` also returns the number of pixels that actually carry
+        depth. The alpha > min_alpha_for_depth gate means the objective can
+        fall simply because fewer depth terms are valid, so the count is
+        recorded alongside the energy and an 'improvement' of that kind is
+        visible rather than silent.
+        """
+        from .observations import depth_support
+
         rgb = depth = 0.0
+        support = {"total": 0, "per_frame": []}
         for t in range(trajectory.T):
+            if with_support:
+                cache = self.obs.linearize_frame(trajectory.states[t], t)
+                counts = depth_support(self.obs, cache)
+                support["total"] += counts["total"]
+                support["per_frame"].append(counts["total"])
+                for residual, precision in zip(cache.residuals, cache.precisions):
+                    if residual is None:
+                        continue
+                    from estimator.measurement import measurement_energy
+                    rgb += float(measurement_energy(residual[0], precision[0]))
+                    depth += float(measurement_energy(residual[1], precision[1]))
+                continue
             cost = self.obs.nonlinear_cost(trajectory.states[t], t)
             rgb += cost["rgb"]
             depth += cost["depth"]
@@ -177,8 +217,11 @@ class UnifiedFreeIEKS:
             prior = 0.5 * float(torch.einsum("ni,nij,nj->", e0, P0, e0))
 
         total = rgb + depth + process + prior
-        return {"E_rgb": rgb, "E_depth": depth, "E_process": process,
-                "E_prior": prior, "E_total": total}
+        out = {"E_rgb": rgb, "E_depth": depth, "E_process": process,
+               "E_prior": prior, "E_total": total}
+        if with_support:
+            out["depth_support"] = support
+        return out
 
     # -- linearisation -----------------------------------------------------
     def build_system(self, trajectory: Trajectory, damping: float):
@@ -212,6 +255,7 @@ class UnifiedFreeIEKS:
         expected_factors = inventory["num_factors"]
         trace = []
         damping = self.cfg.damping
+        initial_grad = None
         current = trajectory
         energy = self.evaluate(current)
         status = MAX_ITERS
@@ -235,7 +279,8 @@ class UnifiedFreeIEKS:
                 break
 
             step, solve_info = pcg(
-                operator, b, preconditioner=block_jacobi_preconditioner(operator),
+                operator, b,
+                preconditioner=block_jacobi_preconditioner(operator, damping=damping),
                 max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol)
             if solve_info["status"] == "NON_POSITIVE_CURVATURE":
                 damping *= self.cfg.damping_up
@@ -250,22 +295,41 @@ class UnifiedFreeIEKS:
             # Armijo needs g^T d < 0 with g = -b the true gradient.
             directional = -float((b * step).sum())
             step_norm = float(step.norm())
+            if initial_grad is None:
+                initial_grad = grad_norm
+            decayed = grad_norm <= self.cfg.grad_decay_tol * max(initial_grad, 1e-30)
             if step_norm < self.cfg.step_tol:
-                status = CONVERGED
+                status = CONVERGED if decayed else STALLED
                 break
+
 
             accepted = False
             trials = []
             for scale in self.cfg.backtracking:
                 candidate = current.retract(step, scale)
-                trial_energy = self.evaluate(candidate)
+                trial_energy = self.evaluate(candidate, with_support=True)
                 threshold = (energy["E_total"]
                              + self.cfg.armijo_c * scale * directional)
                 ok = (math.isfinite(trial_energy["E_total"])
                       and trial_energy["E_total"] <= threshold)
-                trials.append({"scale": scale,
-                               "E_total": trial_energy["E_total"],
-                               "threshold": threshold, "accepted": bool(ok)})
+                # Predicted reduction from the local quadratic model, against
+                # the measured one. A large mismatch says the model is bad
+                # there, which is what LM damping is for -- it is reported,
+                # not absorbed.
+                predicted = -self.cfg.armijo_c * scale * directional
+                trials.append({
+                    "scale": scale, "threshold": threshold,
+                    "accepted": bool(ok),
+                    "E_total": trial_energy["E_total"],
+                    "E_rgb": trial_energy["E_rgb"],
+                    "E_depth": trial_energy["E_depth"],
+                    "E_process": trial_energy["E_process"],
+                    "E_prior": trial_energy["E_prior"],
+                    "depth_support_total": trial_energy.get(
+                        "depth_support", {}).get("total"),
+                    "predicted_reduction": predicted,
+                    "actual_reduction": energy["E_total"] - trial_energy["E_total"],
+                    "finite": bool(math.isfinite(trial_energy["E_total"]))})
                 if ok:
                     # On acceptance only: the nominal moves and the next outer
                     # iteration relinearises here.
@@ -305,14 +369,29 @@ class UnifiedFreeIEKS:
                     break
                 continue
 
+            if accepted and trace[-1]["step_norm"] * trials[-1]["scale"] < self.cfg.step_tol:
+                status = CONVERGED if decayed else STALLED
+                break
             if len(trace) >= 2 and trace[-2].get("accepted"):
                 rel = abs(trace[-2]["E_total"] - energy["E_total"]) / max(
                     abs(trace[-2]["E_total"]), 1e-30)
                 if rel < self.cfg.rel_objective_tol:
-                    status = CONVERGED
+                    # A flat objective is NOT convergence on its own. If the
+                    # gradient is still large the optimiser has stalled, and
+                    # reporting that as CONVERGED is exactly the misreport the
+                    # review warns about.
+                    scaled_grad = grad_norm / max(abs(energy["E_total"]), 1.0)
+                    status = (CONVERGED if (decayed or scaled_grad < self.cfg.grad_rel_tol)
+                              else STALLED)
                     break
 
+        if status == MAX_ITERS and trace and not any(r["accepted"] for r in trace):
+            # A loop of rejected steps is not a budget exhaustion; saying
+            # MAX_ITERS there would describe a stalled solver as one that
+            # simply ran out of iterations.
+            status = LINE_SEARCH_FAILED
         return {"status": status, "energy": energy, "trace": trace,
+                "converged": status == CONVERGED,
                 "trajectory": current, "factor_inventory": inventory,
                 "wall_time_s": time.time() - started,
                 "covariance_contract": {
@@ -330,7 +409,7 @@ class _CudaWindowOperator(FullWindowFreeOperator):
 
     def __init__(self, *, num_frames, num_gaussians, process_factors,
                  observation, caches, prior_information, prior_residual,
-                 damping, frozen_frames=()):
+                 damping, frozen_frames=(), frozen_columns=()):
         super().__init__(num_frames=num_frames, num_gaussians=num_gaussians,
                          process_factors=process_factors,
                          measurement_factors=[],
@@ -339,6 +418,8 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         self.obs = observation
         self.caches = caches
         self.frozen = tuple(frozen_frames)
+        self.frozen_columns = tuple(frozen_columns)
+        self._curvature = None
 
     def _freeze(self, u: torch.Tensor) -> torch.Tensor:
         """Exact elimination of a conditionally fixed source-time pose.
@@ -347,18 +428,56 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         is a soft constraint that leaks, and its magnitude would show up in
         every reported uncertainty.
         """
-        if not self.frozen:
+        if not self.frozen and not self.frozen_columns:
             return u
         out = u.clone()
         for t in self.frozen:
             out[t, :, 0:6] = 0.0
+        for c in self.frozen_columns:
+            out[:, :, c] = 0.0
         return out
+
+    def measurement_block_diagonal(self) -> torch.Tensor:
+        """Per-frame, per-Gaussian measurement Fisher, for preconditioning."""
+        blocks = torch.zeros(self.T, self.N, ERROR_DIM, ERROR_DIM,
+                             dtype=torch.float64,
+                             device=self.process[0].A.device if self.process else "cpu")
+        for t, cache in enumerate(self.caches):
+            blocks[t] = self.obs.block_fisher(cache).to(blocks.device)
+        return blocks
+
+    def curvature_scale(self) -> torch.Tensor:
+        """diag(A) per tangent coordinate, for Levenberg-Marquardt damping.
+
+        Uniform lambda*I cannot work here. The image carries NO velocity
+        Jacobian, so the velocity directions get their curvature only from the
+        process term and sit around seven orders of magnitude below the pose
+        directions. A lambda small enough to leave the pose block alone does
+        nothing to the velocity block, the solve takes a step of norm ~40
+        where the solution is 0.2 away, the velocity part explodes the process
+        energy and every trial is rejected. Scaling by diag(A) damps each
+        direction relative to its own curvature, which is what LM is for.
+        """
+        if self._curvature is None:
+            diag = self.measurement_block_diagonal().diagonal(dim1=-2, dim2=-1).clone()
+            for factor in self.process:
+                t = factor.frame
+                AtQA = torch.einsum("nji,njk,nkl->nil", factor.A, factor.Q_inv, factor.A)
+                BtQB = torch.einsum("nji,njk,nkl->nil", factor.B, factor.Q_inv, factor.B)
+                diag[t] += AtQA.diagonal(dim1=-2, dim2=-1)
+                diag[t + 1] += BtQB.diagonal(dim1=-2, dim2=-1)
+            if self.prior_information is not None:
+                diag[0] += self.prior_information.double().to(diag.device).diagonal(
+                    dim1=-2, dim2=-1)
+            self._curvature = diag.abs().clamp_min(1e-12)
+        return self._curvature
 
     def information_matvec(self, u: torch.Tensor) -> torch.Tensor:
         u = self._freeze(self._check(u))
         out = torch.zeros_like(u)
         if self.prior_information is not None:
-            out[0] += torch.einsum("nij,nj->ni", self.prior_information.double(), u[0])
+            out[0] += torch.einsum(
+                "nij,nj->ni", self.prior_information.double().to(u.device), u[0])
         for t, cache in enumerate(self.caches):
             contribution = self.obs.information_apply(cache, u[t].to(cache.linearization.views[0].rgb.dtype))
             out[t] += contribution.double()
@@ -370,14 +489,15 @@ class _CudaWindowOperator(FullWindowFreeOperator):
             out[t] += torch.einsum("nji,nj->ni", factor.A, QKu)
             out[t + 1] += torch.einsum("nji,nj->ni", factor.B, QKu)
         if self.damping:
-            out += self.damping * u
+            out += self.damping * self.curvature_scale() * u
         return self._freeze(out)
 
     def rhs(self) -> torch.Tensor:
         b = self.zeros()
         if self.prior_information is not None and self.prior_residual is not None:
-            b[0] -= torch.einsum("nij,nj->ni", self.prior_information.double(),
-                                 self.prior_residual.double())
+            P0 = self.prior_information.double().to(b.device)
+            b[0] -= torch.einsum("nij,nj->ni", P0,
+                                 self.prior_residual.double().to(b.device))
         for t, cache in enumerate(self.caches):
             b[t] += self.obs.gradient(cache).double()
         for factor in self.process:

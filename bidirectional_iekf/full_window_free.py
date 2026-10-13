@@ -268,7 +268,7 @@ def schur_forward_backward(diag, upper, rhs_blocks):
     return x
 
 
-def block_jacobi_preconditioner(operator: FullWindowFreeOperator):
+def block_jacobi_preconditioner(operator: FullWindowFreeOperator, damping=None):
     """Per-frame, per-Gaussian inverse of the diagonal blocks.
 
     A PRECONDITIONER. It discards the temporal off-diagonals and the
@@ -284,12 +284,34 @@ def block_jacobi_preconditioner(operator: FullWindowFreeOperator):
     for t in range(operator.T):
         blocks[t] = eye
     if operator.prior_information is not None:
-        blocks[0] += operator.prior_information
+        blocks[0] += operator.prior_information.to(blocks)
+    # The MEASUREMENT diagonal, when the operator can supply it. Omitting it
+    # leaves the preconditioner at roughly the identity while the true
+    # operator carries image information many orders of magnitude larger,
+    # which is indistinguishable from running PCG unpreconditioned on a very
+    # stiff system.
+    if hasattr(operator, "measurement_block_diagonal"):
+        blocks += operator.measurement_block_diagonal().to(blocks)
+    # Mirror the operator's damping, including its diag(A) scaling, or the
+    # preconditioner approximates a different matrix than the one being solved.
+    lam = operator.damping if damping is None else damping
+    if lam and hasattr(operator, "curvature_scale"):
+        scale = operator.curvature_scale().to(blocks.device)
+        blocks = blocks + lam * torch.diag_embed(scale)
+    elif lam:
+        blocks = blocks + lam * torch.eye(size, dtype=torch.float64,
+                                          device=blocks.device)
     for factor in operator.process:
         t = factor.frame
         blocks[t] += torch.einsum("nji,njk,nkl->nil", factor.A, factor.Q_inv, factor.A)
         blocks[t + 1] += torch.einsum("nji,njk,nkl->nil", factor.B, factor.Q_inv, factor.B)
-    inverse = torch.linalg.inv(blocks)
+    # A Gaussian unobserved at a frame contributes nothing, so its block can
+    # be singular; ridge it rather than inverting a singular matrix.
+    ridge = 1e-9 * blocks.diagonal(dim1=-2, dim2=-1).abs().amax(
+        dim=-1, keepdim=True).clamp_min(1.0).unsqueeze(-1)
+    inverse = torch.linalg.inv(
+        blocks + ridge * torch.eye(size, dtype=torch.float64,
+                                   device=blocks.device))
 
     def apply(u):
         return torch.einsum("tnij,tnj->tni", inverse, u)
