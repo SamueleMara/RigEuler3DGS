@@ -115,6 +115,17 @@ class IEKSConfig:
     # precision to imitate a constraint.
     source_pose_policy: str = "optimizable_reference"
     anchor_frames: tuple = ()
+    # Per-GROUP anchors: ((window_frame_index, candidate_indices), ...). The
+    # two-source union needs the initial group's pose fixed at original frame
+    # 0 and the final group's at frame 59 -- and NOT the other way round.
+    # `anchor_frames` freezes a frame for every candidate, which in a union
+    # would clamp the opposite source at a time it was never reconstructed
+    # at. Only the 6 pose columns are eliminated; rates stay free.
+    anchor_groups: tuple = ()
+    # Called with (outer, trajectory, energy) after every ACCEPTED step, so a
+    # caller can keep the best accepted iterate on disk. The objective is
+    # monotone over accepted steps, so the latest one is the best.
+    on_accept: object = None
     # Tangent columns held at zero. A DIAGNOSTIC ablation, not a model: used
     # to isolate whether a stall comes from the weakly observed rate blocks.
     frozen_columns: tuple = ()
@@ -306,6 +317,9 @@ class UnifiedFreeIEKS:
             frozen_frames=(tuple(self.cfg.anchor_frames)
                            if self.cfg.source_pose_policy == "fixed_conditional"
                            else ()),
+            frozen_groups=(tuple(self.cfg.anchor_groups)
+                           if self.cfg.source_pose_policy == "fixed_conditional"
+                           else ()),
             work_device=trajectory.states[0].mu.device)
         return operator, caches
 
@@ -351,9 +365,14 @@ class UnifiedFreeIEKS:
 
             step, solve_info = pcg(
                 operator, b,
-                preconditioner=block_jacobi_preconditioner(
+                # The preconditioner's 12x12 blocks mix pose and rate, so a
+                # residual that is zero on an eliminated pose coordinate can
+                # come back nonzero there, and CG would then move an anchor
+                # it was told is fixed. Eliminating its output too keeps
+                # every CG vector inside the constrained subspace.
+                preconditioner=_eliminated(operator, block_jacobi_preconditioner(
                     operator, damping=damping,
-                    diagonal_only=self.cfg.diagonal_preconditioner),
+                    diagonal_only=self.cfg.diagonal_preconditioner)),
                 max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol,
                 true_residual=self.cfg.pcg_true_residual)
             if solve_info["status"] == "NON_POSITIVE_CURVATURE":
@@ -487,6 +506,8 @@ class UnifiedFreeIEKS:
                     current = candidate
                     energy = trial_energy
                     accepted = True
+                    if self.cfg.on_accept is not None:
+                        self.cfg.on_accept(outer, current, energy)
                     damping = max(damping * self.cfg.damping_down, 1e-12)
                     break
 
@@ -577,6 +598,16 @@ class UnifiedFreeIEKS:
                 }}
 
 
+def _eliminated(operator, preconditioner):
+    if preconditioner is None:
+        return None
+
+    def apply(r):
+        return operator._freeze(preconditioner(r))
+
+    return apply
+
+
 class _StreamedCaches:
     """One frame's linearisation resident at a time, rebuilt on demand.
 
@@ -623,7 +654,7 @@ class _CudaWindowOperator(FullWindowFreeOperator):
 
     def __init__(self, *, num_frames, num_gaussians, process_factors,
                  observation, caches, prior_information, prior_residual,
-                 damping, frozen_frames=(), frozen_columns=(),
+                 damping, frozen_frames=(), frozen_columns=(), frozen_groups=(),
                  work_device=None):
         super().__init__(num_frames=num_frames, num_gaussians=num_gaussians,
                          process_factors=process_factors,
@@ -634,6 +665,9 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         self.obs = observation
         self.caches = caches
         self.frozen = tuple(frozen_frames)
+        self.frozen_groups = tuple(
+            (int(t), torch.as_tensor(idx, dtype=torch.long).reshape(-1))
+            for t, idx in frozen_groups)
         self.frozen_columns = tuple(frozen_columns)
         self._curvature = None
         self._measurement_blocks = None
@@ -646,11 +680,13 @@ class _CudaWindowOperator(FullWindowFreeOperator):
         is a soft constraint that leaks, and its magnitude would show up in
         every reported uncertainty.
         """
-        if not self.frozen and not self.frozen_columns:
+        if not self.frozen and not self.frozen_columns and not self.frozen_groups:
             return u
         out = u.clone()
         for t in self.frozen:
             out[t, :, 0:6] = 0.0
+        for t, idx in self.frozen_groups:
+            out[t, idx.to(out.device), 0:6] = 0.0
         for c in self.frozen_columns:
             out[:, :, c] = 0.0
         return out
