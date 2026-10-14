@@ -320,6 +320,7 @@ def scene_plan(info: dict, profile: str, tag: str, args) -> dict:
     for rel in ("bidirectional_iekf/ieks.py", "bidirectional_iekf/observations.py",
                 "bidirectional_iekf/full_window_free.py",
                 "bidirectional_iekf/process_factors.py",
+                "bidirectional_iekf/accelerated.py",
                 "tools/run_unified_phase1_real_bidirectional.py"):
         code.update((REPO / rel).read_bytes())
     fingerprint_payload = {
@@ -328,6 +329,7 @@ def scene_plan(info: dict, profile: str, tag: str, args) -> dict:
         "initial_full_state": args.initial_full_state,
         "final_full_state": args.final_full_state,
         "mode": "raw_union_experiment", "likelihood": "GAUSSIAN_RGBD",
+        "linear_backend": args.linear_backend, "preconditioner": args.preconditioner,
         "code_sha256": code.hexdigest()}
     fingerprint = hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True,
                                             default=str).encode()).hexdigest()
@@ -422,6 +424,10 @@ def run_scene(args) -> int:
     exp = Path(plan["experiment_dir"])
     if args.time_budget_min is not None:
         plan["settings"] = dict(plan["settings"], time_budget_min=args.time_budget_min)
+    if args.pcg_tol is not None:
+        plan["settings"] = dict(plan["settings"], pcg_tol=args.pcg_tol)
+    if args.pcg_iters is not None:
+        plan["settings"] = dict(plan["settings"], pcg_iters=args.pcg_iters)
 
     import torch
     cuda = bool(torch.cuda.is_available())
@@ -445,6 +451,9 @@ def run_scene(args) -> int:
         "source_sha256": info["sha256"],
         "num_frames": plan["num_frames"], "camera_ids": plan["camera_ids"],
         "camera_policy": plan["camera_policy"],
+        "linear_backend": args.linear_backend,
+        "preconditioner": args.preconditioner or "diagonal (legacy default)",
+        "pcg": {"tol": plan["settings"]["pcg_tol"], "max_iters": plan["settings"]["pcg_iters"]},
         "gaussians": {"initial": info["forward_gaussians"],
                       "final": info["backward_gaussians"],
                       "union": info["forward_gaussians"] + info["backward_gaussians"]},
@@ -499,7 +508,11 @@ def run_scene(args) -> int:
             "--camera-ids", ",".join(plan["camera_ids"]),
             "--max-outer", str(s["max_outer"]), "--pcg-iters", str(s["pcg_iters"]),
             "--pcg-tol", str(s["pcg_tol"]), "--damping", str(s["damping"]),
-            "--stop-file", str(stop_file), "--no-visuals"] + STREAM
+            "--stop-file", str(stop_file), "--no-visuals",
+            "--linear-backend", args.linear_backend,
+            "--transfer-policy", args.transfer_policy,
+            "--cache-host-budget-gib", str(args.cache_host_budget_gib)] + STREAM + (
+            ["--preconditioner", args.preconditioner] if args.preconditioner else [])
         if s["time_budget_min"]:
             cmd += ["--time-budget-min", str(s["time_budget_min"])]
         if prev_best is not None:
@@ -673,8 +686,10 @@ def run_overnight(args) -> int:
     if args.dry_run:
         for q in queue:
             cmd = base + ["--scene", q["scene"], "--reuse-existing-phase1",
-                          "--profile", args.profile, "--tag", args.tag] + (
-                ["--resume"] if args.resume else [])
+                          "--profile", args.profile, "--tag", args.tag,
+                          "--linear-backend", args.linear_backend] + (
+                ["--resume"] if args.resume else []) + (
+                ["--preconditioner", args.preconditioner] if args.preconditioner else [])
             print(f"  [{q['order']}/{len(queue)}] " + " ".join(cmd))
         print(f"\n  summary -> {run_dir / 'ALL_SCENES_SUMMARY.md'}")
         print(f"  stop     -> touch '{run_dir / 'STOP'}'")
@@ -701,8 +716,14 @@ def run_overnight(args) -> int:
                       "pass --resume")
                 continue
             cmd = base + ["--scene", q["scene"], "--reuse-existing-phase1",
-                          "--profile", args.profile, "--tag", args.tag] + (
-                ["--resume"] if args.resume else [])
+                          "--profile", args.profile, "--tag", args.tag,
+                          "--linear-backend", args.linear_backend,
+                          "--transfer-policy", args.transfer_policy,
+                          "--cache-host-budget-gib", str(args.cache_host_budget_gib)] + (
+                ["--pcg-tol", str(args.pcg_tol)] if args.pcg_tol is not None else []) + (
+                ["--pcg-iters", str(args.pcg_iters)] if args.pcg_iters is not None else []) + (
+                ["--resume"] if args.resume else []) + (
+                ["--preconditioner", args.preconditioner] if args.preconditioner else [])
             if args.scene_time_budget_min is not None:
                 cmd += ["--time-budget-min", str(args.scene_time_budget_min)]
             log = run_dir / "logs" / f"{q['scene']}.log"
@@ -807,6 +828,20 @@ def main() -> int:
     sc.add_argument("--reuse-existing-phase1", action="store_true")
     sc.add_argument("--profile", choices=sorted(PROFILES), default="washer-validation")
     sc.add_argument("--time-budget-min", type=float, default=None)
+    sc.add_argument("--linear-backend", default="legacy_reference",
+                    choices=("legacy_reference", "exact_cached_structured"))
+    sc.add_argument("--preconditioner", default=None,
+                    choices=("diagonal", "block12", "temporal_block_tridiagonal"))
+    sc.add_argument("--transfer-policy", default="synchronous",
+                    choices=("synchronous", "double_buffered"))
+    sc.add_argument("--cache-host-budget-gib", type=float, default=24.0)
+    sc.add_argument("--pcg-tol", type=float, default=None,
+                    help="declared relative PCG residual at which a step's linear "
+                         "solve stops (the true residual is always checked and "
+                         "recorded). Default: the profile's 1e-6, i.e. the "
+                         "iteration cap decides")
+    sc.add_argument("--pcg-iters", type=int, default=None,
+                    help="iteration cap per step; default the profile's")
     sc.add_argument("--initial-full-state", default=None)
     sc.add_argument("--final-full-state", default=None)
 
@@ -817,6 +852,20 @@ def main() -> int:
     ov.add_argument("--profile", choices=sorted(PROFILES), default="overnight")
     ov.add_argument("--list-scenes", action="store_true")
     ov.add_argument("--scene-time-budget-min", type=float, default=None)
+    ov.add_argument("--linear-backend", default="legacy_reference",
+                    choices=("legacy_reference", "exact_cached_structured"))
+    ov.add_argument("--preconditioner", default=None,
+                    choices=("diagonal", "block12", "temporal_block_tridiagonal"))
+    ov.add_argument("--transfer-policy", default="synchronous",
+                    choices=("synchronous", "double_buffered"))
+    ov.add_argument("--cache-host-budget-gib", type=float, default=24.0)
+    ov.add_argument("--pcg-tol", type=float, default=None,
+                    help="declared relative PCG residual at which a step's linear "
+                         "solve stops (the true residual is always checked and "
+                         "recorded). Default: the profile's 1e-6, i.e. the "
+                         "iteration cap decides")
+    ov.add_argument("--pcg-iters", type=int, default=None,
+                    help="iteration cap per step; default the profile's")
 
     args = ap.parse_args()
     if args.cmd == "scene":

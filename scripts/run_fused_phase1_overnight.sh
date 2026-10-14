@@ -20,6 +20,8 @@
 #   --resume                  continue matching experiments; without it a scene
 #                             whose experiment already exists is skipped
 #   --scene-time-budget-min M override the profile's per-scene budget
+#   --linear-backend B, --preconditioner P, --transfer-policy T,
+#   --cache-host-budget-gib G  passed to every scene (see run_fused_phase1.sh)
 #   --list-scenes             print eligible / skipped scenes and exit
 #   --preflight               write eligible_scenes.json and exit; no GPU work
 #   --dry-run                 print the serial queue of commands; no GPU work

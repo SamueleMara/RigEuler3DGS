@@ -170,6 +170,20 @@ class IEKSConfig:
     # PCG holds about eight, which is what an 8 GiB card shared with other
     # jobs cannot spare. The arithmetic is unchanged (float64 either way).
     solve_on_cpu: bool = False
+    # ---- exact acceleration (bidirectional_iekf/accelerated.py) ----------
+    # legacy_reference: the validated operator, kept as the oracle.
+    # exact_cached_structured: the SAME A, b, D from linearisations frozen
+    # once per accepted state in host RAM, a structured GPU process stencil,
+    # and A*delta reused from the true-residual check.
+    linear_backend: str = "legacy_reference"
+    transfer_policy: str = "synchronous"          # | double_buffered
+    # None keeps the legacy choice (diagonal_preconditioner flag); otherwise
+    # diagonal | block12 | temporal_block_tridiagonal (cached backend only).
+    preconditioner: object = None
+    pinned_budget_mib: int = 1024
+    gpu_workspace_budget_mib: int = 1024
+    preconditioner_chunk: int = 2048
+    cache_host_budget_gib: object = None
     verbose: bool = True
 
 
@@ -299,6 +313,10 @@ class UnifiedFreeIEKS:
 
     # -- linearisation -----------------------------------------------------
     def build_system(self, trajectory: Trajectory, damping: float):
+        if self.cfg.linear_backend == "exact_cached_structured":
+            return self._build_cached(trajectory, damping)
+        if self.cfg.linear_backend != "legacy_reference":
+            raise ValueError(f"unknown linear_backend {self.cfg.linear_backend!r}")
         caches = (_StreamedCaches(self.obs, trajectory.states)
                   if self.cfg.stream_frames
                   else [self.obs.linearize_frame(trajectory.states[t], t)
@@ -334,6 +352,69 @@ class UnifiedFreeIEKS:
             work_device=(torch.device("cpu") if self.cfg.solve_on_cpu
                          else trajectory.states[0].mu.device))
         return operator, caches
+
+    def _build_cached(self, trajectory: Trajectory, damping: float):
+        """The exact operator from frozen data; rebuilt only for a NEW state.
+
+        A rejected trial leaves `current` unchanged and only raises lambda,
+        so the frozen linearisation of that state is reused: lambda changes
+        the operator's damping term and the preconditioner, never H or J.
+        """
+        from bidirectional_iekf.accelerated import (CachedStructuredOperator,
+                                                    FrozenFrameStore,
+                                                    StructuredProcess)
+        frozen = getattr(self, "_frozen", None)
+        if frozen is None or frozen["trajectory"] is not trajectory:
+            # release the previous state's store BEFORE building the next one;
+            # holding both would double the host cache
+            frozen = None
+            self._frozen = None
+            import gc
+            gc.collect()
+            device = trajectory.states[0].mu.device
+            kind = self.cfg.preconditioner or (
+                "diagonal" if self.cfg.diagonal_preconditioner else "block12")
+            store = FrozenFrameStore(
+                self.obs, trajectory, state_token=id(trajectory),
+                transfer_policy=self.cfg.transfer_policy,
+                pinned_budget_mib=self.cfg.pinned_budget_mib,
+                keep_pose_fisher=kind != "diagonal",
+                host_budget_gib=self.cfg.cache_host_budget_gib,
+                verbose=self.cfg.verbose)
+            proc = StructuredProcess(trajectory, self.Q_inv, device=device,
+                                     gpu_budget_mib=self.cfg.gpu_workspace_budget_mib)
+            frozen = {"trajectory": trajectory, "store": store, "proc": proc,
+                      "builds": getattr(self, "_frozen_builds", 0) + 1}
+            self._frozen = frozen
+            self._frozen_builds = frozen["builds"]
+        operator = CachedStructuredOperator(
+            store=frozen["store"], process=frozen["proc"], observation=self.obs,
+            damping=damping,
+            frozen_frames=(tuple(self.cfg.anchor_frames)
+                           if self.cfg.source_pose_policy == "fixed_conditional" else ()),
+            frozen_groups=(tuple(self.cfg.anchor_groups)
+                           if self.cfg.source_pose_policy == "fixed_conditional" else ()),
+            prior_information=self.prior_information,
+            prior_residual=(self.prior_residual(trajectory)
+                            if self.prior_information is not None else None),
+            work_device=("cpu" if self.cfg.solve_on_cpu
+                         else trajectory.states[0].mu.device))
+        return operator, None
+
+    def _preconditioner(self, operator, damping):
+        if hasattr(operator, "make_preconditioner"):
+            kind = self.cfg.preconditioner or (
+                "diagonal" if self.cfg.diagonal_preconditioner else "block12")
+            return _eliminated(operator, operator.make_preconditioner(
+                kind, damping, chunk=self.cfg.preconditioner_chunk,
+                verbose=self.cfg.verbose))
+        if self.cfg.preconditioner not in (None, "diagonal", "block12"):
+            raise ValueError(f"preconditioner {self.cfg.preconditioner!r} needs "
+                             "linear_backend='exact_cached_structured'")
+        diagonal = (self.cfg.preconditioner == "diagonal" if self.cfg.preconditioner
+                    else self.cfg.diagonal_preconditioner)
+        return _eliminated(operator, block_jacobi_preconditioner(
+            operator, damping=damping, diagonal_only=diagonal))
 
     # -- the outer loop ----------------------------------------------------
     def run(self, trajectory: Trajectory) -> dict:
@@ -387,9 +468,7 @@ class UnifiedFreeIEKS:
                 # come back nonzero there, and CG would then move an anchor
                 # it was told is fixed. Eliminating its output too keeps
                 # every CG vector inside the constrained subspace.
-                preconditioner=_eliminated(operator, block_jacobi_preconditioner(
-                    operator, damping=damping,
-                    diagonal_only=self.cfg.diagonal_preconditioner)),
+                preconditioner=self._preconditioner(operator, damping),
                 max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol,
                 true_residual=self.cfg.pcg_true_residual,
                 progress=(_pcg_progress(outer, self.cfg.pcg_max_iters, started)
@@ -408,7 +487,12 @@ class UnifiedFreeIEKS:
             directional = -float((b * step).sum())
             # d' A0 d with the damping removed: A_damped = A0 + lambda*D, so
             # A0 d = A_damped d - lambda * D d exactly.
-            Ad = operator.information_matvec(step)
+            # The true-residual check already applied the damped operator to
+            # exactly this step; reuse that product instead of a second full
+            # application. A0 d = A_lambda d - lambda D d either way.
+            Ad = solve_info.get("Ax")
+            if Ad is None:
+                Ad = operator.information_matvec(step)
             if damping:
                 Ad = Ad - damping * operator.curvature_scale() * step
             curvature_quadratic = float((step * Ad).sum())

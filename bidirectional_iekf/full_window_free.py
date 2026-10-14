@@ -382,8 +382,11 @@ def _finish(operator, b, x, r, b_norm, iterations, status, history,
             "residual": float(r.norm()) / b_norm, "history": history,
             "residual_kind": "recursive, ||r_k|| / ||b||"}
     if true_residual:
-        info["true_residual"] = float(
-            (b - operator.information_matvec(x)).norm()) / b_norm
+        Ax = operator.information_matvec(x)
+        info["true_residual"] = float((b - Ax).norm()) / b_norm
+        # kept so the caller can reuse A x (the damped operator on exactly x)
+        # instead of applying the operator a second time
+        info["Ax"] = Ax
     return info
 
 

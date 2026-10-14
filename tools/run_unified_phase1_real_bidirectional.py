@@ -272,6 +272,22 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     ap.add_argument("--process-factors-on-cpu", action="store_true")
     ap.add_argument("--diagonal-preconditioner", action="store_true")
+    ap.add_argument("--linear-backend", default="legacy_reference",
+                    choices=("legacy_reference", "exact_cached_structured"),
+                    help="exact_cached_structured: the SAME system from linearisations "
+                         "frozen once per accepted state in host RAM, a GPU process "
+                         "stencil and A*delta reuse (tests/"
+                         "test_exact_cached_structured_backend.py)")
+    ap.add_argument("--preconditioner", default=None,
+                    choices=("diagonal", "block12", "temporal_block_tridiagonal"),
+                    help="numerical solver choice only; A and b are unchanged. "
+                         "block12/temporal need --linear-backend exact_cached_structured "
+                         "(block12 also runs on legacy)")
+    ap.add_argument("--transfer-policy", default="synchronous",
+                    choices=("synchronous", "double_buffered"))
+    ap.add_argument("--pinned-staging-budget-mib", type=int, default=1024)
+    ap.add_argument("--gpu-workspace-budget-mib", type=int, default=1024)
+    ap.add_argument("--cache-host-budget-gib", type=float, default=24.0)
     ap.add_argument("--solve-on-cpu", action="store_true",
                     help="keep the full-window float64 vectors (PCG, "
                          "preconditioner, LM scale) in host memory; one frame's "
@@ -500,7 +516,8 @@ def main() -> int:
         code = _h.sha256()
         for rel in ("bidirectional_iekf/ieks.py", "bidirectional_iekf/observations.py",
                     "bidirectional_iekf/full_window_free.py",
-                    "bidirectional_iekf/process_factors.py"):
+                    "bidirectional_iekf/process_factors.py",
+                    "bidirectional_iekf/accelerated.py"):
             code.update((REPO / rel).read_bytes())
         fp_payload = {
             "mode": args.mode, "window": window, "cameras": names,
@@ -514,6 +531,8 @@ def main() -> int:
                        cfg.min_alpha_for_depth],
             "anchors": [(e, groups[e].anchor_frame) for e in order],
             "smoke_subsample": args.max_gaussians_per_source,
+            "linear_backend": args.linear_backend,
+            "preconditioner": args.preconditioner,
             "solver_code_sha256": code.hexdigest()}
         fingerprint = _h.sha256(json.dumps(fp_payload, sort_keys=True,
                                            default=str).encode()).hexdigest()
@@ -614,6 +633,12 @@ def main() -> int:
             process_factors_on_cpu=args.process_factors_on_cpu,
             diagonal_preconditioner=args.diagonal_preconditioner,
             solve_on_cpu=args.solve_on_cpu,
+            linear_backend=args.linear_backend,
+            preconditioner=args.preconditioner,
+            transfer_policy=args.transfer_policy,
+            pinned_budget_mib=args.pinned_staging_budget_mib,
+            gpu_workspace_budget_mib=args.gpu_workspace_budget_mib,
+            cache_host_budget_gib=args.cache_host_budget_gib,
             on_accept=on_accept, stop_check=stop_check, verbose=True))
         torch.cuda.reset_peak_memory_stats()
         import resource
@@ -622,6 +647,8 @@ def main() -> int:
             failure = None
         except torch.cuda.OutOfMemoryError as exc:
             result, failure = None, f"OOM: {str(exc)[:300]}"
+        except MemoryError as exc:
+            result, failure = None, str(exc)[:500]
         peak_gpu = torch.cuda.max_memory_allocated() / 2 ** 20
         peak_host = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         if result is not None:
@@ -656,7 +683,9 @@ def main() -> int:
                 f"{manifest['solve']['wall_s']:.0f} s, GPU {peak_gpu:.0f} MiB, "
                 f"host {peak_host:.0f} MiB")
         else:
-            manifest["solve"] = {"status": "OOM", "error": failure,
+            manifest["solve"] = {"status": ("CACHE_HOST_BUDGET_EXCEEDED"
+                                            if failure.startswith("CACHE_HOST")
+                                            else "OOM"), "error": failure,
                                  "peak_gpu_mib": peak_gpu,
                                  "best_accepted_dir": str(best_dir) if accept_log else None}
             say(f"  {failure}")

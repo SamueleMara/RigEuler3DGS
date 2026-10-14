@@ -22,6 +22,15 @@
 #                               (the posterior is the same).
 #                               smoke: 1,500 Gaussians per source, 1 camera,
 #                               written under <tag>__smoke, SMOKE_SUBSAMPLED=YES
+#   --linear-backend B        legacy_reference (default) | exact_cached_structured
+#                               the SAME system; exact_cached_structured freezes
+#                               each accepted state's linearisations in host RAM
+#                               instead of re-rendering them on every PCG step
+#   --preconditioner P        diagonal | block12 | temporal_block_tridiagonal
+#                               a solver choice only: A and b do not change
+#   --transfer-policy T       synchronous (default) | double_buffered
+#   --cache-host-budget-gib G refuse (CACHE_HOST_BUDGET_EXCEEDED) rather than swap
+#   --pcg-tol R / --pcg-iters K   declared linear-solve target / cap per step
 #   --tag T                   experiment name under unified_phase1_experiments/
 #   --resume                  continue a matching experiment (see below)
 #   --time-budget-min M       override the profile's time budget (0 = none)
