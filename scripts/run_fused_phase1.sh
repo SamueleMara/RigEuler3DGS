@@ -16,10 +16,10 @@
 #   --reuse-existing-phase1   required: consume the historical F/B results
 #   --profile P               washer-validation | overnight | smoke
 #                               washer-validation / overnight: ALL Gaussians,
-#                               ALL original frames, TWO_CAMERAS (indices 0 and
-#                               n/2), up to 10 outer iterations x 60 PCG
-#                               (overnight: 40 PCG and a 55-minute budget;
-#                               the posterior is the same).
+#                               ALL original frames, ALL calibrated cameras,
+#                               up to 10 outer iterations x 60 PCG;
+#                               overnight adds a 180-minute per-scene budget
+#                               (the posterior is the same).
 #                               smoke: 1,500 Gaussians per source, 1 camera,
 #                               written under <tag>__smoke, SMOKE_SUBSAMPLED=YES
 #   --tag T                   experiment name under unified_phase1_experiments/

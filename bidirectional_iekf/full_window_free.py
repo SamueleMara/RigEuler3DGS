@@ -388,7 +388,8 @@ def _finish(operator, b, x, r, b_norm, iterations, status, history,
 
 
 def pcg(operator: FullWindowFreeOperator, b, preconditioner=None,
-        max_iters: int = 200, tol: float = 1e-10, true_residual: bool = False):
+        max_iters: int = 200, tol: float = 1e-10, true_residual: bool = False,
+        progress=None):
     """Matrix-free preconditioned conjugate gradients on the full window.
 
     `residual` is the RECURSIVE one, `||r_k||/||b||` with r updated by
@@ -417,6 +418,8 @@ def pcg(operator: FullWindowFreeOperator, b, preconditioner=None,
         r = r - alpha * Ap
         rel = float(r.norm()) / b_norm
         history.append(rel)
+        if progress is not None:
+            progress(iteration + 1, rel)
         if rel < tol:
             return x, _finish(operator, b, x, r, b_norm, iteration + 1,
                               "CONVERGED", history, true_residual)

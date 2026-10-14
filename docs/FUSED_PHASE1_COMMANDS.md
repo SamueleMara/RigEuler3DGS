@@ -27,20 +27,20 @@ mu, R, v, omega are optimised except each source's anchor pose.
 Washer first:
 
 ```bash
-cd /home/samuelemara/Joint3DGS/RigEuler3DGS && bash scripts/run_fused_phase1.sh --scene washer_103776 --reuse-existing-phase1 --profile washer-validation --tag fused_phase1_v1 --resume
+cd /home/samuelemara/Joint3DGS/RigEuler3DGS && bash scripts/run_fused_phase1.sh --scene washer_103776 --reuse-existing-phase1 --profile washer-validation --tag fused_phase1_allcams_v1 --resume
 ```
 
 Then every eligible scene, serially, detached:
 
 ```bash
 cd /home/samuelemara/Joint3DGS/RigEuler3DGS
-nohup bash scripts/run_fused_phase1_overnight.sh --all-existing-scenes --reuse-existing-phase1 --profile overnight --tag fused_phase1_v1 --resume > "$HOME/fused_phase1_overnight_v1.log" 2>&1 < /dev/null &
+nohup bash scripts/run_fused_phase1_overnight.sh --all-existing-scenes --reuse-existing-phase1 --profile overnight --tag fused_phase1_allcams_v1 --resume > "$HOME/fused_phase1_overnight_v1.log" 2>&1 < /dev/null &
 echo "overnight PID $!"
 tail -f "$HOME/fused_phase1_overnight_v1.log"
 ```
 
 Clean stop (finishes the current outer iteration, keeps the best state):
-`touch "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours/unified_phase1_overnight/fused_phase1_v1/STOP"`
+`touch "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours/unified_phase1_overnight/fused_phase1_allcams_v1/STOP"`
 (for the single-scene run: `touch <experiment>/STOP`).
 
 ## Measured costs (washer, all 45,920 Gaussians, 60 frames, 2 cameras)
@@ -54,8 +54,13 @@ Clean stop (finishes the current outer iteration, keeps the best state):
 | fixed cost per run (load, evaluate, build, line search) | ~60 s |
 | first accepted step, 5 PCG | E 2.19e8 -> 3.15e7 |
 
-washer-validation: up to 10 outer x 60 PCG, ~8 min per outer, no time
-budget. overnight: up to 10 outer x 40 PCG, 55-minute budget per scene. The
+Both profiles now use ALL 8 cameras and ALL 60 frames (480 factors on
+washer). The 2-camera washer run measured ~8.5 min per outer step at 60 PCG;
+with 4x the factors, expect roughly 30 min per step (an estimate scaled from
+that run, not a measurement). One camera's linearisation of the full union
+holds ~18 MiB, so 8 cameras add ~140 MiB per frame on the GPU.
+washer-validation: up to 10 outer x 60 PCG, no time budget. overnight: the
+same, with a 180-minute budget per scene. The
 two share one experiment per scene (same posterior; PCG count and time are
 not part of the fingerprint). Larger scenes cost proportionally more per
 iteration; foldchair (135,694 Gaussians) is the largest.

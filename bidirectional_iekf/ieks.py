@@ -391,7 +391,9 @@ class UnifiedFreeIEKS:
                     operator, damping=damping,
                     diagonal_only=self.cfg.diagonal_preconditioner)),
                 max_iters=self.cfg.pcg_max_iters, tol=self.cfg.pcg_tol,
-                true_residual=self.cfg.pcg_true_residual)
+                true_residual=self.cfg.pcg_true_residual,
+                progress=(_pcg_progress(outer, self.cfg.pcg_max_iters, started)
+                          if self.cfg.verbose else None))
             if solve_info["status"] == "NON_POSITIVE_CURVATURE":
                 damping *= self.cfg.damping_up
                 trace.append({"outer": outer, "accepted": False,
@@ -613,6 +615,15 @@ class UnifiedFreeIEKS:
                              "cross-Gaussian coupling. No marginal covariance "
                              "is claimed at this scale."),
                 }}
+
+
+def _pcg_progress(outer, max_iters, started, every=10):
+    """A line every `every` PCG iterations, so a long step is visibly alive."""
+    def report(k, rel):
+        if k % every == 0 or k == max_iters:
+            print(f"     outer {outer:>2}  PCG {k:>3}/{max_iters}  residual "
+                  f"{rel:.3e}  ({time.time() - started:.0f} s)", flush=True)
+    return report
 
 
 def _eliminated(operator, preconditioner):

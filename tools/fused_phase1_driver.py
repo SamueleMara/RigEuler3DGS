@@ -74,16 +74,16 @@ REPORT = REPO / "tools" / "write_fused_phase1_report.py"
 # everything that defines the posterior; they differ only in solve budget
 # (PCG iterations, time), which is why they can share one experiment.
 PROFILES = {
-    "washer-validation": dict(n_cams=2, max_outer=10, pcg_iters=60, pcg_tol=1e-6,
+    # ALL cameras, ALL original frames, ALL Gaussians.
+    "washer-validation": dict(n_cams=None, max_outer=10, pcg_iters=60, pcg_tol=1e-6,
                               damping=1e-3, time_budget_min=0.0, render_cams=4,
                               subsample=0),
-    # Same posterior as washer-validation; a smaller solve budget so ten
-    # scenes fit a night. Measured on washer (45,920 Gaussians, 60 frames,
-    # 2 cameras, solve on host): ~7.1 s per PCG iteration plus ~60 s fixed
-    # per run. Larger scenes cost proportionally more per iteration, and the
-    # budget then stops them with TIME_BUDGET and their best accepted state.
-    "overnight": dict(n_cams=2, max_outer=10, pcg_iters=40, pcg_tol=1e-6,
-                      damping=1e-3, time_budget_min=55.0, render_cams=4,
+    # Same posterior as washer-validation (all cameras, all frames); a
+    # per-scene time budget so one large scene cannot take the whole queue.
+    # Measured on washer at 2 cameras: ~8.5 min per outer step with 60 PCG;
+    # the image cost scales with the number of (frame, camera) factors.
+    "overnight": dict(n_cams=None, max_outer=10, pcg_iters=60, pcg_tol=1e-6,
+                      damping=1e-3, time_budget_min=180.0, render_cams=4,
                       subsample=0),
     # bounded validation only: a stride subset, labelled SMOKE_SUBSAMPLED,
     # written under <TAG>__smoke so it can never be mistaken for a full run
@@ -295,7 +295,7 @@ def discover(results_root: Path, dataset_root: Path) -> list:
 # ---------------------------------------------------------------------------
 
 def choose(names, n):
-    if n >= len(names):
+    if n is None or n >= len(names):
         return list(names)
     idx = sorted({round(k * len(names) / n) % len(names) for k in range(n)})
     return [names[i] for i in idx]
@@ -363,10 +363,24 @@ def run_logged(cmd, log: Path, dry: bool) -> int:
     if dry:
         return 0
     log.parent.mkdir(parents=True, exist_ok=True)
+    # Every line goes to the terminal AND the log. Sending it only to the log
+    # made a healthy run look frozen for an hour.
+    noise = ("Reading camera", "Loading Training Cameras", "Loading Test Cameras",
+             "No depth_params.json", "[GT parts]", "rawvideo @", "IMAGEIO FFMPEG")
+    env = dict(os.environ, PYTHONUNBUFFERED="1")
     with open(log, "a") as fh:
         fh.write(f"\n### {time.ctime()}\n### {pretty}\n")
         fh.flush()
-        proc = subprocess.run(cmd, cwd=REPO, stdout=fh, stderr=subprocess.STDOUT)
+        proc = subprocess.Popen(cmd, cwd=REPO, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                env=env)
+        for line in proc.stdout:
+            fh.write(line)
+            fh.flush()
+            if not line.lstrip().startswith(noise):
+                sys.stdout.write("      " + line)
+                sys.stdout.flush()
+        proc.wait()
     return proc.returncode
 
 

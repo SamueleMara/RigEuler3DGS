@@ -134,9 +134,10 @@ def main() -> int:
                              "--profile", "washer-validation", "--tag", "wrapper_probe_x",
                              "--preflight"])
     j = json.loads(out[out.index("{"):out.rindex("}") + 1])
-    check("preflight: no blockers, full population, all frames, TWO_CAMERAS",
+    check("preflight: no blockers, full population, all frames, ALL_CAMERAS",
           rc == 0 and not j["blockers"] and j["gaussians"]["union"] == 45920
-          and j["num_frames"] == 60 and j["camera_policy"] == "TWO_CAMERAS",
+          and j["num_frames"] == 60 and j["camera_policy"] == "ALL_CAMERAS"
+          and len(j["camera_ids"]) == 8,
           f"exit {rc}, {j['gaussians']}, {j['camera_policy']}")
     check("preflight declares the derived initialisation honestly",
           j["initialization_mode"] == "DERIVED_12D_INITIAL_GUESS_FROM_EXISTING_TRACKS")
@@ -152,7 +153,8 @@ def main() -> int:
           f"{len(outs)} outputs")
     check("the optimiser call is the raw-union joint IEKS on both sources",
           "--mode raw_union_experiment" in plan and "--representation-policy diagnostic-only"
-          in plan and "--camera-ids cam_000,cam_004" in plan and "--frames all" in plan)
+          in plan and "--camera-ids cam_000,cam_001,cam_002,cam_003,cam_004,cam_005,"
+          "cam_006,cam_007" in plan and "--frames all" in plan)
     check("dry-run and preflight created nothing",
           not (RESULTS / "washer_103776" / "unified_phase1_experiments" /
                "wrapper_probe_x").exists())
