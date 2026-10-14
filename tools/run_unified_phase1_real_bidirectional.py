@@ -59,8 +59,8 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 MODES = ("render_baseline", "forward_only", "backward_only", "raw_union_experiment")
-FULL_12D = "FULL_12D_FILTER"
-CENTER_ONLY = "CENTER_ONLY_APPROXIMATE"
+FULL_12D = "RECOVERED_FULL_FILTER_STATE"
+CENTER_ONLY = "DERIVED_12D_INITIAL_GUESS_FROM_EXISTING_TRACKS"
 
 
 def parse_frames(spec: str) -> list:
@@ -117,6 +117,13 @@ class Source:
             self.v, self.omega = d["v"][:, self.rows], d["omega"][:, self.rows]
             self.dt = float(dt_override or m["dt_seconds"])
             self.track_source = str(states_dir)
+            self.track_sha256 = __import__("hashlib").sha256(
+                json.dumps(m.get("sha256", {}), sort_keys=True).encode()).hexdigest()
+            self.provenance = {
+                "initialization_mode": FULL_12D,
+                "mu_R_v_omega": f"recorded by the legacy IEKF's output-only "
+                                f"observer in {states_dir}",
+                "FULL_12D_FILTER_EXPORT": "PRESENT"}
             self.track_manifest = {k: m[k] for k in (
                 "direction", "rate_convention", "rotation_convention",
                 "dt_seconds", "dt_is_measured", "num_frames", "num_gaussians")}
@@ -148,9 +155,35 @@ class Source:
             self.R = self.base.R.detach().cpu().float().expand(len(files), -1, -1, -1).clone()
             self.omega = torch.zeros_like(mu)
             self.track_source = str(cdir)
-            self.track_manifest = {"direction": m["direction"],
-                                   "note": "R constant, v central differences, "
-                                           "omega zero: a DIAGNOSTIC warm start"}
+            import hashlib as _h
+            dig = _h.sha256()
+            for f in files:
+                dig.update(f.name.encode())
+                dig.update(np.load(f).tobytes())
+            self.track_sha256 = dig.hexdigest()
+            self.track_manifest = {
+                "direction": m["direction"],
+                "trajectory_manifest": str(cdir / "trajectory_manifest.json"),
+                "centers_sha256": self.track_sha256,
+                "num_center_files": len(files)}
+            self.provenance = {
+                "initialization_mode": CENTER_ONLY,
+                "mu": ("LEGACY_IEKF centres, phase1_centers/centers_frame_NNNN.npy, "
+                       "original chronological order, every PLY row, verbatim"),
+                "R": ("the source PLY's own orientation at every frame -- a "
+                      "provisional guess; the legacy IEKF estimated R internally "
+                      "but did not export it"),
+                "v": (f"central differences of the real centres over the "
+                      f"declared dt = {self.dt:.6f} s (one-sided at the ends)"),
+                "omega": "zero -- a provisional guess, nothing more is justified",
+                "optimised_by_fused_ieks": "mu, R, v, omega for every Gaussian, "
+                                           "except this source's pose at its own "
+                                           "anchor frame",
+                "full_state_recovery_search": (
+                    "historical bidirectional/<direction>/ holds phase1_centers "
+                    "only (no R, v, omega, covariance); nothing recoverable"),
+                "FULL_12D_FILTER_EXPORT": "ABSENT",
+            }
         self.anchor_frame = 0 if endpoint == "initial" else self.frames[-1]
 
     def state(self, frame, device="cuda"):
@@ -188,7 +221,35 @@ def main() -> int:
     ap.add_argument("--final-model", default=None)
     ap.add_argument("--initial-states", default=None, help="full-state export, initial")
     ap.add_argument("--final-states", default=None, help="full-state export, final")
-    ap.add_argument("--allow-center-only", action="store_true")
+    ap.add_argument("--allow-center-only", action="store_true",
+                    help="alias of --reuse-existing-phase1")
+    ap.add_argument("--reuse-existing-phase1", action="store_true",
+                    help="read the historical bidirectional/{forward,backward}/"
+                         "phase1_centers READ ONLY and derive the 12-D initial "
+                         "guess from them when no full-state export is given: "
+                         "R = source PLY orientation, v = central differences "
+                         "of the real centres, omega = 0. That is an optimiser "
+                         "INITIAL GUESS, not something the legacy IEKF exported; "
+                         "every coordinate except the source anchor pose is "
+                         "then optimised")
+    ap.add_argument("--resume-from", default=None,
+                    help="a previous attempt directory of THIS tool; its best "
+                         "accepted state is the warm start. Refused unless its "
+                         "configuration fingerprint equals this run's")
+    ap.add_argument("--warm-start-from", default=None,
+                    help="initialise from another run's best accepted state "
+                         "WITHOUT requiring the same fingerprint (e.g. a 2-camera "
+                         "result seeding an 8-camera run). Recorded as "
+                         "WARM_START_FROM_OTHER_RUN; a different posterior, so it "
+                         "is never called a resume")
+    ap.add_argument("--time-budget-min", type=float, default=0.0,
+                    help="stop at the next outer iteration after this many "
+                         "minutes; status TIME_BUDGET, best accepted state kept")
+    ap.add_argument("--stop-file", default=None,
+                    help="if this file appears, stop at the next outer "
+                         "iteration; status STOPPED_BY_USER")
+    ap.add_argument("--camera-policy-label", default="",
+                    help="e.g. TWO_CAMERAS; recorded in manifest and titles")
     ap.add_argument("--out", required=True)
     ap.add_argument("--mode", choices=MODES, required=True)
     ap.add_argument("--representation-policy", default=None,
@@ -211,11 +272,17 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     ap.add_argument("--process-factors-on-cpu", action="store_true")
     ap.add_argument("--diagonal-preconditioner", action="store_true")
+    ap.add_argument("--solve-on-cpu", action="store_true",
+                    help="keep the full-window float64 vectors (PCG, "
+                         "preconditioner, LM scale) in host memory; one frame's "
+                         "tangent visits the GPU at a time. Same arithmetic "
+                         "(tests/test_unified_cpu_solve.py)")
     ap.add_argument("--no-visuals", action="store_true")
     ap.add_argument("--extra-variants-from", nargs="*", default=[],
                     help="other run dirs of THIS tool whose best accepted state "
                          "should appear as a variant in the visuals")
     args = ap.parse_args()
+    args.allow_center_only = bool(args.allow_center_only or args.reuse_existing_phase1)
 
     out = Path(args.out)
     if (out / "manifest.json").is_file():
@@ -331,13 +398,31 @@ def main() -> int:
                         "anchor": s.anchor_check()}
                     for e, s in sources.items()},
     }
+    manifest["camera_policy"] = args.camera_policy_label or None
+    (out / "initialization_provenance.json").write_text(json.dumps({
+        "scene": args.scene,
+        "historical_inputs_read_only": True,
+        "per_source": {e: {"endpoint": e, "model": str(s.model),
+                           "ply_sha256": s.ply_sha256, "track": s.track_source,
+                           "track_sha256": s.track_sha256,
+                           "anchor_original_frame": s.anchor_frame,
+                           **s.provenance} for e, s in sources.items()},
+        "note": ("A correct 12-D MAP problem needs a valid 12-D state to "
+                 "evaluate, not a 12-D estimate from a previous filter; model "
+                 "correctness, initialisation quality and solver convergence "
+                 "are separate questions and are reported separately"),
+    }, indent=1))
     for e, s in sources.items():
         a = manifest["sources"][e]["anchor"]
         say(f"  {e} pose at its own frame {a['anchor_original_frame']} vs PLY: "
             f"|dmu| {a['max_abs_mu_vs_ply']:.2e}, |dR| {a['max_abs_R_vs_ply']:.2e}")
 
     # ---- the solve ----------------------------------------------------------
-    window = parse_frames(args.frames)
+    if args.frames == "all":
+        common = sorted(set(sources["initial"].frames) & set(sources["final"].frames))
+        window = common
+    else:
+        window = parse_frames(args.frames)
     solved = None
     if args.mode != "render_baseline":
         from bidirectional_iekf.ieks import (IEKSConfig, Trajectory, UnifiedFreeIEKS,
@@ -406,6 +491,79 @@ def main() -> int:
             parts = [groups[e].state(f) for e in order]
             states.append(parts[0] if len(parts) == 1 else concat(*parts))
         warm = Trajectory(states=states, frame_ids=window, dt=dt)
+
+        # The configuration fingerprint: everything that defines the
+        # POSTERIOR (sources, tracks, rows, window, cameras, likelihood, Q, dt,
+        # anchors, the solver's own source files) and nothing that only
+        # budgets the solve (outer iterations, PCG iterations, time).
+        import hashlib as _h
+        code = _h.sha256()
+        for rel in ("bidirectional_iekf/ieks.py", "bidirectional_iekf/observations.py",
+                    "bidirectional_iekf/full_window_free.py",
+                    "bidirectional_iekf/process_factors.py"):
+            code.update((REPO / rel).read_bytes())
+        fp_payload = {
+            "mode": args.mode, "window": window, "cameras": names,
+            "sources": {e: [s.ply_sha256, s.track_sha256,
+                            manifest["sources"][e]["rows_sha256"], s.mode]
+                        for e, s in sources.items() if e in groups},
+            "dt": dt, "likelihood": "GAUSSIAN_RGBD",
+            "Q": [cfg.process_noise_pos, cfg.process_noise_rot,
+                  cfg.process_noise_vel, cfg.process_noise_omega],
+            "sensor": [cfg.rgb_sigma, cfg.depth_sigma_model, cfg.depth_sigma_a,
+                       cfg.min_alpha_for_depth],
+            "anchors": [(e, groups[e].anchor_frame) for e in order],
+            "smoke_subsample": args.max_gaussians_per_source,
+            "solver_code_sha256": code.hexdigest()}
+        fingerprint = _h.sha256(json.dumps(fp_payload, sort_keys=True,
+                                           default=str).encode()).hexdigest()
+        manifest["config_fingerprint"] = fingerprint
+        manifest["config_fingerprint_payload"] = fp_payload
+        say(f"  configuration fingerprint {fingerprint[:16]}")
+        # Written now, so an attempt that dies mid-solve can still be
+        # validated and resumed from its best accepted state.
+        tmp = out / "manifest.partial.json.tmp"
+        tmp.write_text(json.dumps(manifest, indent=1, default=str))
+        tmp.replace(out / "manifest.partial.json")
+
+        if args.resume_from and args.warm_start_from:
+            raise SystemExit("--resume-from and --warm-start-from are exclusive")
+        if args.resume_from or args.warm_start_from:
+            prev = Path(args.resume_from or args.warm_start_from)
+            pm = {}
+            for name in ("manifest.json", "manifest.partial.json"):
+                if (prev / name).is_file():
+                    pm = json.loads((prev / name).read_text())
+                    break
+            if args.resume_from and pm.get("config_fingerprint") != fingerprint:
+                raise SystemExit(
+                    f"--resume-from {prev}: its configuration fingerprint "
+                    f"{str(pm.get('config_fingerprint'))[:16]} differs from this "
+                    f"run's {fingerprint[:16]}. Resuming would continue a "
+                    "DIFFERENT posterior; refused.")
+            npz = prev / "best_accepted" / "state.npz"
+            if not npz.is_file():
+                raise SystemExit(f"--resume-from {prev}: no best_accepted/state.npz")
+            d = np.load(npz)
+            if d["original_frame_ids"].tolist() != window or d["mu"].shape[1] != N:
+                raise SystemExit(f"{npz}: frames or candidate count do not match")
+            from estimator.state import quaternion_wxyz_to_matrix
+            resumed = []
+            for k, st in enumerate(states):
+                resumed.append(dataclasses.replace(
+                    st, mu=torch.from_numpy(d["mu"][k]).to(st.mu),
+                    R=quaternion_wxyz_to_matrix(
+                        torch.from_numpy(d["quat_wxyz"][k]).to(st.mu)).contiguous(),
+                    v=torch.from_numpy(d["v"][k]).to(st.mu),
+                    omega=torch.from_numpy(d["omega"][k]).to(st.mu)))
+            warm = Trajectory(states=resumed, frame_ids=window, dt=dt)
+            manifest["resumed_from" if args.resume_from else
+                     "warm_start_from_other_run"] = {"dir": str(prev),
+                                                     "outer": int(d["outer"]),
+                                        "state_sha256": _h.sha256(
+                                            npz.read_bytes()).hexdigest()}
+            say(f"  {'RESUMED' if args.resume_from else 'WARM_START_FROM_OTHER_RUN'}"
+                f" from {prev} (its accepted outer {int(d['outer'])})")
         anchor_groups = tuple((window.index(groups[e].anchor_frame), offsets[e])
                               for e in order)
         say(f"  {N} candidates; anchors " + ", ".join(
@@ -416,6 +574,16 @@ def main() -> int:
                                device=states[0].mu.device, dtype=torch.float64)
         Q_inv, _ = invert_blocks(Q.double())
         del Q
+
+        deadline = (time.time() + 60.0 * args.time_budget_min
+                    if args.time_budget_min > 0 else None)
+
+        def stop_check():
+            if args.stop_file and Path(args.stop_file).exists():
+                return "STOPPED_BY_USER"
+            if deadline is not None and time.time() > deadline:
+                return "TIME_BUDGET"
+            return None
 
         best_dir = out / "best_accepted"
         accept_log = []
@@ -445,7 +613,8 @@ def main() -> int:
             anchor_groups=anchor_groups, stream_frames=args.stream_frames,
             process_factors_on_cpu=args.process_factors_on_cpu,
             diagonal_preconditioner=args.diagonal_preconditioner,
-            on_accept=on_accept, verbose=True))
+            solve_on_cpu=args.solve_on_cpu,
+            on_accept=on_accept, stop_check=stop_check, verbose=True))
         torch.cuda.reset_peak_memory_stats()
         import resource
         try:
@@ -635,7 +804,9 @@ def main() -> int:
 
     manifest["flags"] = flags
     manifest["wall_s_total"] = time.time() - t_start
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=1, default=str))
+    tmp = out / "manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=1, default=str))
+    tmp.replace(out / "manifest.json")
     say(f"  flags: {json.dumps(flags)}")
     say(f"  {out}")
     log.close()

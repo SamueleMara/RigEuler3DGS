@@ -126,6 +126,11 @@ class IEKSConfig:
     # caller can keep the best accepted iterate on disk. The objective is
     # monotone over accepted steps, so the latest one is the best.
     on_accept: object = None
+    # Called at the top of every outer iteration; a non-empty string return
+    # stops the run with that string as its status (e.g. TIME_BUDGET,
+    # STOPPED_BY_USER). The nominal at that point is the last ACCEPTED one,
+    # so nothing half-applied is ever left behind.
+    stop_check: object = None
     # Tangent columns held at zero. A DIAGNOSTIC ablation, not a model: used
     # to isolate whether a stall comes from the weakly observed rate blocks.
     frozen_columns: tuple = ()
@@ -159,6 +164,12 @@ class IEKSConfig:
     # read small while the iterate is not a solution -- so a run that claims
     # convergence should be able to show the real number.
     pcg_true_residual: bool = False
+    # Keep the full-window float64 vectors (PCG state, preconditioner, LM
+    # scale) in HOST memory; only one frame's tangent visits the GPU at a
+    # time. At 45,920 Gaussians x 60 frames each such vector is 264 MB and
+    # PCG holds about eight, which is what an 8 GiB card shared with other
+    # jobs cannot spare. The arithmetic is unchanged (float64 either way).
+    solve_on_cpu: bool = False
     verbose: bool = True
 
 
@@ -320,7 +331,8 @@ class UnifiedFreeIEKS:
             frozen_groups=(tuple(self.cfg.anchor_groups)
                            if self.cfg.source_pose_policy == "fixed_conditional"
                            else ()),
-            work_device=trajectory.states[0].mu.device)
+            work_device=(torch.device("cpu") if self.cfg.solve_on_cpu
+                         else trajectory.states[0].mu.device))
         return operator, caches
 
     # -- the outer loop ----------------------------------------------------
@@ -353,6 +365,11 @@ class UnifiedFreeIEKS:
                   f"  factors={expected_factors}")
 
         for outer in range(self.cfg.max_outer):
+            if self.cfg.stop_check is not None:
+                reason = self.cfg.stop_check()
+                if reason:
+                    status = str(reason)
+                    break
             operator, _caches = self.build_system(current, damping)
             b = operator.rhs()
             grad_norm = float(b.norm())
@@ -766,8 +783,13 @@ class _CudaWindowOperator(FullWindowFreeOperator):
             out[0] += torch.einsum(
                 "nij,nj->ni", self.prior_information.double().to(u.device), u[0])
         for t, cache in enumerate(self.caches):
-            contribution = self.obs.information_apply(cache, u[t].to(cache.linearization.views[0].rgb.dtype))
-            out[t] += contribution.double()
+            # One frame's tangent goes to the renderer's device and its
+            # information comes back: the full-window vectors may live on the
+            # host (solve_on_cpu) while the JVP/VJP stays on the GPU.
+            ref = cache.linearization.views[0].rgb
+            contribution = self.obs.information_apply(
+                cache, u[t].to(device=ref.device, dtype=ref.dtype))
+            out[t] += contribution.double().to(out.device)
         for factor in self.process:
             t = factor.frame
             A, B, Q = (factor.A.to(u.device), factor.B.to(u.device),
@@ -788,7 +810,7 @@ class _CudaWindowOperator(FullWindowFreeOperator):
             b[0] -= torch.einsum("nij,nj->ni", P0,
                                  self.prior_residual.double().to(b.device))
         for t, cache in enumerate(self.caches):
-            b[t] += self.obs.gradient(cache).double()
+            b[t] += self.obs.gradient(cache).double().to(b.device)
         for factor in self.process:
             t = factor.frame
             A, B, Q = (factor.A.to(b.device), factor.B.to(b.device),
