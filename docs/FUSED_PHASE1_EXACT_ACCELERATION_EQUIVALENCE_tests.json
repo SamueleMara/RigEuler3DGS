@@ -1,8 +1,8 @@
 {
  "floor": {
-  "matvec": 1.7177318891397293e-07,
-  "rhs": 5.050149441966382e-08,
-  "curv": 8.185427470210962e-08
+  "matvec": 9.174200942366496e-08,
+  "rhs": 3.116823884303981e-08,
+  "curv": 7.330199570107985e-08
  },
  "rows": [
   {
@@ -28,22 +28,22 @@
   {
    "check": "A u",
    "pass": true,
-   "detail": "6.16e-08 (floor 1.72e-07)"
+   "detail": "9.86e-08 (floor 9.17e-08)"
   },
   {
    "check": "b = -grad",
    "pass": true,
-   "detail": "3.83e-08 (floor 5.05e-08)"
+   "detail": "4.07e-08 (floor 3.12e-08)"
   },
   {
    "check": "LM metric D",
    "pass": true,
-   "detail": "1.01e-07 (floor 8.19e-08)"
+   "detail": "1.08e-07 (floor 7.33e-08)"
   },
   {
    "check": "symmetry u'Av = v'Au, as symmetric as the legacy operator",
    "pass": true,
-   "detail": "1.50e-07 vs legacy's own 2.36e-07 (float32 JVP/VJP)"
+   "detail": "2.18e-07 vs legacy's own 1.61e-07 (float32 JVP/VJP)"
   },
   {
    "check": "positive on random directions",
@@ -123,17 +123,17 @@
   {
    "check": "double-buffered A u",
    "pass": true,
-   "detail": "6.07e-08"
+   "detail": "1.03e-07"
   },
   {
    "check": "diagonal M^-1 matches the legacy diagonal",
    "pass": true,
-   "detail": "1.58e-10"
+   "detail": "1.12e-10"
   },
   {
    "check": "block12 M^-1 matches legacy block-Jacobi wherever nothing is anchored",
    "pass": true,
-   "detail": "3.48e-07 (legacy adds a 1e-9 ridge)"
+   "detail": "3.50e-07 (legacy adds a 1e-9 ridge)"
   },
   {
    "check": "on anchored blocks it restricts to the FREE coordinates before inverting",
@@ -143,7 +143,7 @@
   {
    "check": "temporal M = A restricted to same-Gaussian blocks (dense oracle)",
    "pass": true,
-   "detail": "2.13e-07"
+   "detail": "2.20e-07"
   },
   {
    "check": "temporal M is SPD on the free subspace",
@@ -163,22 +163,22 @@
   {
    "check": "diagonal: same solution as the legacy solve",
    "pass": true,
-   "detail": "4.68e-07"
+   "detail": "4.75e-07"
   },
   {
    "check": "block12: same solution as the legacy solve",
    "pass": true,
-   "detail": "4.51e-07"
+   "detail": "6.06e-07"
   },
   {
    "check": "temporal: same solution as the legacy solve",
    "pass": true,
-   "detail": "6.83e-07"
+   "detail": "9.11e-07"
   },
   {
    "check": "the temporal preconditioner needs no more iterations than diagonal",
    "pass": true,
-   "detail": "37 vs 160"
+   "detail": "36 vs 160"
   },
   {
    "check": "the Ax PCG returns is A applied to its own x",
@@ -198,12 +198,12 @@
   {
    "check": "cached diag: same converged states as legacy",
    "pass": true,
-   "detail": "4.43e-06 (legacy-vs-legacy 6.87e-06)"
+   "detail": "4.38e-06 (legacy-vs-legacy 4.40e-06)"
   },
   {
    "check": "cached diag: same converged objective",
    "pass": true,
-   "detail": "3.293270e+01 vs 3.293276e+01 (legacy-vs-legacy 2.7e-05)"
+   "detail": "3.293274e+01 vs 3.293270e+01 (legacy-vs-legacy 2.2e-05)"
   },
   {
    "check": "cached diag: anchors bitwise unchanged",
@@ -218,15 +218,45 @@
   {
    "check": "cached temporal: same converged states as legacy",
    "pass": true,
-   "detail": "3.71e-06 (legacy-vs-legacy 6.87e-06)"
+   "detail": "4.37e-06 (legacy-vs-legacy 4.40e-06)"
   },
   {
    "check": "cached temporal: same converged objective",
    "pass": true,
-   "detail": "3.293270e+01 vs 3.293268e+01 (legacy-vs-legacy 2.7e-05)"
+   "detail": "3.293274e+01 vs 3.293276e+01 (legacy-vs-legacy 2.2e-05)"
   },
   {
    "check": "cached temporal: anchors bitwise unchanged",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "check": "host trajectory: A u",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "check": "host trajectory: b and D",
+   "pass": true,
+   "detail": ""
+  },
+  {
+   "check": "host trajectory: same objective",
+   "pass": true,
+   "detail": "2.44606522e+03 vs 2.44606522e+03"
+  },
+  {
+   "check": "host trajectory: converges and stays on the host",
+   "pass": true,
+   "detail": "CONVERGED"
+  },
+  {
+   "check": "host trajectory: same converged states as legacy",
+   "pass": true,
+   "detail": "4.88e-06 (legacy-vs-legacy 4.40e-06)"
+  },
+  {
+   "check": "host trajectory: anchors bitwise unchanged",
    "pass": true,
    "detail": ""
   }

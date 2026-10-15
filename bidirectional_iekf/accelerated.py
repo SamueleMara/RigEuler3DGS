@@ -148,7 +148,7 @@ class FrozenFrameStore:
     from here: the line search re-renders through `obs.nonlinear_cost`.
     """
 
-    def __init__(self, observation, trajectory, state_token, *,
+    def __init__(self, observation, trajectory, state_token, *, device=None,
                  transfer_policy="synchronous", pinned_budget_mib=1024,
                  keep_pose_fisher=False, host_budget_gib=None, verbose=False):
         if transfer_policy not in ("synchronous", "double_buffered"):
@@ -158,7 +158,9 @@ class FrozenFrameStore:
         self.T = trajectory.T
         self.N = trajectory.N
         self.transfer_policy = transfer_policy
-        self.device = trajectory.states[0].mu.device
+        from bidirectional_iekf.ieks import _on
+        self.device = torch.device(device) if device is not None else \
+            trajectory.states[0].mu.device
         self.frames: list[PackedFrame] = []
         self.gradient: list[torch.Tensor] = []         # [N,12] float64 host
         self.meas_diag: list[torch.Tensor] = []        # [N,12] float64 host
@@ -169,7 +171,7 @@ class FrozenFrameStore:
         t0 = time.perf_counter()
         for t, state in enumerate(trajectory.states):
             tb = time.perf_counter()
-            cache = observation.linearize_frame(state, t)
+            cache = observation.linearize_frame(_on(state, self.device), t)
             self.build_calls += 1
             g = observation.gradient(cache).double()
             F = observation.block_fisher(cache).double()
@@ -321,7 +323,7 @@ class StructuredProcess:
                                                         process_residual_jacobians)
         self.T, self.N = trajectory.T, trajectory.N
         Qd = torch.as_tensor(Q_inv).double()
-        uniform = bool((Qd == Qd[:1]).all())
+        uniform = (Qd.ndim == 3 and Qd.stride(0) == 0) or bool((Qd == Qd[:1]).all())
         self.Q_uniform = uniform
         self.Q = (Qd[:1] if uniform else Qd).to(device)
         self.A, self.B = [], []
@@ -329,10 +331,12 @@ class StructuredProcess:
         diag = torch.zeros(self.T, self.N, ERROR_DIM, dtype=torch.float64)
         self.on_gpu = True
         total = 0
+        from bidirectional_iekf.ieks import _on
         st = trajectory.states
         for t in range(self.T - 1):
-            A, B = process_residual_jacobians(st[t], st[t + 1], trajectory.dt)
-            e = process_residual(st[t], st[t + 1], trajectory.dt).double()
+            s0, s1 = _on(st[t], device), _on(st[t + 1], device)
+            A, B = process_residual_jacobians(s0, s1, trajectory.dt)
+            e = process_residual(s0, s1, trajectory.dt).double()
             Q = self.Q.expand(self.N, 12, 12) if uniform else self.Q
             A, B, Q = A.to(device), B.to(device), Q.to(device)
             Qe = torch.einsum("nij,nj->ni", Q, e.to(device))
@@ -347,10 +351,20 @@ class StructuredProcess:
             del A, B, Q, e, Qe
         self.rhs, self.diag = rhs, diag
         self.coeff_bytes = total
-        if total > gpu_budget_mib * 2 ** 20:
+        # Placement follows the MEASURED free GPU memory, not only a fixed
+        # budget: the card is shared, and after the first accepted step the
+        # SO(3) blocks become per-Gaussian (585 MB on washer), which is what
+        # ran the first overnight run out of memory. Host coefficients are
+        # staged one pair at a time (~10 MB) inside each application.
+        free, _total = torch.cuda.mem_get_info(device)
+        limit = min(gpu_budget_mib * 2 ** 20, 0.15 * free)
+        if total > limit:
             self.on_gpu = False
             self.A = [a.to("cpu") for a in self.A]
             self.B = [b.to("cpu") for b in self.B]
+        self.placement = {"coeff_mib": total / 2 ** 20, "on_gpu": self.on_gpu,
+                          "gpu_free_mib_at_build": free / 2 ** 20}
+        torch.cuda.empty_cache()
         self.device = device
         self.patterns = {"A": sorted(self.A[0].blocks) if self.A else [],
                          "B": sorted(self.B[0].blocks) if self.B else [],
@@ -503,12 +517,14 @@ class CachedStructuredOperator:
         return out
 
     # -- preconditioners ----------------------------------------------------------
-    def make_preconditioner(self, kind, damping, chunk=2048, verbose=False):
+    def make_preconditioner(self, kind, damping, chunk=2048, verbose=False,
+                            host_budget_bytes=None):
         if kind == "diagonal":
             return self._diagonal(damping)
         if kind in ("block12", "temporal_block_tridiagonal"):
             return TemporalBlockPreconditioner(self, damping, coupled=(
-                kind == "temporal_block_tridiagonal"), chunk=chunk, verbose=verbose)
+                kind == "temporal_block_tridiagonal"), chunk=chunk,
+                host_budget_bytes=host_budget_bytes, verbose=verbose)
         raise ValueError(kind)
 
     def _diagonal(self, damping):
@@ -550,13 +566,27 @@ class TemporalBlockPreconditioner:
     """
 
     def __init__(self, op: CachedStructuredOperator, damping, *, coupled=True,
-                 chunk=2048, verbose=False):
+                 chunk=2048, host_budget_bytes=None, verbose=False):
         if op.store.pose_fisher is None:
             raise ValueError("block preconditioners need the store built with "
                              "keep_pose_fisher=True")
-        self.op, self.coupled, self.chunk = op, coupled, chunk
+        self.op, self.coupled = op, coupled
         self.kind = "temporal_block_tridiagonal" if coupled else "block12"
         T, N, dev = op.T, op.N, op.gpu
+        # host RAM for the factors, checked BEFORE allocating anything
+        factor_bytes = (2 if coupled else 1) * T * N * 144 * 8
+        if host_budget_bytes is not None and \
+                op.store.host_bytes + factor_bytes > host_budget_bytes:
+            raise PreconditionerBudgetError(
+                f"{self.kind}: factors need {factor_bytes / 2**30:.1f} GiB on top of "
+                f"the {op.store.host_bytes / 2**30:.1f} GiB image cache, over the "
+                f"{host_budget_bytes / 2**30:.1f} GiB host budget")
+        # GPU chunk from the MEASURED free memory: D, E, L, W per chunk, each
+        # [T, n, 12, 12] float64, plus process blocks and scratch (x2)
+        free, _ = torch.cuda.mem_get_info(dev)
+        per_gaussian = 8 * T * 144 * 8
+        chunk = int(max(64, min(chunk, 0.3 * free // per_gaussian)))
+        self.chunk = chunk
         t0 = time.perf_counter()
         self.L, self.W, self.ranges = [], [], []
         curv = op.curvature_scale()
@@ -614,6 +644,7 @@ class TemporalBlockPreconditioner:
                 self.W.append(W.cpu())
             self.ranges.append((s, s + n))
             del D, E, L, W
+        torch.cuda.empty_cache()
         self.build_s = time.perf_counter() - t0
         self.host_bytes = sum(x.numel() * 8 for x in self.L + self.W)
         if verbose:
@@ -643,6 +674,10 @@ class TemporalBlockPreconditioner:
                     x[t] = torch.linalg.solve_triangular(L[t].transpose(1, 2), rhs, upper=True)
             out[:, s:e] = x.squeeze(-1).to(op.work_device)
         return op._freeze(out)
+
+
+class PreconditionerBudgetError(MemoryError):
+    """The block preconditioner does not fit; the solver falls back honestly."""
 
 
 class np_linalg_error(RuntimeError):

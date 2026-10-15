@@ -1,6 +1,6 @@
 # Exact acceleration — equivalence to the reference system
 
-Tests: `tests/test_exact_cached_structured_backend.py` (45 checks, real
+Tests: `tests/test_exact_cached_structured_backend.py` (51 checks, real
 CUDA), machine-readable rows in
 `docs/FUSED_PHASE1_EXACT_ACCELERATION_EQUIVALENCE_tests.json`; the real
 full-scale step is in `docs/FUSED_PHASE1_EXACT_ACCELERATION_BENCHMARK.md`.
@@ -43,6 +43,7 @@ float64 process checks are held to 1e-12.
 | `A x` reuse for predicted reduction | fresh application | PCG's true-residual product | within floor | | yes |
 | converged nonlinear run | legacy E 32.93270 (legacy-vs-legacy 1.4e-4) | cached diagonal 32.93260, cached temporal 32.93276 | states within 1.7e-5 / 1.8e-5 (legacy-vs-legacy 1.9e-5) | 10x legacy spread | yes |
 | anchors after a nonlinear run | | | bitwise unchanged | exact | yes |
+| host-resident trajectory | GPU-resident | trajectory in host RAM, one frame on the GPU | A u, b, D within floor; same objective; converged states 4.9e-6 from legacy (legacy-vs-legacy 4.4e-6); anchors bitwise | floor / 10x legacy spread | yes |
 
 ## Theory mapping
 

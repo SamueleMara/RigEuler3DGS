@@ -227,7 +227,9 @@ def main() -> int:
         flags["ONE_SHARED_RGBD_LIKELIHOOD"] = (
             "PASS" if n_fac == expect and last[1].get("mode") == "raw_union_experiment"
             else f"CHECK: {n_fac} factors, expected {expect}")
-        flags["JOINT_IEKS_ATTEMPTED"] = "PASS" if s.get("status") != "OOM" else "OOM"
+        flags["JOINT_IEKS_ATTEMPTED"] = ("PASS" if s.get("status") not in
+                                         ("OOM", "CACHE_HOST_BUDGET_EXCEEDED")
+                                         else s.get("status"))
         flags["JOINT_IEKS_CONVERGED"] = ("PASS" if s.get("status") == "CONVERGED"
                                          else s.get("status"))
     else:
@@ -295,8 +297,8 @@ def main() -> int:
         "objective_best": min((r["E_total"] for r in e_rows if r.get("accepted")),
                               default=None),
         "outer_iterations": len(e_rows),
-        "pcg_true_residual_last": (last[1]["solve"]["last"].get("pcg_true_residual")
-                                   if last else None),
+        "pcg_true_residual_last": ((last[1]["solve"].get("last") or {}).get(
+            "pcg_true_residual") if last else None),
         "peak_gpu_mib": max((m["solve"].get("peak_gpu_mib", 0) for _, m in solved),
                             default=None),
         "peak_host_mib": max((m["solve"].get("peak_host_rss_mib", 0) or 0

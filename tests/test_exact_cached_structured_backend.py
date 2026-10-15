@@ -368,6 +368,43 @@ def main() -> int:
               torch.equal(st[0].mu[A_rows.cuda()], warm.states[0].mu[A_rows.cuda()])
               and torch.equal(st[T - 1].mu[B_rows.cuda()], warm.states[T - 1].mu[B_rows.cuda()]))
 
+    print("\n[11] a host-resident trajectory is the same problem")
+    # The accelerated CLI keeps the trajectory in host RAM and moves one frame
+    # to the GPU when it is rendered. Same A, b, D, objective and solution.
+    from bidirectional_iekf.ieks import _on
+    warm_cpu = Trajectory(states=[_on(s_, "cpu") for s_ in warm.states],
+                          frame_ids=list(range(T)), dt=dt)
+    op_h = solver("exact_cached_structured").build_system(warm_cpu, lam)[0]
+    check("host trajectory: A u", rel(ref.information_matvec(u),
+                                      op_h.information_matvec(u)) <= tol("matvec"))
+    check("host trajectory: b and D",
+          rel(ref.rhs(), op_h.rhs()) <= tol("rhs")
+          and rel(ref.curvature_scale(), op_h.curvature_scale()) <= tol("curv"))
+    e_dev = solver("exact_cached_structured").evaluate(warm)["E_total"]
+    e_host = solver("exact_cached_structured").evaluate(warm_cpu)["E_total"]
+    check("host trajectory: same objective", abs(e_dev - e_host) <= 1e-6 * abs(e_dev),
+          f"{e_dev:.8e} vs {e_host:.8e}")
+    s_ = UnifiedFreeIEKS(FreeRGBDObservation(cams, obs_data, frame_ids=list(range(T))), Q,
+                         config=IEKSConfig(source_pose_policy="fixed_conditional",
+                                           anchor_groups=groups, solve_on_cpu=True,
+                                           max_outer=60, damping=lam, pcg_max_iters=400,
+                                           pcg_tol=1e-10, pcg_true_residual=True,
+                                           linear_backend="exact_cached_structured",
+                                           preconditioner="temporal_block_tridiagonal",
+                                           verbose=False))
+    run_h = s_.run(warm_cpu)
+    st = run_h["trajectory"].states
+    check("host trajectory: converges and stays on the host",
+          run_h["status"] == "CONVERGED" and all(x.mu.device.type == "cpu" for x in st),
+          run_h["status"])
+    d = max(float((runs["legacy"]["trajectory"].states[t].mu.cpu() - st[t].mu).abs().max())
+            for t in range(T))
+    check("host trajectory: same converged states as legacy", d <= max(10 * ctrl, 1e-5),
+          f"{d:.2e} (legacy-vs-legacy {ctrl:.2e})")
+    check("host trajectory: anchors bitwise unchanged",
+          torch.equal(st[0].mu[A_rows], warm_cpu.states[0].mu[A_rows])
+          and torch.equal(st[T - 1].mu[B_rows], warm_cpu.states[T - 1].mu[B_rows]))
+
     print()
     import json
     log = REPO / "docs" / "FUSED_PHASE1_EXACT_ACCELERATION_EQUIVALENCE_tests.json"

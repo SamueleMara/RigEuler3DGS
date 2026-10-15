@@ -37,6 +37,7 @@ accelerates PCG and is never returned as posterior uncertainty.
 from __future__ import annotations
 
 import json
+import dataclasses
 import math
 import time
 from dataclasses import dataclass, field
@@ -184,6 +185,12 @@ class IEKSConfig:
     gpu_workspace_budget_mib: int = 1024
     preconditioner_chunk: int = 2048
     cache_host_budget_gib: object = None
+    # Where rendering and differentiation run. The trajectory itself may live
+    # on the host (the accelerated CLI keeps it there): each state visits the
+    # device only while it is rendered or differentiated, so the GPU holds one
+    # frame, not 60 frames twice over during a line search -- which at
+    # foldchair's 135,694 Gaussians was 1.6 GB of a 2.35 GB budget.
+    compute_device: object = None
     verbose: bool = True
 
 
@@ -223,6 +230,16 @@ class Trajectory:
         return torch.stack([s.omega for s in self.states])
 
 
+def _on(state, device):
+    """`state` with every tensor on `device`; the same object if already there."""
+    device = torch.device(device)
+    if state.mu.device == device:
+        return state
+    return dataclasses.replace(
+        state, **{f: getattr(state, f).to(device, non_blocking=True)
+                  for f in ("mu", "R", "v", "omega", "colors", "opacity", "scales")})
+
+
 class UnifiedFreeIEKS:
     """One posterior over the whole window, solved by iterated smoothing."""
 
@@ -252,6 +269,19 @@ class UnifiedFreeIEKS:
                 "as reference data, source-time pose free). Mixing them "
                 "silently makes every reported uncertainty ambiguous.")
 
+    @property
+    def _cdev(self):
+        if self.cfg.compute_device is not None:
+            return torch.device(self.cfg.compute_device)
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def _Q_on(self, device):
+        """Q^-1 on `device`; a uniform Q stays a broadcast view (no N copies)."""
+        Q = self.Q_inv
+        if Q.ndim == 3 and Q.shape[0] > 1 and Q.stride(0) == 0:
+            return Q[:1].to(device).expand(Q.shape[0], 12, 12)
+        return Q.to(device)
+
     # -- objective ---------------------------------------------------------
     def prior_residual(self, trajectory: Trajectory) -> torch.Tensor:
         """X_0 boxminus Xbar_0, in the current chart. Zero if no prior."""
@@ -276,7 +306,7 @@ class UnifiedFreeIEKS:
         support = {"total": 0, "per_frame": []}
         for t in range(trajectory.T):
             if with_support:
-                cache = self.obs.linearize_frame(trajectory.states[t], t)
+                cache = self.obs.linearize_frame(_on(trajectory.states[t], self._cdev), t)
                 counts = depth_support(self.obs, cache)
                 support["total"] += counts["total"]
                 support["per_frame"].append(counts["total"])
@@ -287,15 +317,16 @@ class UnifiedFreeIEKS:
                     rgb += float(measurement_energy(residual[0], precision[0]))
                     depth += float(measurement_energy(residual[1], precision[1]))
                 continue
-            cost = self.obs.nonlinear_cost(trajectory.states[t], t)
+            cost = self.obs.nonlinear_cost(_on(trajectory.states[t], self._cdev), t)
             rgb += cost["rgb"]
             depth += cost["depth"]
 
         process = 0.0
         for t in range(trajectory.T - 1):
-            e = process_residual(trajectory.states[t], trajectory.states[t + 1],
+            e = process_residual(_on(trajectory.states[t], self._cdev),
+                                 _on(trajectory.states[t + 1], self._cdev),
                                  trajectory.dt)
-            Q = self.Q_inv.to(e.device)
+            Q = self._Q_on(e.device)
             process += 0.5 * float(torch.einsum("ni,nij,nj->", e, Q, e))
 
         prior = 0.0
@@ -330,7 +361,7 @@ class UnifiedFreeIEKS:
                 trajectory.states[t], trajectory.states[t + 1], trajectory.dt)
             e = process_residual(trajectory.states[t], trajectory.states[t + 1],
                                  trajectory.dt)
-            Q = self.Q_inv.to(A.device)
+            Q = self._Q_on(A.device)
             if host is not None:
                 A, B, Q, e = A.to(host), B.to(host), Q.to(host), e.to(host)
             process_factors.append(ProcessFactor(frame=t, A=A, B=B, Q_inv=Q,
@@ -371,11 +402,11 @@ class UnifiedFreeIEKS:
             self._frozen = None
             import gc
             gc.collect()
-            device = trajectory.states[0].mu.device
+            device = self._cdev
             kind = self.cfg.preconditioner or (
                 "diagonal" if self.cfg.diagonal_preconditioner else "block12")
             store = FrozenFrameStore(
-                self.obs, trajectory, state_token=id(trajectory),
+                self.obs, trajectory, state_token=id(trajectory), device=device,
                 transfer_policy=self.cfg.transfer_policy,
                 pinned_budget_mib=self.cfg.pinned_budget_mib,
                 keep_pose_fisher=kind != "diagonal",
@@ -397,17 +428,32 @@ class UnifiedFreeIEKS:
             prior_information=self.prior_information,
             prior_residual=(self.prior_residual(trajectory)
                             if self.prior_information is not None else None),
-            work_device=("cpu" if self.cfg.solve_on_cpu
-                         else trajectory.states[0].mu.device))
+            work_device=("cpu" if self.cfg.solve_on_cpu else self._cdev))
         return operator, None
 
     def _preconditioner(self, operator, damping):
         if hasattr(operator, "make_preconditioner"):
+            from bidirectional_iekf.accelerated import PreconditionerBudgetError
             kind = self.cfg.preconditioner or (
                 "diagonal" if self.cfg.diagonal_preconditioner else "block12")
-            return _eliminated(operator, operator.make_preconditioner(
-                kind, damping, chunk=self.cfg.preconditioner_chunk,
-                verbose=self.cfg.verbose))
+            budget = (None if self.cfg.cache_host_budget_gib is None
+                      else self.cfg.cache_host_budget_gib * 2 ** 30)
+            try:
+                M = operator.make_preconditioner(
+                    kind, damping, chunk=self.cfg.preconditioner_chunk,
+                    verbose=self.cfg.verbose, host_budget_bytes=budget)
+                self.preconditioner_used = kind
+            except (PreconditionerBudgetError, torch.cuda.OutOfMemoryError) as exc:
+                # The preconditioner is a solver component: falling back to the
+                # diagonal one changes the iteration count, never A or b. The
+                # fallback is recorded in every trace row.
+                torch.cuda.empty_cache()
+                if self.cfg.verbose:
+                    print(f"     {kind} preconditioner does not fit ({str(exc)[:160]}); "
+                          "using diagonal for this step", flush=True)
+                M = operator.make_preconditioner("diagonal", damping)
+                self.preconditioner_used = f"diagonal (fallback from {kind})"
+            return _eliminated(operator, M)
         if self.cfg.preconditioner not in (None, "diagonal", "block12"):
             raise ValueError(f"preconditioner {self.cfg.preconditioner!r} needs "
                              "linear_backend='exact_cached_structured'")
@@ -451,6 +497,14 @@ class UnifiedFreeIEKS:
                 if reason:
                     status = str(reason)
                     break
+            # Drop the previous step's operator (and with it the previous
+            # state's frozen store and GPU buffers) BEFORE building the next
+            # one; holding both doubled host RAM and ran the GPU out.
+            operator = None
+            if self.cfg.linear_backend == "exact_cached_structured":
+                import gc
+                gc.collect()
+                torch.cuda.empty_cache()
             operator, _caches = self.build_system(current, damping)
             b = operator.rhs()
             grad_norm = float(b.norm())
@@ -631,6 +685,7 @@ class UnifiedFreeIEKS:
                       "decrement_ratio": decrement_ratio,
                       "decrement_threshold": max(
                           self.cfg.decrement_tol * objective_scale, noise_floor),
+                      "preconditioner_used": getattr(self, "preconditioner_used", None),
                       "objective_noise": objective_noise,
                       "certified": certified,
                       "gradient_decay_ratio": grad_norm / max(initial_grad, 1e-30),

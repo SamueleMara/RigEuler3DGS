@@ -190,8 +190,14 @@ class Source:
         if frame not in self.frames:
             return None
         k = self.frames.index(frame)
+        base = self.base
+        if torch.device(device).type == "cpu":
+            if getattr(self, "_base_cpu", None) is None:
+                from bidirectional_iekf.ieks import _on
+                self._base_cpu = _on(self.base, "cpu")
+            base = self._base_cpu
         return dataclasses.replace(
-            self.base, mu=self.mu[k].to(device).contiguous(),
+            base, mu=self.mu[k].to(device).contiguous(),
             R=self.R[k].to(device).contiguous(), v=self.v[k].to(device).contiguous(),
             omega=self.omega[k].to(device).contiguous())
 
@@ -502,9 +508,12 @@ def main() -> int:
             offsets[e] = torch.arange(start, start + groups[e].N)
             start += groups[e].N
         N = start
+        # The accelerated backend keeps the trajectory in host RAM and moves
+        # one frame to the GPU when it is rendered; legacy keeps it on device.
+        traj_device = "cpu" if args.linear_backend == "exact_cached_structured" else "cuda"
         states = []
         for f in window:
-            parts = [groups[e].state(f) for e in order]
+            parts = [groups[e].state(f, device=traj_device) for e in order]
             states.append(parts[0] if len(parts) == 1 else concat(*parts))
         warm = Trajectory(states=states, frame_ids=window, dt=dt)
 
@@ -588,11 +597,16 @@ def main() -> int:
         say(f"  {N} candidates; anchors " + ", ".join(
             f"{e} rows at original frame {groups[e].anchor_frame}" for e in order))
 
-        Q = make_process_noise(N, dt, cfg.process_noise_pos, cfg.process_noise_rot,
-                               cfg.process_noise_vel, cfg.process_noise_omega,
-                               device=states[0].mu.device, dtype=torch.float64)
-        Q_inv, _ = invert_blocks(Q.double())
-        del Q
+        # Every Gaussian has the same dt and the same densities, so Q is one
+        # 12x12 matrix. It is built and inverted ONCE on the host and broadcast
+        # (a stride-0 view): the same matrix the [N,12,12] construction gave,
+        # without 156 MB per copy on the GPU at foldchair's size.
+        Q1 = make_process_noise(1, dt, cfg.process_noise_pos, cfg.process_noise_rot,
+                                cfg.process_noise_vel, cfg.process_noise_omega,
+                                device="cpu", dtype=torch.float64)
+        Q1_inv, _ = invert_blocks(Q1.double())
+        Q_inv = Q1_inv.expand(N, 12, 12)
+        del Q1
 
         deadline = (time.time() + 60.0 * args.time_budget_min
                     if args.time_budget_min > 0 else None)
@@ -687,6 +701,8 @@ def main() -> int:
                                             if failure.startswith("CACHE_HOST")
                                             else "OOM"), "error": failure,
                                  "peak_gpu_mib": peak_gpu,
+                                 "accepted": len(accept_log),
+                                 "energy_final": (accept_log[-1] if accept_log else None),
                                  "best_accepted_dir": str(best_dir) if accept_log else None}
             say(f"  {failure}")
 

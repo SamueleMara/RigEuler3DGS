@@ -24,11 +24,12 @@ the step acceptance or any reported uncertainty.
 | per-(frame, camera) `IEKFLinearizationCache` + rendered depth/alpha/T/n_contrib + precisions | once per accepted state, on the GPU | ONE flat pageable host buffer per frame (`PackedFrame`), structure in a skeleton | a new accepted state (the store is keyed by the trajectory object, which changes only on acceptance) |
 | per-frame gradient `H^T W r` | same pass | host `[T][N,12]` float64 | same |
 | per-frame Fisher diagonal (and 6x6 pose blocks if a block preconditioner is selected) | same pass | host | same |
-| process coefficients (nonzero 3x3 blocks of the validated `A_proc`, `B_proc`; Q once if uniform) | once per accepted state | GPU if within `--gpu-workspace-budget-mib`, else host and staged per pair | same |
+| process coefficients (nonzero 3x3 blocks of the validated `A_proc`, `B_proc`; Q once if uniform) | once per accepted state | GPU if within `--gpu-workspace-budget-mib` AND 15% of the GPU memory free at build time, else host and staged per pair | same |
 | process RHS and LM diagonal contributions | same pass | host | same |
 | LM metric D (`curvature_scale`) | per operator | host | state; NOT lambda (lambda multiplies it) |
 | preconditioner factors | per outer iteration | host, GPU chunk by chunk | state OR lambda |
 | PCG vectors (x, r, z, p, Ap) | per solve | host (`solve_on_cpu`) | — |
+| the trajectory (mu, R, v, omega, appearance; every frame) | per accepted or trial state | host; one frame visits the GPU while it is rendered or differentiated | — |
 
 A rejected trial changes only lambda, so `build_system` reuses the frozen
 store and process coefficients and builds a new operator (new damping) and a
@@ -40,6 +41,21 @@ the PCG operators (JVP, precision, VJP) never read them. Everything they do
 read is copied bit for bit (`tests/test_exact_cached_structured_backend.py
 [2]`), including the integer `ranges` and the sorted `point_list`, with shared
 tensors (one `means3D` per frame for all cameras) kept shared.
+
+## Running beside other GPU jobs
+
+The overnight run failed on every scene with CUDA OOM after its first
+accepted step: the process coefficients became per-Gaussian (585 MB on
+washer) and were placed by a fixed budget, the previous operator was still
+alive during the rebuild, and the temporal preconditioner's GPU chunk was a
+fixed 2,048 Gaussians. Now placement and chunk size are taken from the memory
+actually free, the old operator is released before the new one is built, Q
+is one 12x12 broadcast, and the trajectory itself lives in host RAM (at
+foldchair's 135,694 Gaussians, 60 resident frames plus the line-search trial
+were 1.6 GB of the 2.35 GB left beside the other jobs). When the temporal
+factors do not fit the host budget next to the image cache, that step uses
+the diagonal preconditioner and records it in the trace. None of this
+changes A, b or the objective (test [11]).
 
 ## One operator application
 

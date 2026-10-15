@@ -47,7 +47,9 @@ def sha256_file(path) -> str:
 
 
 def render(state, cameras):
+    from bidirectional_iekf.ieks import _on
     from estimator.renderer_bridge import build_linearization
+    state = _on(state, cameras[0].viewmatrix.device)
     with torch.no_grad():
         lin = build_linearization(state, cameras)
     return [{"rgb": v.rgb.detach().float().cpu().clamp(0, 1).numpy(),
