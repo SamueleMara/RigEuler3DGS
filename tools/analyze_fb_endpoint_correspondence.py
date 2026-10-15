@@ -114,6 +114,26 @@ def write_csv(path: Path, rows: list):
             w.writerow({k: (json.dumps(v) if isinstance(v, (list, dict)) else v) for k, v in r.items()})
 
 
+def observed_names(row: dict) -> dict:
+    """Output naming only: a valid RECORDED depth pixel is 'observed_depth_valid'
+    (older outputs said 'gt_valid'; it was never ground truth)."""
+    out = {}
+    for k, v in row.items():
+        k2 = (k.replace("gt_valid", "observed_depth_valid").replace("gt_invalid", "observed_depth_invalid")
+               .replace("GT_INVALID", "OBSERVED_DEPTH_INVALID"))
+        out[k2] = observed_names(v) if isinstance(v, dict) else v
+    return out
+
+
+DATA_DICTIONARY = {
+    "sensor_observation_metric": "residuals/categories against the RECORDED RGB-D frames (rgb/, depth_npy/); "
+                                 "legal for inference. observed_depth_valid = the recorded depth has a return",
+    "inferred_joint_metric": "quantities of the ESTIMATED joints/poses from <d>_rigid; legal as evidence",
+    "gt_evaluation_metric": "dataset ground truth vs frozen predictions; EVALUATION ONLY, produced by "
+                            "tools/evaluate_fb_endpoint_correspondence_gt.py under evaluation_gt/",
+    "oracle_metric": "a GT metric that uses GT to resolve a convention; EVALUATION ONLY"}
+
+
 def jsonable(x):
     if isinstance(x, dict):
         return {str(k): jsonable(v) for k, v in x.items()}
@@ -483,7 +503,8 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
             imgs["B_RGB"] = vz._to_u8(Bn["rgb"].transpose(1, 2, 0))
             mdir = out / "pixel_maps" / frame_dir / cam
             for name, img in imgs.items():
-                vz.save_png(mdir / f"{name}.png", img)
+                safe_name = ("observed_" + name[3:] if name.upper().startswith("GT_") else name)
+                vz.save_png(mdir / f"{safe_name}.png", img)
             (mdir / "states.json").write_text(json.dumps({
                 "F": kf, "B": kb, "observation": {"A": "frame 0", "B": f"frame {T}",
                                                   "C": f"frame {T} depth on pixels unchanged since frame 0"}[ct],
@@ -522,8 +543,9 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     log(f"  endpoint pass: {n_renders} renders in {time.time() - t0:.0f} s; pairs "
         + ", ".join(f"{ct} {s['stored_pairs']:,} stored of {s['pair_records']:,} records"
                     for ct, s in pair_stats.items()))
-    write_csv(out / "endpoint_views.csv", view_rows)
-    write_csv(out / "depth_tolerance_sweep.csv", sweep)
+    write_csv(out / "endpoint_views.csv", [observed_names(r) for r in view_rows])
+    write_csv(out / "depth_tolerance_sweep.csv", [observed_names(r) for r in sweep])
+    (out / "data_dictionary.json").write_text(json.dumps(DATA_DICTIONARY, indent=1))
     endpoint = {"A": 0, "B": T}
     pos = {"F0": F.mu[0], "FT": F.mu[T], "B0": B.mu[0], "BT": B.mu[T]}
     scl = {"F": F.base.scales.max(1).values.cpu().numpy(), "B": B.base.scales.max(1).values.cpu().numpy()}
@@ -664,7 +686,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
             for cam in cams:
                 d_, v_ = gt_depth(cam, t_oth)
                 lab_ = ec.visibility_by_depth(specs[all_cams.index(cam)], pos[own_oth_key_][g], d_, v_, tol)
-                for k_ in set(lab_):
+                for k_ in sorted(set(lab_)):
                     vis_[k_] = vis_.get(k_, 0) + int((lab_ == k_).sum())
             nv_ = sum(vis_.values())
             dd_, _ = trees["F0" if o == "F" else "BT"].query(pos["F0" if s == "F" else "BT"][g], k=1)
@@ -708,7 +730,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                                    "bound of distinct witness pixels")
             if gi not in detailed:
                 base["detail"] = "SCREENED_ONLY (not in the top-N by U or top-N proposals)"
-                (cdir / f"{pid}.json").write_text(json.dumps(jsonable({"rows": g.tolist()} | base)))
+                (cdir / f"{pid}.json").write_text(json.dumps(jsonable(base | {"rows_list": g.tolist()})))
                 patch_out[s].append(base)
                 continue
             # witness pixels per camera
@@ -753,7 +775,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
             for cam in cams:
                 d_, v_ = gt_depth(cam, t_oth)
                 lab = ec.visibility_by_depth(specs[all_cams.index(cam)], pos[own_oth_key][g], d_, v_, tol)
-                for k_ in set(lab):
+                for k_ in sorted(set(lab)):
                     vis[k_] = vis.get(k_, 0) + int((lab == k_).sum())
             nv = sum(vis.values())
             unseen = (vis.get("OCCLUDED", 0) + vis.get("OUT_OF_VIEW", 0) + vis.get("GT_INVALID", 0)) / max(nv, 1)
@@ -1120,7 +1142,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                                                          "BOTH_COVER_DIFFERENT_DEPTH",
                                                          "BOTH_COVER_AGREE_OFF_OBSERVED_SURFACE",
                                                          "NEITHER_COVERS__on_gt_valid")} | {
-            "gt_valid_pixels": sum(r["gt_valid"] for r in rs)}
+            "observed_depth_valid_pixels": sum(r["gt_valid"] for r in rs)}
     labels, screened = {}, {}
     for s in ("B", "F"):
         for rec in patch_out[s]:
@@ -1162,7 +1184,9 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
         "SOURCE_IMMUTABILITY": "PASS" if not changed else f"FAIL {changed}",
         "STATE_MODE": F.state_mode}
     summary = {"scene": args.scene, "endpoints": [0, T], "cameras": cams, "rows": {"F": F.N, "B": B.N},
-               "flags": flags, "contrasts_pct_of_gt_valid": contrast_summary, "patch_labels": labels,
+               "flags": flags,
+               "contrasts_pct_of_observed_depth_valid": {k: observed_names(v) for k, v in contrast_summary.items()},
+               "patch_labels": labels,
                "screened_patch_labels_all_patches": screened,
                "static_patches": len(static_rows), "static_F_rows": int(cand.sum()),
                "accounting": acct, "pairs": pair_stats, "renderer_checks": worst_cons,
@@ -1185,7 +1209,8 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     imgs = [("endpoint comparisons", "endpoint_comparisons.png")] + [
         (r["patch_id"], r["case_study_png"].replace("visuals/", "")) for s in patch_out for r in patch_out[s]
         if r.get("case_study_png")]
-    tabs = {"contrasts (% of GT-valid pixels)": [{"contrast": k, **v} for k, v in contrast_summary.items()],
+    tabs = {"contrasts (% of pixels with a valid RECORDED depth)": [{"contrast": k, **observed_names(v)}
+                                                                   for k, v in contrast_summary.items()],
             "estimated joints": [{"direction": d, "status": e.status, "notes": "; ".join(e.notes)[:300],
                                   **({"max_owned_displacement_m": round(e.motion["max_owned_displacement_m"], 4),
                                       "max_rotation_rad": round(e.motion["max_rotation_rad"], 4),
@@ -1208,13 +1233,14 @@ def write_summary_md(out, S, patch_out, est, jprov):
          "> CENTER_ONLY_FIXED_ORIENTATION: transported states use trained orientations at every frame.\n",
          "## Report flags\n"]
     L += [f"* **{k}**: {v}" for k, v in S["flags"].items()]
-    L.append("\n## Endpoint contrasts (% of GT-valid pixels, all cameras)\n")
+    L.append("\n## Endpoint contrasts (% of pixels with a valid RECORDED depth, all cameras; sensor data, not GT)\n")
     keys = ["BOTH_VALID_SUPPORT", "F_SUPPORTED_B_UNEXPLAINED", "B_SUPPORTED_F_UNEXPLAINED",
             "NEITHER_VALID_SUPPORT", "BOTH_SAME_OBSERVED_SURFACE_CANDIDATE", "BOTH_COVER_DIFFERENT_DEPTH",
             "NEITHER_COVERS__on_gt_valid"]
+    keys = [observed_names({k: 0}).popitem()[0] for k in keys]
     L.append("| contrast | " + " | ".join(keys) + " |")
     L.append("|---|" + "---|" * len(keys))
-    for ct, v in S["contrasts_pct_of_gt_valid"].items():
+    for ct, v in S["contrasts_pct_of_observed_depth_valid"].items():
         L.append(f"| {ct} | " + " | ".join(str(v[k]) for k in keys) + " |")
     L.append("\nA = F0 vs B0 at frame 0; B = FT vs BT at frame T; C = F0 vs BT on pixels whose measured "
              "depth is unchanged between 0 and T; *_J1_<d> = the same with the transported source "
