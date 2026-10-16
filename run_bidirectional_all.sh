@@ -4,7 +4,8 @@
 #
 #   per scene:  static 30k initial + final
 #               Phase 1 + coherence, forward and backward
-#               rigid SE(3) Phase 2, forward and backward
+#               rigid SE(3) Phase 2 + joint identification, forward and backward
+#               Phase 3 joint-specific RGB-D IEKF (opt-in: add "phase3" to STAGES)
 #
 # Every stage is skipped when its output is already on disk, so the script is
 # re-runnable and an interrupted run resumes where it stopped. A stage that
@@ -14,7 +15,8 @@
 #
 #   bash run_bidirectional_all.sh                  # everything
 #   SCENES="washer_103776" bash run_bidirectional_all.sh
-#   STAGES="static" bash run_bidirectional_all.sh  # static | phase1 | phase2
+#   STAGES="static" bash run_bidirectional_all.sh  # static | phase1 | phase2 | phase3
+#   STAGES="phase3" bash run_bidirectional_all.sh  # Phase 3 on existing Phase-2 outputs
 #   DRY=1 bash run_bidirectional_all.sh            # print the commands only
 #
 set -u
@@ -37,6 +39,8 @@ IEKF_SN=${IEKF_SN:-64}      # Phase-1 IEKF grouped-state size -- NOT the graph.
                             # These were one flag once; 0 there means one group
                             # per Gaussian and Phase 1 slows ~60x.
 FOLDS=${FOLDS:-5}
+PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
+PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
 # FORCE=1 retrains/reruns even when the output exists. The final endpoint
 # models trained before the points3D_parts_final.ply lookup landed carry no
@@ -173,6 +177,39 @@ for S in $SCENES; do
         echo "    !! phase2/$DIR failed rc=$RC"
         tail -5 "$LOGS/${S}_phase2_${DIR}.log"
         STATUS+=("$S FAILED(phase2/$DIR)")
+      fi
+    done
+  fi
+
+  # ---- Phase 3: joint-specific RGB-D IEKF, both directions --------------
+  # Opt-in. Initialised from Phase 2's joint identification and support;
+  # both hypotheses are fitted, no type is chosen.
+  if has_stage phase3; then
+    for DIR in forward backward; do
+      [ "$DIR" = forward ] && END=initial || END=final
+      P2="$BIDI/${DIR}_rigid"
+      P3="$BIDI/${DIR}_joint"
+      if [ ! -f "$P2/support_coherence/support.json" ] || [ ! -d "$P2/joint_reduction" ]; then
+        echo "  [phase3/$DIR] no Phase-2 joint identification -- skipping"
+        STATUS+=("$S SKIPPED(phase3/$DIR, no phase2)"); continue
+      fi
+      if [ "$FORCE" != "1" ] && [ -f "$P3/summary.json" ]; then
+        echo "  [phase3/$DIR] present, reusing"; continue
+      fi
+      echo "  [phase3/$DIR]  $(date +%T)"
+      rm -rf "$P3"; mkdir -p "$P3"
+      run "$LOGS/${S}_phase3_${DIR}.log" \
+        "$PY" tools/run_joint_phase3.py \
+          --scene "$S" --direction "$DIR" \
+          --model "$OUT/static_bidi/$END" --source "$SRC" \
+          --phase2-dir "$P2" --frames "$FRAMES" --cameras "$CAMS" \
+          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu \
+          --evaluate-gt --out "$P3"
+      RC=$?
+      if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
+        echo "    !! phase3/$DIR failed rc=$RC"
+        tail -5 "$LOGS/${S}_phase3_${DIR}.log"
+        STATUS+=("$S FAILED(phase3/$DIR)")
       fi
     done
   fi
