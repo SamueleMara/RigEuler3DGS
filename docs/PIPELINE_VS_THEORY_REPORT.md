@@ -43,9 +43,11 @@ Items marked **(verified)** were re-read in the code for this report.
    * Phase 2's process prior is numerically inert.
    * Joint identification produces no P/R/unresolved decision.
    * Phase 3 was never run on bidirectional outputs, and could not be until today.
-4. **Phase 3 now runs, forward and backward** (`tools/run_joint_phase3.py`, §6). In its current
-   configuration it degrades the Phase-2 joint on fridge (axis 0.06° → 1.27°). It is not yet a stable
-   final stage. Until its prior is fixed, **the stable final joint is Phase 2's joint identification.**
+4. **Phase 3 now runs, forward and backward** (`tools/run_joint_phase3.py`, §6).
+   * As specified for this project, it keeps the joint type and geometry from joint identification
+     **fixed** and re-estimates only the per-frame displacement q_k (and q̇_k) on the RGB-D.
+   * On fridge it reproduces the Phase-2 track to within 0.006 rad. It does not improve it: angle MAE
+     0.0026 vs 0.0022 rad forward, 0.0073 vs 0.0071 rad backward.
 
 ## 2. Stage-by-stage conformance
 
@@ -119,17 +121,22 @@ Entry point: `joint_reduction/rigid_trajectory_reduction.reduce_trajectory`, cal
 | No double counting of the same pixels | ✅ | The reduction never renders |
 | Direction and endpoint-relative bookkeeping | 🟡 | θ is endpoint-relative (correct), but `trajectory.csv` labels processing indices as "frame", and Phase 2's inline GT check pairs processing-order θ with chronological GT. A sign-by-correlation step hides this |
 
-### Phase 3F/3B: joint-specific RGB-D IEKF (Sec. 8, 10.6)
+### Phase 3F/3B: per-frame joint displacement with the joint fixed (Sec. 8, 10.6)
+
+**Project choice.** Phase 3 must not change the joint type or geometry. That differs from the PDF's
+Sec. 8, where the geometry (e, a) is part of the Phase-3 state and is "corrected directly by the
+original RGB-D innovation". Here the state is (q_k, q̇_k) only, and the joint comes from
+identification.
 
 | Contract | Verdict | Where / note |
 |---|---|---|
-| P state (s, ṡ, e_P) and R state (θ, θ̇, e_R, a_R) with axial gauge | ✅ | `estimator/phase2_prismatic.py`, `phase2_revolute.py` (the PDF's "Phase 3" is the older code's "exact Phase 2") |
-| Transport including orientation; H3 with geometry columns | ✅ | Revolute rotates R; FD tests in `test_phase2_parallel_pr.py` cover centre columns only |
-| Process [[1,h],[0,1]], white acceleration, Q_ϑ = 0 | 🟡 | `joint_process.py:42-83`; h = 1 frame and σ = 1 hard-coded |
-| A defensible explicit prior | ❌ | diag(1) on every coordinate in mixed units (`phase2_model_comparison.py:53-56`) |
-| One filter per hypothesis; both reported | ✅ | |
-| Endpoint-relative anchor (backward) | ✅ **new** | `tools/run_joint_phase3.py` processes frames in Phase-2 order, so the backward anchor is the final model at frame T |
-| Initialised from joint identification and the frozen Phase-2 support | ✅ **new** | Before today, only `tools/run_complete_joint_debug.py` existed. It is forward-only, re-runs Phase 1 and ignores Phase 2 |
+| Joint type and geometry held exactly | ✅ **new** | `estimator/joint_displacement.DisplacementOnlyState`. The runner refuses to write unless the geometry is bitwise unchanged |
+| Moving Gaussians transported by the fixed joint, including orientation; statics rendered | ✅ | P: μ̄ + s e_P. R: a + Q(θ)(μ̄ − a), R = Q(θ)R̄ (`phase2_revolute.py:152-171`) |
+| H = q-column of H^G J_G; VJP the exact transpose | ✅ **new** | `tests/test_joint_phase3_runner.py` [4], on both models |
+| Process [[1,h],[0,1]], white acceleration on q̇ | 🟡 | `joint_process.py:42-83`; h = 1 frame, σ_q̈ = 1 by default (`--sigma-qddot`) |
+| Same iterated information update | 🟡 | `joint_iekf.run_window`; the acceptance and transport defects of §2 apply. Transport is trivial here (G = I) |
+| Endpoint-relative anchor (backward at T, final model) | ✅ **new** | Frames in Phase-2 processing order; q(anchor) = 0 |
+| Initialised from joint identification and the frozen Phase-2 support | ✅ **new** | Before this, only `tools/run_complete_joint_debug.py` existed. It is forward-only, re-runs Phase 1 and refits the geometry |
 
 ## 3. The deviations that matter most, ranked
 
@@ -156,9 +163,10 @@ Entry point: `joint_reduction/rigid_trajectory_reduction.reduce_trajectory`, cal
 5. **Centre-only Phase-1 export.**
    * Phase 2 needs only a Kabsch initial twist, so it copes.
    * The endpoint diagnostics and any warm start above about 0.8 rad cannot.
-6. **Phase 3 prior.** diag(1) in mixed units lets the first frames' innovations move the axis
-   geometry freely, after which the geometry covariance collapses (about 1e-10). This is the likely
-   reason for the smoke-run degradation in §6.
+6. **Phase 3 freely refitting the geometry was harmful.** A first version left the axis free with a
+   diag(1) prior in mixed units. It moved the fridge axis from 0.06° to 1.27° (axis point by 8.6 cm),
+   with the geometry covariance collapsing to about 1e-10. Holding the joint fixed, as the project
+   specifies, removes that failure mode.
 
 ## 4. Where our datasets fail
 
@@ -232,36 +240,41 @@ GT is used for scoring only. Sources:
 
 ## 6. Phase 3 status (new runner)
 
-`tools/run_joint_phase3.py`, and stage `phase3` of `run_bidirectional_all.sh`.
+`tools/run_joint_phase3.py`, and the opt-in stage `phase3` of `run_bidirectional_all.sh`.
 
 **What it does:**
 
 * Loads the direction's endpoint model and the RGB-D in Phase-2 processing order, so a backward run
   is anchored at original frame 59 with the final model.
-* Takes the frozen Phase-2 support.
-* Initialises P and R from `joint_reduction/`.
-* Runs the existing exact P/R joint IEKF once per hypothesis.
-* Writes `bidirectional/<dir>_joint/{summary.json, prismatic/, revolute/}`.
-* With `--evaluate-gt`, scores afterwards into `evaluation_gt/`.
+* Moves the frozen Phase-2 support by the **fixed** joint from `joint_reduction/<type>/geometry.json`.
+* Starts q from joint identification's track.
+* Runs the RGB-D IEKF on (q_k, q̇_k) only, for the type(s) given by `--hypotheses`.
+* Writes `bidirectional/<dir>_joint/`. With `--evaluate-gt`, scores afterwards into `evaluation_gt/`.
 
-Tests: `tests/test_joint_phase3_runner.py`, 6 checks covering initialisation, the window-length and
-direction refusals.
+Tests: `tests/test_joint_phase3_runner.py`, 12 checks:
 
-**Smoke results on fridge** (revolute, the GT type; scored afterwards):
+* initialisation;
+* window-length and direction refusals;
+* reduced H equals the q-column of the full model, and VJP is its transpose, for P and R;
+* retraction moves only q[k], and the geometry stays bitwise equal.
 
-| run | axis err | line dist | coord MAE |
-|---|---|---|---|
-| Phase-2 joint ID (init), F / B | 0.06° / 0.10° | 1.3 / 3.6 mm | 0.002 / 0.005 rad |
-| Phase 3, 2 cams, 1 iter, F / B | 1.15° / 0.56° | 0.4 / 15 mm | 0.004 / 0.048 rad |
-| Phase 3, 8 cams, 2 iters, F | 1.27° | 86 mm | 0.119 rad |
+**Smoke on fridge** (revolute = GT type, 8 cameras, 2 iterations per frame, about 0.9 min per
+direction; scored afterwards):
 
-The image energy decreases (1.0706e7 → 1.0616e7) while the joint moves away from GT. The axis-point
-covariance collapses to about 1e-10 within the window.
+| | forward | backward |
+|---|---|---|
+| geometry (fixed) axis / line error | 0.062° / 1.3 mm | 0.104° / 3.6 mm |
+| angle MAE: Phase-2 track → Phase 3 | 0.0022 → 0.0026 rad | 0.0071 → 0.0073 rad |
+| angle range: Phase 2 → Phase 3 (GT 1.772) | 1.779 → 1.778 | 1.760 → 1.759 |
+| largest change of q vs Phase 2 | 0.004 rad | 0.006 rad |
+| image energy | 7.225e6 → 7.140e6 | 9.774e6 → 9.713e6 |
 
-**Status: runnable in both directions, not yet an improvement over Phase 2.** The prime suspect is
-deviation 6 (diag(1) prior in mixed units, dt = 1 frame, σ = 1); the second is the
-acceptance/transport defects in `joint_iekf.py`. These should be fixed and re-validated on fridge
-before Phase 3 replaces the Phase-2 joint as the final output.
+**Reading.** With the joint fixed, Phase 3 is stable and endpoint-anchored in both directions. On a
+scene where Phase 2 is already accurate, re-fitting q on the RGB-D changes it by less than 0.006 rad
+and does not lower the GT error. It lowers the image energy, so the residual it removes is not joint
+error. Whether it helps where the Phase-2 track is noisier (laptop B, blade B) is untested.
+
+A first version that refitted the geometry is recorded in §3 item 6.
 
 ## 7. Recommendations, in order
 
@@ -284,7 +297,8 @@ before Phase 3 replaces the Phase-2 joint as the final output.
    * Re-run Phase 1 + support on oven, storage and washer forward first.
 4. **Fix Phase 2/3 process noise and priors together with the two `joint_iekf.py` defects.** Use
    physical dt, Q mapped through Ad/J_l, MAP-consistent acceptance, and the G⁻^T Λ G⁻¹ transport.
-   Then re-validate Phase 3 on fridge before trusting it.
+   Then run the fixed-joint Phase 3 on the scenes with noisier Phase-2 tracks (laptop B, blade B,
+   oven B) to see whether it earns its place.
 5. **Separate the GT-scoring process** from Phases 1–2: `inference_only=True` and evaluation
    afterwards, as the endpoint diagnosis already does.
 6. **Data.** For closed-start scenes, add views or frames that observe the moving link at the closed

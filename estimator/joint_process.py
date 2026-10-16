@@ -127,7 +127,10 @@ def apply_correction(state, frame: int, delta: Tensor,
         # Stage B: the physical model owns its own exact retraction and its
         # own basis-reset Jacobian.  Everything else here -- in particular the
         # covariance transport below -- is shared.
-        G = state.parts[0].reset_jacobian(d)
+        # A reduced state (e.g. displacement-only over a fixed joint) owns its
+        # reset; otherwise the part's full-state reset applies.
+        G = (state.reset_jacobian(d) if hasattr(state, "reset_jacobian")
+             else state.parts[0].reset_jacobian(d))
         state.retract_in_place(d, frame)
         if transport and state.covariance is not None:
             state.covariance = G @ state.covariance @ G.T

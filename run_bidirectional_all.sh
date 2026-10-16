@@ -5,7 +5,7 @@
 #   per scene:  static 30k initial + final
 #               Phase 1 + coherence, forward and backward
 #               rigid SE(3) Phase 2 + joint identification, forward and backward
-#               Phase 3 joint-specific RGB-D IEKF (opt-in: add "phase3" to STAGES)
+#               Phase 3 per-frame joint displacement, joint fixed (opt-in: "phase3" in STAGES)
 #
 # Every stage is skipped when its output is already on disk, so the script is
 # re-runnable and an interrupted run resumes where it stopped. A stage that
@@ -181,9 +181,9 @@ for S in $SCENES; do
     done
   fi
 
-  # ---- Phase 3: joint-specific RGB-D IEKF, both directions --------------
-  # Opt-in. Initialised from Phase 2's joint identification and support;
-  # both hypotheses are fitted, no type is chosen.
+  # ---- Phase 3: per-frame joint displacement, both directions -----------
+  # Opt-in. Joint type + geometry FIXED from Phase 2 joint identification;
+  # only the per-frame displacement q_k is re-estimated on the RGB-D.
   if has_stage phase3; then
     for DIR in forward backward; do
       [ "$DIR" = forward ] && END=initial || END=final

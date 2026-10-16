@@ -1,43 +1,37 @@
 #!/usr/bin/env python
-"""Phase 3: joint-specific RGB-D IEKF, forward OR backward, from Phase 2.
+"""Phase 3: per-frame joint displacement on the RGB-D, joint FIXED, F or B.
 
-The framework's Phase 3 (Bidirectional_Articulated_3DGS_IEKF_Final_Framework,
-section 8): one filter per joint hypothesis, on the ORIGINAL RGB-D and the
-same renderer, with state
+Joint identification (inside Phase 2) gives the joint type and its geometry:
+prismatic direction e_P, or revolute axis e_R with axis point a_R. Phase 3
+keeps them exactly as given and estimates, frame by frame, only the joint
+displacement and its rate
 
-    P:  (s_k, sdot_k, e_P)                     moving mu = mu_bar + s e_P
-    R:  (theta_k, thetadot_k, e_R, a_R)        mu = a + Q(theta)(mu_bar - a),
-                                               R = Q(theta) R_bar
+    x_k = (q_k, qdot_k)        q = s [m] (prismatic) or theta [rad] (revolute)
 
-and time-invariant geometry corrected directly by the image innovation.
+with an RGB-D IEKF on the original images and the same renderer: the moving
+Gaussians are transported by the fixed joint (mu = mu_bar + s e_P, or
+mu = a + Q(theta)(mu_bar - a), R = Q(theta) R_bar), the static ones stay in
+the render. The update is estimator/joint_iekf.run_window on
+estimator/joint_displacement.DisplacementOnlyState; the geometry is checked to
+be bitwise unchanged before anything is written.
 
-The filters are the existing exact P / R models (estimator/phase2_prismatic,
-phase2_revolute) driven by estimator/joint_iekf.run_window. What this runner
-adds is the bidirectional plumbing the legacy debug tool
-(tools/run_complete_joint_debug.py) never had:
+  * frames in PROCESSING order for --direction, as Phase 2 loads them, with
+    that direction's endpoint model: run_window pins its first frame (q = 0),
+    so a backward run is anchored at original frame T on the final model and
+    q is endpoint-relative;
+  * the moving set is the frozen Phase-2 support (support_coherence/support.json);
+  * q_k starts from joint identification's track (joint_reduction/<type>/
+    trajectory.csv), already in processing order and anchor-relative.
 
-  * the frames are loaded in PROCESSING order for --direction, exactly as
-    Phase 2 loads them, with the endpoint model of that direction. run_window
-    pins its first frame as the gauge (q = 0), so for a backward run the
-    canonical geometry is the FINAL endpoint at original frame T and the joint
-    coordinate is endpoint-relative (section 8.1) -- not frame 0 of a model
-    that was trained at T;
-  * the support is the frozen Phase-2 support (support_coherence/support.json),
-    not a re-run of Phase 1;
-  * both hypotheses are initialised from the joint identification that Phase 2
-    wrote (joint_reduction/{prismatic,revolute}/{geometry,trajectory}), which
-    is already in processing order and anchor-relative.
-
-Both hypotheses are fitted and reported; NO type is chosen (section 9: the
-fits are evidence, a lower residual alone is not a verdict). Inference never
-reads ground truth. --evaluate-gt scores the finished fits afterwards, into
+The joint type is an input (--hypotheses), never chosen or changed here. GT is
+never read during inference; --evaluate-gt scores the result afterwards into
 <out>/evaluation_gt/ only.
 
-    python tools/run_joint_phase3.py --scene fridge_10905 --direction backward \
-        --model <results>/fridge_10905/static_bidi/final \
-        --source <dataset>/fridge_10905 \
-        --phase2-dir <results>/fridge_10905/bidirectional/backward_rigid \
-        --frames 60 --cameras 8 --iters 5 --frames-on-cpu \
+    python tools/run_joint_phase3.py --scene fridge_10905 --direction backward \\
+        --model <results>/fridge_10905/static_bidi/final \\
+        --source <dataset>/fridge_10905 \\
+        --phase2-dir <results>/fridge_10905/bidirectional/backward_rigid \\
+        --hypotheses revolute --frames 60 --cameras 8 --iters 5 --frames-on-cpu \\
         --out <results>/fridge_10905/bidirectional/backward_joint
 """
 from __future__ import annotations
@@ -93,7 +87,10 @@ def parse_args(argv=None):
     ap.add_argument("--cg-iters", type=int, default=40)
     ap.add_argument("--sigma-qddot", type=float, default=1.0,
                     help="white-acceleration noise on the joint rate, per frame^2")
-    ap.add_argument("--hypotheses", default="prismatic,revolute")
+    ap.add_argument("--hypotheses", default="prismatic,revolute",
+                    help="joint type(s) to run, each with its FIXED joint-identification geometry")
+    ap.add_argument("--prior-q", type=float, default=1.0, help="prior sd of q at the anchor (m or rad)")
+    ap.add_argument("--prior-qdot", type=float, default=1.0, help="prior sd of qdot (per frame)")
     ap.add_argument("--frames-on-cpu", action="store_true")
     ap.add_argument("--evaluate-gt", action="store_true",
                     help="after the fits are written, score them against the dataset GT "
@@ -174,9 +171,11 @@ def evaluate_gt(out: Path, source: Path, frame_ids, fits: dict) -> dict:
         e = np.asarray(g.get("direction") or g.get("axis"), float)
         sgn = float(np.sign(e @ gt.joint["axis"])) or 1.0
         q = np.asarray(f["q"], float) * sgn
+        q0 = np.asarray(f["q_init"], float) * sgn
         r = {"hypothesis": name, "matches_gt_type": name == gt.joint["type"],
              "axis_angle_deg": G.line_angle_deg(e, gt.joint["axis"]),
              "coord_mae": float(np.abs(q - q_gt).mean()), "coord_max_abs": float(np.abs(q - q_gt).max()),
+             "coord_mae_phase2_init": float(np.abs(q0 - q_gt).mean()),
              "coord_range_est": float(q.max() - q.min()), "coord_range_gt": float(q_gt.max() - q_gt.min()),
              "coord_units": "m" if name == "prismatic" else "rad",
              "note": "coordinate compared only when the hypothesis matches the GT type"}
@@ -192,6 +191,7 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     from estimator.joint_iekf import JointIEKFConfig
     from estimator.model_error import estimate_model_error
+    from estimator.joint_displacement import DisplacementOnlyState, geometry_snapshot, geometry_unchanged
     from estimator.phase2_model_comparison import fit_model, prismatic_state, revolute_state
     from estimator.phase2_shared import effective_precision, render_state
     from estimator.renderer_bridge import build_linearization
@@ -264,8 +264,12 @@ def main(argv=None) -> int:
         if part is None:
             summary_h[name] = {"status": "NOT_FITTED", **init["notes"].get(name, {})}
             continue
-        state = prismatic_state(part) if name == "prismatic" else revolute_state(part)
+        full = prismatic_state(part) if name == "prismatic" else revolute_state(part)
+        # the joint type and geometry are FIXED: only (q_k, qdot_k) is estimated
+        state = DisplacementOnlyState(full, prior_scale=(args.prior_q ** 2, args.prior_qdot ** 2))
         g_init = geometry_of(name, state.parts[0])
+        g_snap = geometry_snapshot(state.parts[0])
+        q_init = (part.s if name == "prismatic" else part.theta).clone().tolist()
         ctr = {"t": 0}
 
         def lin(st, t, _ctr=ctr):
@@ -283,26 +287,30 @@ def main(argv=None) -> int:
         p = state.parts[0]
         q = (p.s if name == "prismatic" else p.theta).tolist()
         qd = (p.sdot if name == "prismatic" else p.thetadot).tolist()
-        g_fin = geometry_of(name, p)
+        if not geometry_unchanged(g_snap, p):
+            raise SystemExit(f"{name}: joint geometry changed during Phase 3 -- refusing to write")
         d = out / name
         d.mkdir(parents=True, exist_ok=True)
         with open(d / "trajectory.csv", "w", newline="") as fh:
             w = csv.writer(fh)
-            w.writerow(["processing_index", "original_frame", "q", "qdot", "energy_before",
-                        "energy_after", "iterations", "accepted"])
+            w.writerow(["processing_index", "original_frame", "q", "qdot", "q_phase2_init",
+                        "posterior_sd_q", "energy_before", "energy_after", "iterations", "accepted"])
             for k, r in enumerate(recs):
-                w.writerow([k, orig_frames[k], q[k], qd[k], r.energy_before, r.energy_after,
-                            r.iterations, r.accepted])
+                w.writerow([k, orig_frames[k], q[k], qd[k], q_init[k], float(r.posterior[0, 0]) ** 0.5,
+                            r.energy_before, r.energy_after, r.iterations, r.accepted])
         e_tot = float(sum(r.energy_after for r in recs))
-        fits[name] = {"q": q, "geometry": g_fin}
+        fits[name] = {"q": q, "q_init": q_init, "geometry": g_init}
         summary_h[name] = {
-            "status": "FITTED", "geometry_init": g_init, "geometry_final": g_fin,
+            "status": "FITTED", "joint_type": name, "geometry_fixed": g_init,
+            "geometry_unchanged_bitwise": True,
             "coordinate_units": "m" if name == "prismatic" else "rad",
             "coordinate_range": float(max(q) - min(q)),
             "energy_total_after": e_tot,
             "energy_total_before": float(sum(r.energy_before for r in recs)),
             "frames_with_accepted_steps": int(sum(r.accepted > 0 for r in recs)),
-            "posterior_geometry_covariance_diag_last": torch.diag(recs[-1].posterior)[2:].tolist(),
+            "coordinate_range_phase2_init": float(max(q_init) - min(q_init)),
+            "max_abs_change_from_phase2_q": float(max(abs(a - b) for a, b in zip(q, q_init))),
+            "posterior_sd_q_last": float(recs[-1].posterior[0, 0]) ** 0.5,
             "seconds": round(time.time() - t0, 1), **init["notes"].get(name, {})}
         _json(d / "geometry.json", summary_h[name])
         print(f"    {name}: energy {summary_h[name]['energy_total_before']:.4e} -> {e_tot:.4e}, "
@@ -311,22 +319,22 @@ def main(argv=None) -> int:
 
     fitted = {k: v for k, v in summary_h.items() if v.get("status") == "FITTED"}
     summary = {
-        "scene": args.scene, "direction": args.direction, "stage": "phase3_joint_specific_rgbd_iekf",
+        "scene": args.scene, "direction": args.direction, "stage": "phase3_joint_displacement_rgbd_iekf",
+        "estimated": "q_k and qdot_k per frame only; joint type and geometry fixed from joint identification",
         "canonical_model": str(model), "canonical_original_frame": orig_frames[0],
         "frame_order": "processing (backward = T..0); q is relative to the canonical frame",
         "original_frames_processing_order": orig_frames,
         "support": {"file": str(p2 / "support_coherence" / "support.json"), "members": int(members.numel())},
         "config": {"iters": args.iters, "cg_iters": args.cg_iters, "sigma_qddot_per_frame2": args.sigma_qddot,
                    "dt": "1 frame", "cameras": ncam, "frames": T,
-                   "prior": "diag(1) on every error coordinate (estimator/phase2_model_comparison.py)"},
+                   "prior_sd": {"q": args.prior_q, "qdot": args.prior_qdot}},
         "hypotheses": summary_h,
         "energy_difference_P_minus_R": (fitted["prismatic"]["energy_total_after"]
                                         - fitted["revolute"]["energy_total_after"])
         if {"prismatic", "revolute"} <= set(fitted) else None,
-        "decided_type": "UNDECIDED",
-        "decision_note": ("both hypotheses are fitted on the same RGB-D; no type is chosen here. "
-                          "Compare geometry plausibility (axis radius / part scale) and held-out "
-                          "evidence, not the raw energy alone (framework sec. 7, 9)"),
+        "joint_types_run": [k for k in fitted],
+        "type_note": ("the type is an input (--hypotheses), never changed here; with both, each "
+                      "hypothesis keeps its own fixed joint-identification geometry"),
         "gt_used_in_inference": False,
         "runtime_s": round(time.time() - t_start, 1)}
     _json(out / "summary.json", summary)
@@ -336,7 +344,8 @@ def main(argv=None) -> int:
         for name, x in r.get("fits", {}).items():
             print(f"  [GT eval] {name}: axis {x['axis_angle_deg']:.3f} deg"
                   + (f", line {x['line_distance_m']:.4f} m" if "line_distance_m" in x else "")
-                  + (f", coord MAE {x['coord_mae']:.4f} {x['coord_units']}" if x["matches_gt_type"] else ""))
+                  + (f", coord MAE {x['coord_mae']:.4f} {x['coord_units']} (Phase-2 track "
+                     f"{x['coord_mae_phase2_init']:.4f})" if x["matches_gt_type"] else ""))
     return 0
 
 

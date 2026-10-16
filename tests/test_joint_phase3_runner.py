@@ -70,6 +70,38 @@ def main() -> int:
         except SystemExit as e:
             check("[3] a backward support with --direction forward is refused",
                   "not --direction forward" in str(e), str(e)[:100])
+    print("\n[4] the joint is fixed: only (q, qdot) is estimated")
+    from estimator.joint_displacement import DisplacementOnlyState, geometry_snapshot, geometry_unchanged
+    from estimator.joint_process import apply_correction
+    from estimator.phase2_model_comparison import prismatic_state, revolute_state
+    g = torch.Generator().manual_seed(0)
+    X = torch.randn((300, 3), generator=g, dtype=torch.float64) * 0.2
+    mem = torch.arange(0, 300, 2)
+    for name, part in (("revolute", R), ("prismatic", P)):
+        part = type(part).__new__(type(part)); part.__dict__.update(
+            (init["parts"][name]).__dict__)
+        part.members = mem
+        full = (revolute_state if name == "revolute" else prismatic_state)(part)
+        st = DisplacementOnlyState(full)
+        snap = geometry_snapshot(part)
+        k = 7
+        d2 = torch.tensor([0.013, -0.002], dtype=torch.float64)
+        dfull = torch.zeros(full.error_dim, dtype=torch.float64)
+        dfull[:2] = d2
+        Jr, Jf = st.jvp(k, d2, X), full.jvp(k, dfull, X)
+        check(f"[4] {name}: H of the reduced state is the q-column of the full joint model",
+              torch.allclose(Jr, Jf, atol=0, rtol=0) and float(Jr.abs().max()) > 0)
+        a = torch.randn((300, 6), generator=g, dtype=torch.float64)
+        lhs = float((Jr * a).sum())
+        rhs = float((st.vjp(k, a, X) * d2).sum())
+        check(f"[4] {name}: reduced VJP is the transpose (<Jd,a> = <d,J^T a>)",
+              abs(lhs - rhs) <= 1e-10 * max(1.0, abs(lhs)), f"{lhs:.6e} vs {rhs:.6e}")
+        q_before = part.q.clone()
+        apply_correction(st, k, torch.tensor([0.05, 0.01], dtype=torch.float64))
+        dq = part.q - q_before
+        check(f"[4] {name}: a retraction moves q[k] only and leaves the geometry bitwise unchanged",
+              abs(float(dq[k]) - 0.05) < 1e-15 and float(dq.abs().sum() - abs(dq[k])) == 0.0
+              and geometry_unchanged(snap, part) and st.covariance.shape == (2, 2))
     print()
     if FAILURES:
         print(f"{len(FAILURES)} of {CHECKS} checks FAILED")

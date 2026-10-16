@@ -15,7 +15,7 @@ static 3DGS at t=0 (initial) and t=T (final)
 | Static endpoints | 3DGS at the first and last frame (RGB + metric depth) | `train.py` |
 | Phase 1 + support | free per-Gaussian motion (IEKF); static / moving-rigid support from trajectory coherence | `tools/run_motion_coherence_support.py` |
 | Phase 2 + joint identification | rigid SE(3) pose of the moving part per frame (RGB-D IEKF); prismatic and revolute joint fits from those poses | `tools/run_rigid_se3_pipeline.py` |
-| Phase 3 | joint-specific RGB-D IEKF, one filter per hypothesis (P: s, e; R: θ, e, a) | `tools/run_joint_phase3.py` |
+| Phase 3 | per-frame joint displacement q_k (and q̇_k) by RGB-D IEKF; joint type and geometry fixed from joint identification | `tools/run_joint_phase3.py` |
 
 Theory: `assets/Bidirectional_Articulated_3DGS_IEKF_Final_Framework.pdf`.
 
@@ -30,9 +30,10 @@ merged: each gives its own estimate.
 > * Static, Phase 1, Phase 2 and joint identification are the stable pipeline. They produced
 >   `results_11_10_26/ours/<scene>/bidirectional/` (tag `bidirectional-batch-2026-10-12`), and the
 >   joint is correct in 16 of 20 scene×direction runs.
-> * Phase 3 runs in both directions but does not yet improve on the Phase-2 joint (see the report,
->   §6). **Use Phase 2's `joint_reduction/` as the final joint until Phase 3 is re-validated.**
-> * No stage chooses the joint type. Both P and R are reported, and `decided_type` is `UNDECIDED`.
+> * Phase 3 keeps the identified joint fixed and refines only the per-frame displacement. On fridge
+>   it reproduces the Phase-2 track to within 0.006 rad (report, §6).
+> * No stage chooses the joint type. Joint identification reports both P and R; give Phase 3 the type
+>   to run with `--hypotheses`.
 
 ---
 
@@ -66,15 +67,77 @@ Each scene directory (one PartNet-Mobility episode, 8 static cameras, 60 frames)
   metadata/, pointcloud/                GT: used ONLY for evaluation
 ```
 
-The paths used throughout (substitute yours):
+### 2.1 Set the input and output roots (copy and edit this block first)
+
+**Input** (`DATA`, passed to the batch script as `SRC_ROOT`): the **parent directory containing all scene folders**, not the folder for one scene and not the repository path. For example, the loader expects `$DATA/washer_103776/rgb/`, `$DATA/washer_103776/depth_npy/`, `$DATA/washer_103776/colmap/` and `$DATA/washer_103776/colmap_final/`.
+
+**Output** (`RES`, passed as `OUT_ROOT`): the **parent directory where per-scene results should be written**. The runner creates/uses `$RES/<scene>/`. It does not require the output root to be inside the dataset or repository. To reuse previously trained static models, point `RES` at the existing result root; selecting a new empty root requires the `static` stage before motion estimation.
+
+Run the following in **the same terminal** in which you will run the pipeline:
 
 ```bash
+cd /home/samuelemara/Joint3DGS/RigEuler3DGS
+conda activate rigeuler3dgs
+
+# INPUT: directory whose immediate children are scene names.
 DATA="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear"
+
+# OUTPUT: directory whose immediate children will be scene names.
 RES="/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours"
+
+# Python executable used by the per-stage commands below.
+PY="/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python"
+
+# Example single scene and its fully resolved paths.
+S="washer_103776"
+SRC="$DATA/$S"               # input for this scene
+OUT="$RES/$S"                # output for this scene
+BIDI="$OUT/bidirectional"   # Phase 1/2/3 output for this scene
+
+# Check the input before launching a GPU job.
+if test -d "$SRC/colmap/sparse/0" && test -d "$SRC/colmap_final/sparse/0" \
+    && test -d "$SRC/rgb" && test -d "$SRC/depth_npy"; then
+  echo "Input layout OK: $SRC"
+else
+  echo "ERROR: missing required input directories under $SRC; do not start the run." >&2
+fi
+
+printf 'INPUT ROOT : %s\nINPUT SCENE: %s\nOUTPUT ROOT: %s\nOUTPUT SCENE: %s\n' \
+  "$DATA" "$SRC" "$RES" "$OUT"
 ```
 
-The scenes are: `USB_100109 stapler_103111 blade_103706 fridge_10905 storage_45135 laptop_10211
-oven_101917 scissor_11100 foldchair_102255 washer_103776`.
+**Spaces in paths are supported when you keep the double quotes.** Do not write an unquoted path such as `/media/samuelemara/Extreme SSD/...` in a shell command: Bash would treat it as multiple arguments. The variables are shell-local and remain defined in that terminal; opening a new terminal requires setting them again (or sourcing a configuration file you created).
+
+The scene names used in the original dataset are: `USB_100109 stapler_103111 blade_103706 fridge_10905 storage_45135 laptop_10211 oven_101917 scissor_11100 foldchair_102255 washer_103776`.
+
+### 2.2 How path arguments map to scripts
+
+| Interface | Input location | Output location | What is appended automatically? |
+|---|---|---|---|
+| **All-scenes driver** `run_bidirectional_all.sh` | `SRC_ROOT="$DATA"` | `OUT_ROOT="$RES"` | `/<scene>` for each selected scene |
+| **Phase 1 CLI** `run_motion_coherence_support.py` | `--source "$SRC"`, `--model "$OUT/static_bidi/initial"` (F) or `--model "$OUT/static_bidi/final"` (B) | `--out "$BIDI/forward"` or `.../backward` | No scene folder added to `--out` |
+| **Phase 2 CLI** `run_rigid_se3_pipeline.py` | `--source "$SRC"`, `--model ...`, plus saved support/centers | `--out "$BIDI/forward_rigid"` or `.../backward_rigid` | No scene folder added |
+| **Phase 3 CLI** `run_joint_phase3.py` | `--source "$SRC"`, `--model ...`, `--phase2-dir ...` | `--out "$BIDI/forward_joint"` or `.../backward_joint` | No scene folder added |
+| **Optional endpoint diagnostic** `run_fb_endpoint_correspondence_all.sh` | `--dataset-root "$DATA"` | `--results-root "$RES"` | Uses each scene's result tree; diagnostic tag determines subdirectory |
+
+There are **no** documented `--input`/`--output` options for the main all-scenes driver; configure its roots with the **environment variables** `SRC_ROOT` and `OUT_ROOT`. The individual Python tools instead use explicit `--source`, `--model`, and `--out` flags.
+
+For reference, a completed Washer run under the example `RES` root is organised as follows:
+
+```text
+$RES/washer_103776/
+  static_bidi/
+    initial/                  # trained at frame 0
+    final/                    # trained at frame T
+  bidirectional/
+    forward/                  # Phase 1F + support
+    backward/                 # Phase 1B + support
+    forward_rigid/            # Phase 2F + joint identification
+    backward_rigid/           # Phase 2B + joint identification
+    forward_joint/            # Phase 3F
+    backward_joint/           # Phase 3B
+  endpoint_correspondence/   # optional separate diagnostic, if run
+```
 
 ## 3. Full pipeline, all scenes, one command
 
@@ -84,19 +147,52 @@ oven_101917 scissor_11100 foldchair_102255 washer_103776`.
 * A failed stage is recorded and the batch moves on.
 * `DRY=1` prints the commands without running them.
 
+The commands below assume you already executed **Section 2.1** to define `DATA` and `RES` in this shell. You can select a different input dataset or output drive by changing **only those two variables**.
+
+**First run, new output directory** (train endpoint models and run the complete pipeline):
+
 ```bash
 cd /home/samuelemara/Joint3DGS/RigEuler3DGS
 
-# everything: static endpoints, Phase 1 + support, Phase 2 + joint ID, Phase 3 -- forward and backward
-SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
+# Inspect the actual command paths without running anything.
+DRY=1 SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" \
+  bash run_bidirectional_all.sh
 
-# the stable part only (the default STAGES)
-SRC_ROOT="$DATA" OUT_ROOT="$RES" bash run_bidirectional_all.sh
-
-# one scene, one stage, or a dry run
-SCENES="fridge_10905" SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="phase3" bash run_bidirectional_all.sh
-DRY=1 SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
+# After checking the paths, run all four stages in both directions.
+SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" \
+  bash run_bidirectional_all.sh
 ```
+
+**Existing output root with previously trained static models** (run/resume the documented stable stages):
+
+```bash
+SRC_ROOT="$DATA" OUT_ROOT="$RES" bash run_bidirectional_all.sh
+```
+
+**Only one scene**, for example Washer, including all stages:
+
+```bash
+SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
+  STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
+```
+
+**Only Phase 3 for an already processed scene** (requires that scene's Phase 2 outputs under `RES`):
+
+```bash
+SCENES="fridge_10905" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
+  STAGES="phase3" bash run_bidirectional_all.sh
+```
+
+**Custom paths** are passed the same way (these are examples, not additional fixed paths):
+
+```bash
+DATA="/path/to/datasets/parent_directory"
+RES="/path/to/output/parent_directory"
+DRY=1 SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
+  STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
+```
+
+Do not set `SRC_ROOT` to `$DATA/washer_103776` when running `SCENES="washer_103776"`: the driver already appends the scene name. Likewise, `OUT_ROOT` must be `$RES`, not `$RES/washer_103776`. The quoted assignments preserve path segments such as `Extreme SSD`.
 
 Defaults:
 
@@ -113,16 +209,24 @@ training runs.
 
 ## 4. Stage by stage, one scene, forward and backward
 
-The commands below are exactly what the driver runs. In them:
-
-* `S` is the scene;
-* `SRC="$DATA/$S"` is its dataset directory;
-* `OUT="$RES/$S"` is its results directory;
-* `BIDI="$OUT/bidirectional"` is where the dynamic stages write.
+The individual commands below bypass the all-scenes driver and let you set the **exact scene input and output directory**. They use the variables from Section 2.1. To switch to a different scene, recompute all three dependent paths:
 
 ```bash
-S=fridge_10905; SRC="$DATA/$S"; OUT="$RES/$S"; BIDI="$OUT/bidirectional"
+S="fridge_10905"
+SRC="$DATA/$S"              # exact input scene directory, used by --source
+OUT="$RES/$S"               # exact output scene directory
+BIDI="$OUT/bidirectional"  # exact dynamic-results directory
+
+# Alternatively, for manual per-stage commands ONLY, SRC and OUT may be
+# unrelated full paths, without following a shared parent/scene layout:
+# SRC="/another/disk/input/my_scene"
+# OUT="/another/disk/output/experiment_a"
+# BIDI="$OUT/bidirectional"
 ```
+
+The `--model` flag points to an **existing trained static 3DGS directory** under `OUT/static_bidi/`, whereas `--source` points to the **RGB-D scene directory** under `SRC`. `--out` points to the **exact desired directory** for that stage; the Python tools do not infer the output root from `--source`. The static training step writes the models with `train.py -s <input COLMAP directory> -m <output model directory>`.
+
+The lines in Sections 4.1–4.4 use `$PY`; define it as shown in Section 2.1 before running the individual commands.
 
 ### 4.1 Static endpoints (initial = frame 0, final = frame T)
 
@@ -190,10 +294,19 @@ Output, in `$BIDI/<dir>_rigid/`:
 * `summary.json`: includes Phase 2's own GT check.
 * `html/`: the debug pages.
 
-### 4.4 Phase 3 (joint-specific RGB-D IEKF)
+### 4.4 Phase 3 (per-frame joint displacement, joint fixed)
 
-Initialised from 4.3's support and joint identification. Both hypotheses are fitted, and backward is
-anchored at frame T with the final model.
+Phase 3 **does not change the joint**:
+
+* The type and the geometry (prismatic direction, or revolute axis and axis point) are taken from
+  4.3's `joint_reduction/` and held fixed. A run checks that they are bitwise unchanged before it
+  writes anything.
+* It re-estimates only the displacement q_k (and its rate) frame by frame on the RGB-D. It starts
+  from joint identification's q track, moves the support Gaussians by the fixed joint, and keeps the
+  static ones in the render.
+* Choose the type with `--hypotheses revolute` or `--hypotheses prismatic`. The default runs both,
+  each with its own fixed geometry.
+* Backward is anchored at frame T with the final model.
 
 ```bash
 $PY tools/run_joint_phase3.py --scene "$S" --direction forward \
@@ -211,21 +324,26 @@ $PY tools/run_joint_phase3.py --scene "$S" --direction backward \
 
 Output, in `$BIDI/<dir>_joint/`:
 
-* `summary.json`: per hypothesis, the initial and final geometry, coordinate range, energies, and
-  `decided_type: UNDECIDED`.
-* `{prismatic,revolute}/geometry.json`.
-* `{prismatic,revolute}/trajectory.csv`: processing index, original frame, q, q̇, energy per frame.
+* `summary.json`: per type, the fixed geometry (`geometry_unchanged_bitwise`), the q range against
+  joint identification's, the largest change in q, and energies.
+* `{prismatic,revolute}/geometry.json`: the same per type.
+* `{prismatic,revolute}/trajectory.csv`: processing index, original frame, q, q̇, the Phase-2 q,
+  posterior sd of q, and energy per frame.
 * `evaluation_gt/phase3_gt_evaluation.json`: only with `--evaluate-gt`, written after inference.
 
-About 2 min per hypothesis per direction at 8 cameras and 2 iterations/frame on fridge (25k
-Gaussians); scale linearly with `--iters`.
+About 1 min per type per direction at 8 cameras and 2 iterations/frame on fridge (25k Gaussians);
+scale linearly with `--iters`. A run reading from the external SSD has occasionally stalled for tens
+of minutes on I/O, so re-run it if that happens.
 
 The window must be the full sequence, `--frames 60`. A shorter backward window would not be anchored
 at frame T, and the runner refuses it.
 
 ## 5. Reading the results
 
-* **Final joint (stable):** `$BIDI/<dir>_rigid/joint_reduction/`.
+* **Final joint:**
+  * Type and geometry: `$BIDI/<dir>_rigid/joint_reduction/<type>/geometry.json`.
+  * Displacement per frame: `$BIDI/<dir>_joint/<type>/trajectory.csv` (Phase 3), or
+    `joint_reduction/<type>/trajectory.csv` if Phase 3 was not run.
   * Both P and R are reported; nothing chooses the type.
   * Prefer the hypothesis with order-1 `axis_radius_over_part_scale` and the much lower pose
     residual. For prismatic parts the energy margin is small (1.15–2.8), so treat type as uncertain.
@@ -244,11 +362,15 @@ at frame T, and the runner refuses it.
 ## 6. Evaluation (GT is never read during inference)
 
 ```bash
-# Phase 3, if not run with --evaluate-gt: re-run with it (inference outputs are identical)
-# Endpoint correspondence diagnosis + GT evaluation (optional, all scenes)
-bash scripts/run_fb_endpoint_correspondence_all.sh --results-root "$RES" --dataset-root "$DATA" \
-    --tag endpoint_eval_v4 --estimated-joints auto --evaluate-gt --execute --gpu-memory-fraction 0.2
+# Uses the SAME input and output roots configured in Section 2.1.
+# Optional endpoint correspondence diagnosis + post-run GT evaluation (all scenes):
+bash scripts/run_fb_endpoint_correspondence_all.sh \
+    --dataset-root "$DATA" --results-root "$RES" \
+    --tag endpoint_eval_v4 --estimated-joints auto \
+    --evaluate-gt --execute --gpu-memory-fraction 0.2
 ```
+
+This auxiliary script uses **command-line options** `--dataset-root` and `--results-root`, unlike the main `run_bidirectional_all.sh` driver, which uses `SRC_ROOT`/`OUT_ROOT` environment variables. Its outputs appear under `$RES/<scene>/endpoint_correspondence/<tag>/` and in the batch summary directory, rather than under `$BIDI`.
 
 Phase 2 writes its own `joint_reduction/gt_evaluation.json` after fitting. The GT scores per run
 (support precision and recall, axis and line error, coordinate and pose error) are in
@@ -261,7 +383,7 @@ $PY tests/test_rigid_se3_phase2.py              # Phase 2: Jacobians, adjoint, t
 $PY tests/test_iekf_process_covariance.py       # Phase 1: left-SO(3) process Jacobians, Q
 $PY tests/test_motion_coherence_support.py      # support
 $PY tests/test_phase2_parallel_pr.py            # P/R joint models (Phase 3 kinematics, FD)
-$PY tests/test_joint_phase3_runner.py           # Phase 3 runner: initialisation, direction/window refusals
+$PY tests/test_joint_phase3_runner.py           # Phase 3: init, refusals, fixed joint (H = q-column, geometry bitwise)
 $PY tests/test_fb_covariance_transport.py       # endpoint transport and ownership
 ```
 
@@ -279,7 +401,6 @@ The full list, with file:line references, is in `docs/PIPELINE_VS_THEORY_REPORT.
   * Closed-start forward runs (oven, storage, washer) produce a confident wrong support.
 * **Phase 2 and Phase 3:**
   * The process noise is in per-frame units with σ = 1, which makes the prior inert.
-  * Phase 3's diag(1) prior lets the axis drift.
   * Two update defects in `estimator/joint_iekf.py` are latent: acceptance is likelihood-only, and
     the information transport has its sides swapped.
 * **No type decision, no "unresolved" output** on the standard path.
