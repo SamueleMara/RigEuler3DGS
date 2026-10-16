@@ -319,6 +319,14 @@ def support_metrics(F: Frozen, gt: G.GroundTruth, tols) -> tuple[list, dict]:
             p = np.zeros(n, bool)
             p[np.asarray(j.get("members", []), dtype=np.int64)] = True
             preds[(s, "rigid_phase2_support_members")] = (p, "moving")
+        jo = F.diag / "j1_ownership.npz"
+        if jo.is_file():        # J1 ownership tested by the diagnosis on the recorded RGB-D
+            z = np.load(jo)
+            for jd in ("forward", "backward"):
+                if f"{jd}__{s}" in z.files:
+                    p = np.zeros(n, bool)
+                    p[z[f"{jd}__{s}"]] = True
+                    preds[(s, f"j1_tested_ownership_{jd}_joint")] = (p, "moving")
         p = np.zeros(n, bool)
         for st in F.statics():
             rr = st["F_rows"] if s == "F" else st["B_rows"]

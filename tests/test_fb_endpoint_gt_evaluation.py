@@ -185,7 +185,11 @@ def t8_real_smoke():
           and tree_hashes(V2) == before, json.dumps(rep.get("metrics_available")))
     r = subprocess.run([PY, str(REPO / "tools/evaluate_fb_endpoint_correspondence_gt.py"), "--diagnosis-dir", str(V2),
                         "--dataset-dir", str(DATA / SCENE), "--resume"], capture_output=True, text=True)
-    check("[8] evaluation on the existing result completes (or is reused)", r.returncode == 0, r.stdout[-200:])
+    # an evaluation made by an older evaluator is refused by --resume (fingerprint
+    # changed) and kept intact; superseding it on real results is the user's call
+    refused_old = r.returncode != 0 and "evaluator changed" in r.stdout and "nothing deleted" in r.stdout
+    check("[8] evaluation on the existing result completes, is reused, or (older evaluator) is refused intact",
+          r.returncode == 0 or refused_old, r.stdout[-200:])
     after = tree_hashes(V2)
     check("[8] every original file of the diagnosis is unchanged", after == before, f"{len(before)} files")
     S = json.loads((V2 / "evaluation_gt" / "gt_evaluation_summary.json").read_text())

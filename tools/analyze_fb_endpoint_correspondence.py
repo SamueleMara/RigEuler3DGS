@@ -288,6 +288,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     import torch
     from observation_diagnostics import endpoint_compare as ec
     from observation_diagnostics import endpoint_visuals as ev
+    ev.set_transport_mode(args.transport_orientation)
     from observation_diagnostics import gaussian_evidence as ge
     from observation_diagnostics import pair_evidence as pv
     from observation_diagnostics import pixel_evidence as pe
@@ -354,24 +355,91 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     if args.estimated_joints == "require" and not usable:
         raise SystemExit("--estimated-joints require: no USABLE estimate: " + json.dumps(
             {d: [e.status] + e.notes for d, e in est.items()}))
+    # ---- covariance-consistent free transport (J0) --------------------------
+    rot_mode = args.transport_orientation
+    Rtrack, track_stats = {}, {}
+
+    def rot_track(src, f):
+        """Local rigid rotation of src's free track from its anchor to frame f."""
+        k = (src.key, f)
+        if k not in Rtrack:
+            if rot_mode == "fixed" or f == src.anchor:
+                Rtrack[k] = None
+            else:
+                R_, res_, deg_, nonr_ = ec.track_rotations(src.mu[src.anchor], src.mu[f])
+                ang = np.degrees(np.arccos(np.clip((np.trace(R_, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+                turned = ~(deg_ | nonr_)
+                Rtrack[k] = R_
+                track_stats[f"{src.key}:{src.anchor}->{f}"] = {
+                    "turned_fraction": float(turned.mean()),
+                    "track_not_locally_rigid_fraction": float(nonr_.mean()),
+                    "degenerate_fraction": float(deg_.mean()),
+                    "median_rotation_deg_turned": float(np.median(ang[turned])) if turned.any() else None,
+                    "p90_rotation_deg_turned": float(np.percentile(ang[turned], 90)) if turned.any() else None,
+                    "median_fit_residual_m": float(np.median(res_))}
+                log(f"  J0 orientation {src.key} {src.anchor}->{f}: {turned.mean():.1%} of rows turned by a "
+                    f"locally rigid track; {nonr_.mean():.1%} torn (trained orientation kept)")
+        return Rtrack[k]
+
+    def state_at(src, f):
+        """src at original frame f: its anchor as trained, otherwise the free
+        Phase-1 transport with orientations turned by the track (unless fixed)."""
+        return ec.transported_state(src, f, rot_track(src, f))
+    gt_cache = {}
+
+    def gt_at(cam, f):
+        k = (cam, f)
+        if k not in gt_cache:
+            spec_ = specs[all_cams.index(cam)]
+            gt_cache[k] = dict(zip(("rgb", "depth", "valid"),
+                                   load_gt(P["data"], cam, f, spec_.image_height, spec_.image_width)[:3]))
+        return gt_cache[k]
+
+    # ---- J1: estimated part motion, ownership tested against the RGB-D -------
     J1 = {}
     for d, e in usable.items():
-        if d == "backward":
-            owned_B = e.members
-            part0 = apply(e.transform(T, 0), B.mu[T][owned_B])
-            r_own = max(2.0 * float(np.median(B.base.scales.max(1).values.cpu().numpy()[owned_B])), 0.01)
-            owned_F = ec.infer_ownership(F.mu[0], part0, r_own)
-            J1[d] = {"owned_B": owned_B, "owned_F": owned_F, "own_source": "B",
-                     "B0_J": (T, owned_B, e.transform(T, 0)), "FT_J": (0, owned_F, e.transform(0, T)),
-                     "ownership_radius_m": r_own}
-        else:
-            owned_F = e.members
-            partT = apply(e.transform(0, T), F.mu[0][owned_F])
-            r_own = max(2.0 * float(np.median(F.base.scales.max(1).values.cpu().numpy()[owned_F])), 0.01)
-            owned_B = ec.infer_ownership(B.mu[T], partT, r_own)
-            J1[d] = {"owned_B": owned_B, "owned_F": owned_F, "own_source": "F",
-                     "B0_J": (T, owned_B, e.transform(T, 0)), "FT_J": (0, owned_F, e.transform(0, T)),
-                     "ownership_radius_m": r_own}
+        own_src, oth_src = (B, F) if d == "backward" else (F, B)
+        ta, tx = own_src.anchor, oth_src.anchor          # the two endpoints
+        M_own = e.transform(ta, tx)                      # moves owned geometry ta -> tx
+        M_oth = e.transform(tx, ta)                      # moves the other source's part tx -> ta
+        members = e.members
+        sc_own = own_src.base.scales.max(1).values.cpu().numpy()
+        r_own = max(2.0 * float(np.median(sc_own[members])), 0.01)
+        # owner source: every row tested at tx; rows near the support also by rendering
+        cand_own = np.union1d(members, ec.infer_ownership(own_src.mu[ta], own_src.mu[ta][members], r_own))
+        own_res = ec.tested_ownership(own_src, ta, tx, M_own, cams, specs, all_cams,
+                                      lambda cam: gt_at(cam, tx), th, cand_own, prior_owned=members,
+                                      min_cameras=RULES["MIN_WITNESS_CAMERAS"])
+        # other source: every row tested at ta; rows near the estimated part also by rendering
+        part_at_tx = apply(M_own, own_src.mu[ta][members])
+        cand_oth = ec.infer_ownership(oth_src.mu[tx], part_at_tx, 3.0 * r_own)
+        oth_res = ec.tested_ownership(oth_src, tx, ta, M_oth, cams, specs, all_cams,
+                                      lambda cam: gt_at(cam, ta), th, cand_oth, prior_owned=None,
+                                      track_xyz=oth_src.mu[ta], min_cameras=RULES["MIN_WITNESS_CAMERAS"])
+        # wall-clock timings go to the log only, so the provenance stays reproducible
+        t_fs = own_res["reasons"].pop("seconds_freespace") + oth_res["reasons"].pop("seconds_freespace")
+        t_rt = own_res["reasons"].pop("seconds_render_test") + oth_res["reasons"].pop("seconds_render_test")
+        prox_oth = ec.infer_ownership(oth_src.mu[tx], part_at_tx, r_own)
+        owned = {own_src.key: own_res["owned"], oth_src.key: oth_res["owned"]}
+        J1[d] = {"owned_B": owned["B"], "owned_F": owned["F"], "own_source": own_src.key,
+                 "B0_J": (T, owned["B"], e.transform(T, 0)), "FT_J": (0, owned["F"], e.transform(0, T)),
+                 "ownership_radius_m": r_own,
+                 "ownership": {own_src.key: {"source_role": "estimator's own source", "estimator_support": int(members.size),
+                                             "candidates": own_res["candidates"], **own_res["reasons"],
+                                             "rule": own_res.get("rule")},
+                               oth_src.key: {"source_role": "other source (inferred)", "candidates": oth_res["candidates"],
+                                             "previous_proximity_rule_would_own": int(prox_oth.size), **oth_res["reasons"],
+                                             "rule": oth_res.get("rule")}}}
+        n_r = 4 * len(cams)
+        ro, rt = own_res["reasons"], oth_res["reasons"]
+        log(f"  J1[{d}] ownership tested on the RGB-D ({n_r} renders + free-space): {own_src.key} owns "
+            f"{ro['final_owned']} (support {members.size}: +{ro['added_beyond_estimator_support']} "
+            f"-{ro['estimator_support_dropped']}); {oth_src.key} owns {rt['final_owned']} "
+            f"(free-space {rt['freespace_moved']}, proximity alone would own {prox_oth.size}); "
+            f"{t_fs:.0f} s free-space, {t_rt:.0f} s render test")
+    if J1:      # the tested ownership sets themselves, for the separate GT evaluator
+        np.savez_compressed(out / "j1_ownership.npz",
+                            **{f"{d}__{k}": j[f"owned_{k}"].astype(np.int64) for d, j in J1.items() for k in ("F", "B")})
     jprov = {"estimates": {d: e.describe() for d, e in est.items()},
              "cross_direction": (cross_direction(est["forward"], est["backward"])
                                  if len(est) == 2 else None),
@@ -380,11 +448,16 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                                                           else j["owned_F"]).size),
                              "owned_rows_inferred_in_other_source": int((j["owned_F"] if j["own_source"] == "B"
                                                                          else j["owned_B"]).size),
-                             "inferred_ownership_rule": f"within {j['ownership_radius_m']:.4f} m of the "
-                                                        "estimated part at the other source's anchor frame "
-                                                        "(low confidence)",
-                             "transport": "T_part(t) T_part(t_ref)^-1 on positions and orientations; "
-                                          "scales/opacity/colour unchanged; unowned rows static"}
+                             "ownership": j["ownership"],
+                             "inferred_ownership_rule": "both sources: every row's centre tested against the "
+                                                        "recorded depth at the other endpoint, static vs moved "
+                                                        "(free-space test, net >= MIN_WITNESS_CAMERAS); rows "
+                                                        "it leaves open by the render test near the part, "
+                                                        "then the estimator support (owner) or the free "
+                                                        "track (other source)",
+                             "transport": "covariance-consistent: X <- R X + t and R_gauss <- R_part R_gauss "
+                                          "(T_part(t) T_part(t_ref)^-1); scales/opacity/colour unchanged; "
+                                          "unowned rows static"}
                          for d, j in J1.items()},
              "j1_status": ("AVAILABLE" if J1 else
                            "JOINT_ESTIMATE_UNAVAILABLE" if not est else
@@ -394,7 +467,17 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     log(f"  sources F {F.N}, B {B.N} rows, endpoints 0 and {T}, cameras {cams}; J1: {jprov['j1_status']}"
         + (f" ({list(J1)})" if J1 else ""))
     # ---- per-camera endpoint renders ---------------------------------------
-    stF0, stB0, stFT, stBT = F.state(0), B.state(0), F.state(T), B.state(T)
+    from estimator.renderer_bridge import build_linearization
+    stF0, stB0, stFT, stBT = F.state(0), state_at(B, 0), state_at(F, T), B.state(T)
+    stB0_fixed, stFT_fixed = (B.state(0), F.state(T)) if rot_mode != "fixed" else (None, None)
+    jprov["transport_orientation"] = {"mode": rot_mode, "track_rotation_stats": track_stats,
+                                      "method": ("free Phase-1 centres; orientation turned by a local rigid "
+                                                 "(Kabsch) fit of each row's 16 nearest neighbours' track "
+                                                 "(R_gauss <- R_track R_gauss) where that neighbourhood moved "
+                                                 "rigidly (rms residual <= 0.25 x its rms extent); torn or "
+                                                 "collinear neighbourhoods keep the trained orientation") if rot_mode != "fixed" else
+                                      "trained orientation kept (centres only)"}
+    (out / "joint_estimate_provenance.json").write_text(json.dumps(jsonable(jprov), indent=1))
     stJ = {}
     for d, j in J1.items():
         stJ[d] = {"FT_J": ec.j1_state(F, j["FT_J"][0], j["FT_J"][1], j["FT_J"][2]),
@@ -402,7 +485,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
     acc = {k: ge.new_frame_accumulator(F.N if k[1] == "F" else B.N, "cuda")
            for k in ("AF", "AB", "BF", "BB", "CF", "CB")}
     pair_views = {"A": [], "B": [], "C": []}
-    per_cam, view_rows, cons_all, sweep = {}, [], {}, []
+    per_cam, view_rows, cons_all, sweep, orient_rows = {}, [], {}, [], []
     drange = None
     budget_free = None
     if args.gpu_memory_fraction:
@@ -425,6 +508,21 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
         n_renders += 4
         for k, v in V.items():
             cons_all[f"{k}/{cam}"] = ec.conservation(v)
+        if stFT_fixed is not None:      # what turning the splats changes, against the recorded RGB-D
+            for nm, st_t, st_f, g_, f_ in (("FT", stFT, stFT_fixed, gT, T), ("B0", stB0, stB0_fixed, g0, 0)):
+                for mode_, d_ in (("track_kabsch", V[nm].d),
+                                  ("fixed", build_linearization(st_f, [spec]).views[0])):
+                    d_ = d_ if isinstance(d_, dict) else {"rgb": d_.rgb, "depth": d_.depth, "alpha": d_.alpha}
+                    m_ = g_["valid"] & (d_["alpha"] >= th.alpha_cover)
+                    dz = (d_["depth"] - g_["depth"]).abs()[m_]
+                    orient_rows.append({"state": nm, "frame": f_, "camera": cam, "orientation": mode_,
+                                        "covered_valid_px": int(m_.sum()),
+                                        "rgb_rmse": float(((d_["rgb"] - g_["rgb"]) ** 2)[..., m_].mean().sqrt())
+                                        if m_.any() else float("nan"),
+                                        "depth_mae_m": float(dz.mean()) if m_.any() else float("nan"),
+                                        "depth_within_tol_frac": float((dz <= th.depth_tol_m).float().mean())
+                                        if m_.any() else float("nan")})
+                n_renders += 1
         gS = ec.static_observation(g0, gT, th.depth_tol_m)
         fields = {"A": pe.classify(V["F0"].d, V["B0"].d, g0, th),
                   "B": pe.classify(V["FT"].d, V["BT"].d, gT, th),
@@ -545,6 +643,8 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                     for ct, s in pair_stats.items()))
     write_csv(out / "endpoint_views.csv", [observed_names(r) for r in view_rows])
     write_csv(out / "depth_tolerance_sweep.csv", [observed_names(r) for r in sweep])
+    if orient_rows:
+        write_csv(out / "transport_orientation_effect.csv", orient_rows)
     (out / "data_dictionary.json").write_text(json.dumps(DATA_DICTIONARY, indent=1))
     endpoint = {"A": 0, "B": T}
     pos = {"F0": F.mu[0], "FT": F.mu[T], "B0": B.mu[0], "BT": B.mu[T]}
@@ -926,7 +1026,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                     specs[all_cams.index(c)], src.mu[f][g], *gt_depth(c, f), tol) == "AT_OBSERVED_DEPTH").sum()))[:2]
                 for cam in best:
                     spec = specs[all_cams.index(cam)]
-                    v = build_linearization(src.state(f), [spec]).views[0]
+                    v = build_linearization(state_at(src, f), [spec]).views[0]
                     from observation_diagnostics.renderer_access import pixel_contributions
                     cn = to_np_contrib(pixel_contributions(v.cache))
                     d_, v_ = gt_depth(cam, f)
@@ -992,8 +1092,8 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
                 anch_s = pos["BT"] if s == "B" else pos["F0"]
                 dd, nn = cKDTree(anch_o).query(anch_s[rec["_rows"]], k=1)
                 partners = np.unique(nn[dd <= r_match]).tolist()
-            v_s = ec.render(ty["own"], src.state(t_end), spec, t_end, cam)
-            v_o = ec.render(ty["fail"], oth.state(t_end), spec, t_end, cam)
+            v_s = ec.render(ty["own"], state_at(src, t_end), spec, t_end, cam)
+            v_o = ec.render(ty["fail"], state_at(oth, t_end), spec, t_end, cam)
             region = torch.as_tensor(rec["_mass_maps"][cam] > 0, device="cuda")
             g_ = per_cam[cam]["g0"] if t_end == 0 else per_cam[cam]["gT"]
             probe = ec.sensitivity_alignment(v_s, rec["_rows"], v_o, partners, region,
@@ -1030,7 +1130,7 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
             if occ and occ.get("chosen_frames"):
                 inter = []
                 for f in occ["chosen_frames"][:4]:
-                    v = build_linearization(src.state(f), [spec]).views[0]
+                    v = build_linearization(state_at(src, f), [spec]).views[0]
                     d_, v_ = gt_depth(cam, f)
                     inter.append((f"*{s} track, frame {f}", ev.crop(vz.depth_rgb(v.depth.cpu().numpy(),
                                                                                v.alpha.cpu().numpy() > 0.05, drange), box)))
@@ -1182,7 +1282,8 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
         "JOINT_AIDED_DIAGNOSIS": ("J1 compared for every detailed patch" if J1 else jprov["j1_status"]),
         "GT_FIREWALL": "PASS: no forbidden file opened" if not fwr["refused"] else f"REFUSED {fwr['refused']}",
         "SOURCE_IMMUTABILITY": "PASS" if not changed else f"FAIL {changed}",
-        "STATE_MODE": F.state_mode}
+        "STATE_MODE": ("CENTRES_FROM_PHASE1_TRACK + ORIENTATION_FROM_LOCAL_TRACK_ROTATION"
+                       if rot_mode != "fixed" else F.state_mode)}
     summary = {"scene": args.scene, "endpoints": [0, T], "cameras": cams, "rows": {"F": F.N, "B": B.N},
                "flags": flags,
                "contrasts_pct_of_observed_depth_valid": {k: observed_names(v) for k, v in contrast_summary.items()},
@@ -1230,7 +1331,10 @@ def execute(args, P, pf, out: Path, log: Log) -> int:
 
 def write_summary_md(out, S, patch_out, est, jprov):
     L = [f"# {S['scene']}: endpoint correspondence and complementarity (read only)\n",
-         "> CENTER_ONLY_FIXED_ORIENTATION: transported states use trained orientations at every frame.\n",
+         ("> CENTER_ONLY_FIXED_ORIENTATION: transported states use trained orientations at every frame.\n"
+          if jprov.get("transport_orientation", {}).get("mode") == "fixed" else
+          "> TRACK_ROTATION_ORIENTATION: free-transport states turn each splat by its local track rotation; "
+          "J1 states by the estimated part rotation (covariance-consistent).\n"),
          "## Report flags\n"]
     L += [f"* **{k}**: {v}" for k, v in S["flags"].items()]
     L.append("\n## Endpoint contrasts (% of pixels with a valid RECORDED depth, all cameras; sensor data, not GT)\n")
@@ -1294,6 +1398,9 @@ def main() -> int:
     mode.add_argument("--execute", action="store_true")
     ap.add_argument("--resume", action="store_true",
                     help="reuse a COMPLETE experiment with the same fingerprint; refuse a different one")
+    ap.add_argument("--transport-orientation", choices=("track_kabsch", "fixed"), default="track_kabsch",
+                    help="J0 free transport: turn each splat with the local rigid rotation of its "
+                         "track (covariance-consistent, default) or keep the trained orientation")
     ap.add_argument("--gpu-memory-fraction", type=float, default=None,
                     help="cap this process's GPU memory (shared GPU)")
     args = ap.parse_args()
@@ -1321,6 +1428,7 @@ def main() -> int:
         return 2
     # fingerprint and resume
     fp_payload = {"scene": args.scene, "cameras": cams, "estimated_joints": args.estimated_joints,
+                  "transport_orientation": args.transport_orientation,
                   "code": code_hash(), "rules": RULES,
                   "inputs": {k: [pf[f"source_{k}"]["ply"], pf[f"source_{k}"]["rows"]] for k in ("F", "B")},
                   "joint_files": {d: e.get("files") for d, e in pf["estimated_joints"].items()}}

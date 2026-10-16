@@ -19,6 +19,16 @@ WARN = ("CENTER_ONLY_FIXED_ORIENTATION: the historical Phase-1 runs saved centre
         "Transported states (B0, FT) use each Gaussian's TRAINED orientation at every frame; "
         "anisotropic footprints of rotating parts are wrong away from their anchor, which can "
         "create or hide apparent mismatches.")
+WARN_FIXED = WARN
+WARN_TURNED = ("TRACK_ROTATION_ORIENTATION: the historical Phase-1 runs saved centres only. Transported "
+               "states (B0, FT) turn each Gaussian by the local rigid rotation of its neighbours' track "
+               "(covariance-consistent R S S^T R^T); J1 states turn owned rows by the estimated part rotation.")
+
+
+def set_transport_mode(mode: str):
+    """Caption every sheet with the orientation rule the transported states actually used."""
+    global WARN
+    WARN = WARN_FIXED if mode == "fixed" else WARN_TURNED
 
 
 def _np(x):

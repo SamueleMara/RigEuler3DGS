@@ -507,3 +507,223 @@ def static_candidates(keys, O_surf, dist3d_surf, q2F, q2B, NB, NF, supported_F, 
     tier[world & ~both_static] = "STATIC_WORLD_MATCH_TRACK_DISAGREES"
     return {"best_B": best, "rho": best_rho, "dist": best_dist, "world": world,
             "full": world & both_static, "tier": tier, "rho_all": rho}
+
+
+# ---------------------------------------------------------------------------
+# covariance-consistent transport and observation-tested ownership
+# ---------------------------------------------------------------------------
+
+def track_rotations(mu_from: np.ndarray, mu_to: np.ndarray, k: int = 16, min_ratio: float = 1e-3,
+                    max_rel_residual: float = 0.25):
+    """Per-row rotation of the free Phase-1 track between two frames, from a
+    local rigid (Kabsch) fit of the row's k nearest neighbours at `mu_from`.
+
+    The historical tracks saved centres only; this recovers how each local
+    neighbourhood turned, so a transported splat can turn with it
+    (R <- R_track R) instead of keeping its trained orientation. GT-free.
+    Returns (R [N,3,3], rms residual [N] in metres, degenerate [N] bool,
+    nonrigid [N] bool). A neighbourhood whose spread is (nearly) collinear cannot
+    fix a rotation, and one the track tore apart (rms residual above
+    `max_rel_residual` x the neighbourhood's rms extent) has no rotation to
+    recover: both keep the identity (the trained orientation). The free tracks
+    tear most neighbourhoods on real scenes (scissor: median residual 2.8 x the
+    extent), where an unconditioned Kabsch fit returns arbitrary rotations."""
+    from scipy.spatial import cKDTree
+    N = mu_from.shape[0]
+    kk = min(k, N)
+    _d, nb = cKDTree(mu_from).query(mu_from, k=kk)
+    P = mu_from[nb].astype(np.float64)
+    Q = mu_to[nb].astype(np.float64)
+    P = P - P.mean(1, keepdims=True)
+    Q = Q - Q.mean(1, keepdims=True)
+    H = np.einsum("nki,nkj->nij", P, Q)
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(np.einsum("nji,nkj->nik", Vt, U)))
+    D = np.zeros((N, 3, 3))
+    D[:, 0, 0] = 1
+    D[:, 1, 1] = 1
+    D[:, 2, 2] = d
+    R = np.einsum("nji,njk,nlk->nil", Vt, D, U)          # V D U^T
+    res = np.sqrt(((np.einsum("nij,nkj->nki", R, P) - Q) ** 2).sum(-1).mean(-1))
+    sv = np.linalg.svd(P, compute_uv=False)               # spread of the neighbourhood
+    degenerate = sv[:, 1] < min_ratio * np.maximum(sv[:, 0], 1e-12)
+    extent = np.sqrt((P ** 2).sum(-1).mean(-1))
+    nonrigid = ~degenerate & (res > max_rel_residual * np.maximum(extent, 1e-12))
+    R[degenerate | nonrigid] = np.eye(3)
+    return R, res, degenerate, nonrigid
+
+
+def transported_state(src, frame: int, R_track: np.ndarray | None):
+    """The free Phase-1 transport of `src` to `frame`: centres from the track,
+    orientations turned by the track's local rotation when given."""
+    if R_track is None:
+        return src.state(frame)
+    R = torch.as_tensor(R_track, dtype=src.base.R.dtype, device=src.base.R.device) @ src.base.R
+    return src.state(frame, R=R)
+
+
+def single_source_fields(view_d: dict, gt: dict, th) -> dict:
+    """The fields gaussian_evidence.accumulate reads, for ONE source against the
+    observation (key 'F'): S_d = valid, covered, |D - D_obs| <= depth_tol."""
+    v = gt["valid"]
+    S = v & (view_d["alpha"] >= th.alpha_cover) & ((view_d["depth"] - gt["depth"]).abs() <= th.depth_tol_m)
+    z = torch.zeros_like(view_d["depth"])
+    return {"valid": v, "SdF": S, "W_Fonly": torch.zeros_like(S), "improve_F": z}
+
+
+def observation_ownership(src, anchor_frame: int, other_frame: int, candidates: np.ndarray,
+                          T_motion: np.ndarray, cams, specs, all_cams, gt_at, th,
+                          prior_owned: np.ndarray | None = None, track_xyz: np.ndarray | None = None,
+                          margin: float = 0.5, track_margin_m: float = 0.01,
+                          context_owned: np.ndarray | None = None) -> dict:
+    """Which candidate rows move with the ESTIMATED part, decided by the recorded
+    RGB-D at the other endpoint (GT-free).
+
+    Two renders of `src` per camera at `other_frame`: every candidate left at its
+    anchor pose (static hypothesis), and every candidate moved by T_motion with
+    its orientation turned (part hypothesis); all other rows at the anchor in
+    both. A row's depth-compatible supported mass (gaussian_evidence) in each
+    gives delta = moved - static (pixel-weight units, summed over cameras):
+      delta >= +margin  -> OWNED (observation)
+      delta <= -margin  -> STATIC (observation)
+      otherwise         -> undecided: the estimator's own support if given
+                           (prior_owned), else the row's free track if it is
+                           closer to the moved than to the static position by
+                           track_margin_m, else STATIC.
+    """
+    from . import gaussian_evidence as ge
+    cand = np.unique(np.asarray(candidates, dtype=np.int64))
+    ctx = np.empty(0, np.int64) if context_owned is None else np.unique(np.asarray(context_owned, np.int64))
+    cand = np.setdiff1d(cand, ctx)
+    out = {"candidates": int(cand.size)}
+    if cand.size == 0:
+        out |= {"owned": np.empty(0, np.int64), "reasons": {}, "delta": np.empty(0), "cand": cand}
+        return out
+    # rows already known to move (context) move in both hypotheses
+    st_static = j1_state(src, anchor_frame, ctx, T_motion) if ctx.size else src.state(anchor_frame)
+    st_moved = j1_state(src, anchor_frame, np.union1d(ctx, cand), T_motion)
+    acc = {k: ge.new_frame_accumulator(src.N, "cuda") for k in ("static", "moved")}
+    for cam in cams:
+        ci = all_cams.index(cam)
+        spec = specs[ci]
+        gt = gt_at(cam)
+        for k, st in (("static", st_static), ("moved", st_moved)):
+            v = render(k, st, spec, other_frame, cam)
+            f = single_source_fields(v.d, gt, th)
+            ge.accumulate(acc[k], v.contrib, v.lin.cache.depth, f, gt["depth"], "F", ci,
+                          th.contrib_depth_tol_m)
+            del v
+    sup = {k: a["mass_supported"].double().cpu().numpy() for k, a in acc.items()}
+    delta = (sup["moved"] - sup["static"])[cand]
+    owned = cand[delta >= margin]
+    static = cand[delta <= -margin]
+    und = cand[(delta > -margin) & (delta < margin)]
+    reasons = {"observation_owned": int(owned.size), "observation_static": int(static.size),
+               "undecided": int(und.size)}
+    extra = np.empty(0, np.int64)
+    if und.size:
+        if prior_owned is not None:
+            extra = und[np.isin(und, prior_owned)]
+            reasons["undecided_kept_by_estimator_support"] = int(extra.size)
+            und = und[~np.isin(und, prior_owned)]
+        if track_xyz is not None and und.size:
+            X0 = src.mu[anchor_frame][und].astype(np.float64)
+            Xm = X0 @ T_motion[:3, :3].T + T_motion[:3, 3]
+            Xt = track_xyz[und].astype(np.float64)
+            closer = np.linalg.norm(Xt - Xm, axis=1) + track_margin_m < np.linalg.norm(Xt - X0, axis=1)
+            extra = np.concatenate([extra, und[closer]])
+            reasons["undecided_owned_by_free_track"] = int(closer.sum())
+    final = np.unique(np.concatenate([owned, extra])).astype(np.int64)
+    reasons["final_owned"] = int(final.size)
+    out |= {"owned": final, "reasons": reasons, "delta": delta, "cand": cand,
+            "rule": (f"two renders per camera at frame {other_frame}; owned if moving the row with the "
+                     f"estimated part raises its depth-compatible supported mass by >= {margin}, static if "
+                     f"it lowers it by >= {margin}; undecided rows: estimator support, then free track "
+                     f"(closer to the moved position by {track_margin_m} m), else static")}
+    return out
+
+
+def freespace_ownership(xyz_static: np.ndarray, xyz_moved: np.ndarray, cams, specs, all_cams, gt_at,
+                        tol: float, min_cameras: int = 2) -> dict:
+    """Per-row test of the static and the part hypotheses against the recorded
+    depth at the other endpoint (GT-free, every row, no rendering).
+
+    Each hypothesis' centre is projected into every camera: AT_OBSERVED_DEPTH
+    supports it, BEHIND_GAP (the observed surface lies behind the centre, so the
+    centre floats in observed free space) contradicts it, occluded / invalid /
+    out of view says nothing. score = #support - #contradiction over cameras;
+    delta = score_moved - score_static. delta >= min_cameras -> moves with the
+    part, <= -min_cameras -> static, else undecided. This reaches rows the
+    estimator's support missed, which the render test (candidates near the
+    support) cannot."""
+    s_st = np.zeros(len(xyz_static), np.int32)
+    s_mv = np.zeros(len(xyz_static), np.int32)
+    for cam in cams:
+        spec = specs[all_cams.index(cam)]
+        g = gt_at(cam)
+        d_np, v_np = g["depth"].cpu().numpy(), g["valid"].cpu().numpy()
+        for xyz, acc in ((xyz_static, s_st), (xyz_moved, s_mv)):
+            vis = visibility_by_depth(spec, xyz, d_np, v_np, tol)
+            acc += (vis == "AT_OBSERVED_DEPTH").astype(np.int32) - (vis == "BEHIND_GAP").astype(np.int32)
+    delta = s_mv - s_st
+    return {"delta": delta, "moved": delta >= min_cameras, "static": delta <= -min_cameras,
+            "score_static": s_st, "score_moved": s_mv}
+
+
+def tested_ownership(src, anchor_frame: int, other_frame: int, T_motion: np.ndarray, cams, specs, all_cams,
+                     gt_at, th, render_candidates: np.ndarray, prior_owned: np.ndarray | None = None,
+                     track_xyz: np.ndarray | None = None, min_cameras: int = 2) -> dict:
+    """Ownership of every row of `src` by the estimated part motion, tested on the
+    recorded RGB-D at `other_frame` (GT-free):
+      1. free-space test of every row's centre, static vs moved (net >= min_cameras);
+      2. rows it leaves open: the render test over `render_candidates` (rows near
+         the estimated part), which weighs footprint and opacity;
+      3. still open: the estimator's support (prior_owned) or the free track.
+    Variants that gate the free-space test on splat size, vote among neighbours,
+    or render-test every open row in context were tried on scissor, blade and
+    laptop and were worse in total (docs/FB_ENDPOINT_COVARIANCE_AND_OWNERSHIP.md)."""
+    import time
+    t0 = time.time()
+    x0 = src.mu[anchor_frame]
+    x1 = x0 @ T_motion[:3, :3].T + T_motion[:3, 3]
+    fs = freespace_ownership(x0, x1, cams, specs, all_cams, gt_at, th.depth_tol_m, min_cameras)
+    t1 = time.time()
+    open_rows = np.intersect1d(np.flatnonzero(~(fs["moved"] | fs["static"])), render_candidates)
+    rr = observation_ownership(src, anchor_frame, other_frame, open_rows, T_motion, cams, specs,
+                               all_cams, gt_at, th, prior_owned=None, track_xyz=None)
+    t2 = time.time()
+    N = len(x0)
+    own = fs["moved"].copy()
+    decided = fs["moved"] | fs["static"]
+    r_dec = np.zeros(N, bool)
+    r_own = np.zeros(N, bool)
+    if len(rr.get("cand", [])):
+        r_own[rr["owned"]] = True
+        r_dec[rr["owned"]] = True
+        r_dec[rr["cand"][rr["delta"] <= -0.5]] = True
+    use_r = ~decided & r_dec
+    own[use_r] = r_own[use_r]
+    rest = ~decided & ~r_dec
+    prior = np.zeros(N, bool)
+    if prior_owned is not None:
+        prior[prior_owned] = True
+    by_prior = rest & prior
+    own[by_prior] = True
+    by_track = np.zeros(N, bool)
+    if track_xyz is not None:
+        closer = np.linalg.norm(track_xyz - x1, axis=1) + 0.01 < np.linalg.norm(track_xyz - x0, axis=1)
+        by_track = rest & ~prior & closer
+        own[by_track] = True
+    reasons = {"rows": int(N), "freespace_moved": int(fs["moved"].sum()), "freespace_static": int(fs["static"].sum()),
+               "render_tested": int(open_rows.size), "render_decided": int(use_r.sum()),
+               "render_owned": int((use_r & own).sum()),
+               "undecided_kept_by_estimator_support": int(by_prior.sum()),
+               "undecided_owned_by_free_track": int(by_track.sum()),
+               "estimator_support_dropped": int((prior & ~own).sum()),
+               "added_beyond_estimator_support": int((own & ~prior).sum()) if prior_owned is not None else None,
+               "final_owned": int(own.sum()),
+               "seconds_freespace": round(t1 - t0, 2), "seconds_render_test": round(t2 - t1, 2)}
+    return {"owned": np.flatnonzero(own), "reasons": reasons, "candidates": int(N),
+            "rule": f"free-space test of every row's centre against the recorded depth (net >= {min_cameras} "
+                    f"cameras); then the render test of the {open_rows.size} open rows near the part; then "
+                    + ("the estimator support" if prior_owned is not None else "the free Phase-1 track")}
