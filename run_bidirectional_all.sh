@@ -13,24 +13,63 @@
 # next stage does not depend on it; otherwise the scene is abandoned and the
 # run moves on. One scene must not take the batch down.
 #
-#   bash run_bidirectional_all.sh                  # everything
-#   SCENES="washer_103776" bash run_bidirectional_all.sh
-#   STAGES="static" bash run_bidirectional_all.sh  # static | phase1 | phase2 | phase3
-#   STAGES="phase3" bash run_bidirectional_all.sh  # Phase 3 on existing Phase-2 outputs
-#   DRY=1 bash run_bidirectional_all.sh            # print the commands only
+#   bash run_bidirectional_all.sh --input DATASET_ROOT --output RESULTS_ROOT
+#   bash run_bidirectional_all.sh --input /path/to/one/scene_folder --output RESULTS_ROOT
+#   bash run_bidirectional_all.sh -i IN -o OUT --stages "phase3" --dry-run
+#
+# --input / -i   EITHER a dataset root whose sub-folders are scenes (every
+#                scene folder found there is run, unless --scenes narrows it)
+#                OR one scene folder itself (it contains rgb/, depth_npy/,
+#                colmap/, colmap_final/). Quote paths with spaces.
+# --output / -o  the results ROOT: each scene is written to <output>/<scene>/.
+#                Passing <root>/<scene> for a single scene is recognised and
+#                not nested twice.
+# --scenes "A B" restrict a dataset root to these scenes
+# --stages "..." static | phase1 | phase2 | phase3   (default: static phase1 phase2)
+# --frames N|auto   frames per sequence (default auto = every frame of the scene;
+#                   the backward run needs the whole sequence, ending at frame T)
+# --cameras N|auto  cameras (default auto = every rgb/cam_* folder)
+# --dry-run      print the commands only        --force   rerun existing stages
+#
+# The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
+# SCENES, STAGES, FRAMES, CAMS, DRY, FORCE), e.g.
+#   SCENES="washer_103776" STAGES="phase3" bash run_bidirectional_all.sh
+#
+# Every scene is checked before any GPU work: both COLMAP endpoints, rgb/ and
+# depth_npy/ per camera, the same frame count per camera, and frame files
+# numbered frame_000000, frame_000001, ... without gaps (the RGB-D loader
+# reads them consecutively). A scene that fails the check is skipped with the
+# reason; the rest of the batch runs.
 #
 set -u
 cd "$(dirname "$0")"
 
-PY=${PY:-/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python}
-SRC_ROOT=${SRC_ROOT:-"/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear"}
-OUT_ROOT=${OUT_ROOT:-"/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours"}
+usage() { sed -n '3,46p' "$0" | sed 's/^# \{0,1\}//'; }
+INPUT="" ; OUTPUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -i|--input)   INPUT="$2"; shift 2;;
+    -o|--output)  OUTPUT="$2"; shift 2;;
+    --scenes)     SCENES="$2"; shift 2;;
+    --stages)     STAGES="$2"; shift 2;;
+    --frames)     FRAMES="$2"; shift 2;;
+    --cameras)    CAMS="$2"; shift 2;;
+    --dry-run)    DRY=1; shift;;
+    --force)      FORCE=1; shift;;
+    -h|--help)    usage; exit 0;;
+    *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
+  esac
+done
 
-SCENES=${SCENES:-"USB_100109 stapler_103111 blade_103706 fridge_10905 storage_45135 laptop_10211 oven_101917 scissor_11100 foldchair_102255 washer_103776"}
+PY=${PY:-/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python}
+INPUT=${INPUT:-${SRC_ROOT:-"/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear"}}
+OUTPUT=${OUTPUT:-${OUT_ROOT:-"/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours"}}
+INPUT=${INPUT%/}; OUTPUT=${OUTPUT%/}
+
 STAGES=${STAGES:-"static phase1 phase2"}
 ITERS=${ITERS:-30000}
-FRAMES=${FRAMES:-60}
-CAMS=${CAMS:-8}
+FRAMES=${FRAMES:-auto}
+CAMS=${CAMS:-auto}
 BOOT=${BOOT:-12}            # Phase-1 IEKF iterations per frame
 RIGID_ITERS=${RIGID_ITERS:-8}
 KNN=${KNN:-12}
@@ -48,6 +87,82 @@ DRY=${DRY:-0}
 # is how they get rebuilt. Nothing about thealgorithm depends on it.
 FORCE=${FORCE:-0}
 FORCE_STATIC=${FORCE_STATIC:-$FORCE}
+
+# ---- input: a dataset root or a single scene folder -----------------------
+is_scene_dir() { [ -d "$1/rgb" ] && { [ -d "$1/colmap" ] || [ -d "$1/colmap_final" ]; }; }
+if [ ! -d "$INPUT" ]; then
+  echo "input not found: $INPUT" >&2; exit 2
+fi
+if is_scene_dir "$INPUT"; then
+  SRC_ROOT=$(dirname "$INPUT")
+  ONE=$(basename "$INPUT")
+  if [ -n "${SCENES:-}" ] && [ "$SCENES" != "$ONE" ]; then
+    echo "--input is the scene folder '$ONE' but --scenes says '$SCENES'" >&2; exit 2
+  fi
+  SCENES="$ONE"
+  # <results>/<scene> given as the output of a single scene: use its parent
+  if [ "$(basename "$OUTPUT")" = "$ONE" ]; then
+    echo "  note: --output ends in the scene name; writing to $OUTPUT"
+    OUTPUT=$(dirname "$OUTPUT")
+  fi
+else
+  SRC_ROOT="$INPUT"
+  if [ -z "${SCENES:-}" ]; then
+    SCENES=""
+    for d in "$SRC_ROOT"/*/; do
+      d=${d%/}; is_scene_dir "$d" && SCENES="$SCENES $(basename "$d")"
+    done
+    SCENES=${SCENES# }
+  fi
+  if [ -z "$SCENES" ]; then
+    echo "no scene folders (with rgb/ and colmap*/) under $SRC_ROOT" >&2; exit 2
+  fi
+fi
+OUT_ROOT="$OUTPUT"
+for S in $SCENES; do
+  case "$S" in */*) echo "scene names must be plain folder names: '$S'" >&2; exit 2;; esac
+done
+
+# Layout check of one scene: prints "OK <frames> <cameras>" or "FAIL <reasons>".
+check_scene() {
+  "$PY" - "$1" <<'PYEOF'
+import re, sys
+from pathlib import Path
+d = Path(sys.argv[1]); errs = []
+for k in ("colmap/sparse/0", "colmap_final/sparse/0", "rgb", "depth_npy"):
+    if not (d / k).is_dir():
+        errs.append(f"missing {k}/")
+cams = sorted(p.name for p in (d / "rgb").glob("cam_*") if p.is_dir()) if (d / "rgb").is_dir() else []
+if not cams:
+    errs.append("no rgb/cam_* folders")
+counts = {}
+for c in cams:
+    idx = sorted(int(m.group(1)) for f in (d / "rgb" / c).iterdir()
+                 if (m := re.fullmatch(r"frame_(\d+)\.(png|jpg|jpeg)", f.name, re.I)))
+    counts[c] = len(idx)
+    if not idx:
+        errs.append(f"rgb/{c} has no frame_NNNNNN images")
+    elif idx != list(range(len(idx))):
+        errs.append(f"rgb/{c}: {len(idx)} frames numbered {', '.join(map(str, idx[:3]))}, ... {idx[-1]}"
+                    f", not 0..{len(idx) - 1}; the RGB-D loader reads frame_000000, frame_000001, ... "
+                    f"consecutively, so the frames (and the COLMAP image names) must be renumbered "
+                    f"to be contiguous")
+        break
+    if (d / "depth_npy" / c).is_dir():
+        nd = len(list((d / "depth_npy" / c).glob("frame_*.npy")))
+        if nd != len(idx):
+            errs.append(f"depth_npy/{c} has {nd} frames, rgb/{c} has {len(idx)}")
+if counts and len(set(counts.values())) > 1:
+    errs.append(f"cameras have different frame counts: {counts}")
+print("FAIL " + "; ".join(errs) if errs else f"OK {min(counts.values())} {len(cams)}")
+PYEOF
+}
+
+echo "input root : $SRC_ROOT"
+echo "scenes     : $SCENES"
+echo "output root: $OUT_ROOT   (each scene -> $OUT_ROOT/<scene>/)"
+echo "stages     : $STAGES"
+[ "$DRY" = "1" ] || mkdir -p "$OUT_ROOT"
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
 
@@ -82,10 +197,22 @@ for S in $SCENES; do
   echo " $S   $(date '+%F %T')"
   echo "=============================================================="
 
-  if [ ! -d "$SRC/colmap/sparse/0" ] || [ ! -d "$SRC/colmap_final/sparse/0" ]; then
-    echo "  !! missing colmap or colmap_final -- skipping"
-    STATUS+=("$S SKIPPED(no endpoints)"); continue
+  CHK=$(check_scene "$SRC")
+  if [ "${CHK%% *}" != "OK" ]; then
+    echo "  !! input check failed -- skipping: ${CHK#FAIL }"
+    STATUS+=("$S SKIPPED(input check failed)"); continue
   fi
+  read -r _ NF_ALL NC_ALL <<< "$CHK"
+  if [ "$FRAMES" = "auto" ]; then NF=$NF_ALL; else NF=$FRAMES; fi
+  if [ "$CAMS" = "auto" ]; then NC=$NC_ALL; else NC=$CAMS; fi
+  if [ "$NF" -gt "$NF_ALL" ]; then
+    echo "  !! --frames $NF but the scene has $NF_ALL -- skipping"
+    STATUS+=("$S SKIPPED(frames $NF > $NF_ALL)"); continue
+  fi
+  if [ "$NF" -lt "$NF_ALL" ]; then
+    echo "  note: $NF of $NF_ALL frames; the backward run is anchored at the LAST frame and will refuse a shorter window"
+  fi
+  echo "  input OK: $NF_ALL frames x $NC_ALL cameras  (using $NF x $NC)"
 
   # ---- static 30k, both endpoints ------------------------------------
   if has_stage static; then
@@ -134,7 +261,7 @@ for S in $SCENES; do
           "$PY" tools/run_motion_coherence_support.py \
             --scene "$S" --direction "$DIR" \
             --model "$OUT/static_bidi/$END" --source "$SRC" \
-            --frames "$FRAMES" --cameras "$CAMS" --bootstrap-iters "$BOOT" \
+            --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
             --cv-folds "$FOLDS" --frames-on-cpu --out "$P1"
@@ -167,7 +294,7 @@ for S in $SCENES; do
         "$PY" tools/run_rigid_se3_pipeline.py \
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
-          --frames "$FRAMES" --cameras "$CAMS" \
+          --frames "$NF" --cameras "$NC" \
           --rigid-iters "$RIGID_ITERS" --frames-on-cpu \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
@@ -202,7 +329,7 @@ for S in $SCENES; do
         "$PY" tools/run_joint_phase3.py \
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
-          --phase2-dir "$P2" --frames "$FRAMES" --cameras "$CAMS" \
+          --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
           --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu \
           --evaluate-gt --out "$P3"
       RC=$?

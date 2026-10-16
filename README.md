@@ -55,7 +55,8 @@ PY=/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python
 
 ## 2. Data layout
 
-Each scene directory (one PartNet-Mobility episode, 8 static cameras, 60 frames) contains:
+Each scene directory contains the following. The synthetic PartNet-Mobility episodes have 8 static
+cameras and 60 frames; any number of cameras and frames is accepted.
 
 ```
 <DATA>/<scene>/
@@ -67,11 +68,26 @@ Each scene directory (one PartNet-Mobility episode, 8 static cameras, 60 frames)
   metadata/, pointcloud/                GT: used ONLY for evaluation
 ```
 
-### 2.1 Set the input and output roots (copy and edit this block first)
+### 2.1 Set the input and output paths (copy and edit this block first)
 
-**Input** (`DATA`, passed to the batch script as `SRC_ROOT`): the **parent directory containing all scene folders**, not the folder for one scene and not the repository path. For example, the loader expects `$DATA/washer_103776/rgb/`, `$DATA/washer_103776/depth_npy/`, `$DATA/washer_103776/colmap/` and `$DATA/washer_103776/colmap_final/`.
+**Input** (`--input`, or the environment variable `SRC_ROOT`) can be **either**:
 
-**Output** (`RES`, passed as `OUT_ROOT`): the **parent directory where per-scene results should be written**. The runner creates/uses `$RES/<scene>/`. It does not require the output root to be inside the dataset or repository. To reuse previously trained static models, point `RES` at the existing result root; selecting a new empty root requires the `static` stage before motion estimation.
+* **one scene folder**, the folder that itself contains `rgb/`, `depth_npy/`, `colmap/` and
+  `colmap_final/`. For example:
+  `/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/fridge_plastic_20261016_163314`.
+  Only that scene is run.
+* **a dataset root**, a folder whose sub-folders are scene folders, such as
+  `$DATA/washer_103776/rgb/`, `$DATA/washer_103776/colmap/`, …. Every scene folder found there is
+  run, or only those listed with `--scenes`.
+
+**Output** (`--output`, or `OUT_ROOT`): the **results root**. Each scene is written to
+`<output>/<scene>/`, for example `/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours`.
+
+* It does not need to be inside the dataset or the repository.
+* If you pass `<root>/<scene>` for a single scene, the driver recognises it and does not nest the
+  scene twice.
+* To reuse previously trained static models, point it at the existing results root. A new, empty
+  root needs the `static` stage before motion estimation.
 
 Run the following in **the same terminal** in which you will run the pipeline:
 
@@ -79,8 +95,10 @@ Run the following in **the same terminal** in which you will run the pipeline:
 cd /home/samuelemara/Joint3DGS/RigEuler3DGS
 conda activate rigeuler3dgs
 
-# INPUT: directory whose immediate children are scene names.
+# INPUT: a dataset root (its sub-folders are scenes) ...
 DATA="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear"
+# ... or one scene folder, used directly as --input
+SCENE_DIR="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/fridge_plastic_20261016_163314"
 
 # OUTPUT: directory whose immediate children will be scene names.
 RES="/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours"
@@ -114,13 +132,41 @@ The scene names used in the original dataset are: `USB_100109 stapler_103111 bla
 
 | Interface | Input location | Output location | What is appended automatically? |
 |---|---|---|---|
-| **All-scenes driver** `run_bidirectional_all.sh` | `SRC_ROOT="$DATA"` | `OUT_ROOT="$RES"` | `/<scene>` for each selected scene |
+| **Pipeline driver** `run_bidirectional_all.sh` | `--input "$DATA"` (root) or `--input "$DATA/<scene>"` (one scene); or `SRC_ROOT=...` | `--output "$RES"`; or `OUT_ROOT=...` | `/<scene>` for each selected scene |
 | **Phase 1 CLI** `run_motion_coherence_support.py` | `--source "$SRC"`, `--model "$OUT/static_bidi/initial"` (F) or `--model "$OUT/static_bidi/final"` (B) | `--out "$BIDI/forward"` or `.../backward` | No scene folder added to `--out` |
 | **Phase 2 CLI** `run_rigid_se3_pipeline.py` | `--source "$SRC"`, `--model ...`, plus saved support/centers | `--out "$BIDI/forward_rigid"` or `.../backward_rigid` | No scene folder added |
 | **Phase 3 CLI** `run_joint_phase3.py` | `--source "$SRC"`, `--model ...`, `--phase2-dir ...` | `--out "$BIDI/forward_joint"` or `.../backward_joint` | No scene folder added |
-| **Optional endpoint diagnostic** `run_fb_endpoint_correspondence_all.sh` | `--dataset-root "$DATA"` | `--results-root "$RES"` | Uses each scene's result tree; diagnostic tag determines subdirectory |
+| **Optional endpoint diagnostic** `run_fb_endpoint_correspondence_all.sh` | `--dataset-root "$DATA"` or one scene folder | `--results-root "$RES"` | Uses each scene's result tree; diagnostic tag determines subdirectory |
 
-There are **no** documented `--input`/`--output` options for the main all-scenes driver; configure its roots with the **environment variables** `SRC_ROOT` and `OUT_ROOT`. The individual Python tools instead use explicit `--source`, `--model`, and `--out` flags.
+The driver accepts `--input`/`--output` (or `-i`/`-o`), plus `--scenes`, `--stages`, `--frames`,
+`--cameras`, `--dry-run`, `--force` and `--help`. The environment variables `SRC_ROOT`, `OUT_ROOT`,
+`SCENES`, `STAGES`, `FRAMES`, `CAMS`, `DRY` and `FORCE` do the same; the command-line options win. The
+individual Python tools use explicit `--source` (one scene folder), `--model` and `--out` flags.
+
+### 2.3 Input check (automatic, before any GPU work)
+
+For every scene, the driver checks:
+
+* both `colmap/sparse/0` and `colmap_final/sparse/0` exist;
+* `rgb/cam_*` and `depth_npy/cam_*` exist with the same number of frames per camera;
+* the frame files are numbered `frame_000000, frame_000001, …` without gaps.
+
+A scene that fails is skipped with the reason printed, and the rest of the batch runs. With the
+defaults `--frames auto --cameras auto`, every frame and every camera of the scene is used. The
+backward run is anchored at the scene's last frame, so it needs the full sequence.
+
+**The real captures do not pass this check yet.** For example,
+`real/fridge_plastic_20261016_163314` has 3 cameras and 328 frames per camera, stored as
+`frame_000000, frame_000002, …, frame_000654` (every second index). The RGB-D loader reads frames
+consecutively, so the run is refused with:
+
+```text
+!! input check failed -- skipping: rgb/cam_000: 328 frames numbered 0, 2, 4, ... 654, not 0..327; ...
+```
+
+To run it, the frames (and the image names inside the COLMAP models) must be renumbered to be
+contiguous, or the loader must learn to read the frame list. It also has no joint GT, so
+`--evaluate-gt` reports `GT_UNAVAILABLE`.
 
 For reference, a completed Washer run under the example `RES` root is organised as follows:
 
@@ -139,7 +185,7 @@ $RES/washer_103776/
   endpoint_correspondence/   # optional separate diagnostic, if run
 ```
 
-## 3. Full pipeline, all scenes, one command
+## 3. Full pipeline, one command (one scene folder or a whole dataset)
 
 `run_bidirectional_all.sh` runs every stage for both directions:
 
@@ -147,57 +193,66 @@ $RES/washer_103776/
 * A failed stage is recorded and the batch moves on.
 * `DRY=1` prints the commands without running them.
 
-The commands below assume you already executed **Section 2.1** to define `DATA` and `RES` in this shell. You can select a different input dataset or output drive by changing **only those two variables**.
+The commands below assume you already ran **Section 2.1** to define `DATA` and `RES` in this shell.
+Always look at a `--dry-run` first: it prints the resolved input root, scenes, output root, the input
+check, and every command, without running anything.
 
-**First run, new output directory** (train endpoint models and run the complete pipeline):
+**One scene folder** (any folder with `rgb/`, `depth_npy/`, `colmap/`, `colmap_final/`), all stages:
 
 ```bash
 cd /home/samuelemara/Joint3DGS/RigEuler3DGS
 
-# Inspect the actual command paths without running anything.
-DRY=1 SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" \
+bash run_bidirectional_all.sh \
+  --input  "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear/washer_103776" \
+  --output "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours" \
+  --stages "static phase1 phase2 phase3" --dry-run
+
+# then the same command without --dry-run
+```
+
+**A whole dataset root**, every scene found in it:
+
+```bash
+bash run_bidirectional_all.sh --input "$DATA" --output "$RES" \
+  --stages "static phase1 phase2 phase3" --dry-run
+bash run_bidirectional_all.sh --input "$DATA" --output "$RES" --stages "static phase1 phase2 phase3"
+```
+
+**Existing results root with trained static models** (resume the stable stages, the default
+`--stages`):
+
+```bash
+bash run_bidirectional_all.sh --input "$DATA" --output "$RES"
+```
+
+**Some scenes of a root**, or **only Phase 3** for already processed scenes (needs their Phase 2
+outputs under the output root):
+
+```bash
+bash run_bidirectional_all.sh -i "$DATA" -o "$RES" --scenes "washer_103776 oven_101917" \
+  --stages "static phase1 phase2 phase3"
+bash run_bidirectional_all.sh -i "$DATA/fridge_10905" -o "$RES" --stages phase3
+```
+
+The same runs with environment variables, as before:
+
+```bash
+SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" \
   bash run_bidirectional_all.sh
-
-# After checking the paths, run all four stages in both directions.
-SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 phase2 phase3" \
-  bash run_bidirectional_all.sh
 ```
 
-**Existing output root with previously trained static models** (run/resume the documented stable stages):
+**Paths:**
 
-```bash
-SRC_ROOT="$DATA" OUT_ROOT="$RES" bash run_bidirectional_all.sh
-```
-
-**Only one scene**, for example Washer, including all stages:
-
-```bash
-SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
-  STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
-```
-
-**Only Phase 3 for an already processed scene** (requires that scene's Phase 2 outputs under `RES`):
-
-```bash
-SCENES="fridge_10905" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
-  STAGES="phase3" bash run_bidirectional_all.sh
-```
-
-**Custom paths** are passed the same way (these are examples, not additional fixed paths):
-
-```bash
-DATA="/path/to/datasets/parent_directory"
-RES="/path/to/output/parent_directory"
-DRY=1 SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" \
-  STAGES="static phase1 phase2 phase3" bash run_bidirectional_all.sh
-```
-
-Do not set `SRC_ROOT` to `$DATA/washer_103776` when running `SCENES="washer_103776"`: the driver already appends the scene name. Likewise, `OUT_ROOT` must be `$RES`, not `$RES/washer_103776`. The quoted assignments preserve path segments such as `Extreme SSD`.
+* Keep the double quotes, so path segments such as `Extreme SSD` survive.
+* A trailing `/` is ignored.
+* With a dataset root, `--scenes` names its sub-folders. With a scene folder, `--scenes` may be
+  omitted; if given, it must name that folder.
 
 Defaults:
 
 * Static training: `ITERS=30000`.
-* Window: `FRAMES=60`, `CAMS=8`.
+* Window: `--frames auto`, `--cameras auto`, i.e. every frame and camera of the scene (60 and 8 on
+  the synthetic data).
 * Phase 1: `BOOT=12` iterations per frame, `IEKF_SN=64` (grouped-state size).
 * Support: `KNN=12`, `SNCOUNT=192` (coherence graph nodes), `FOLDS=5`.
 * Phase 2: `RIGID_ITERS=8` iterations per frame.
@@ -370,7 +425,12 @@ bash scripts/run_fb_endpoint_correspondence_all.sh \
     --evaluate-gt --execute --gpu-memory-fraction 0.2
 ```
 
-This auxiliary script uses **command-line options** `--dataset-root` and `--results-root`, unlike the main `run_bidirectional_all.sh` driver, which uses `SRC_ROOT`/`OUT_ROOT` environment variables. Its outputs appear under `$RES/<scene>/endpoint_correspondence/<tag>/` and in the batch summary directory, rather than under `$BIDI`.
+This auxiliary script uses `--dataset-root` and `--results-root`.
+
+* `--dataset-root` may also be **one scene folder**, for example `--dataset-root "$DATA/fridge_10905"`;
+  only that scene is diagnosed.
+* Its outputs appear under `$RES/<scene>/endpoint_correspondence/<tag>/` and in the batch summary
+  directory, not under `$BIDI`.
 
 Phase 2 writes its own `joint_reduction/gt_evaluation.json` after fitting. The GT scores per run
 (support precision and recall, axis and line error, coordinate and pose error) are in

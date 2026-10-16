@@ -23,7 +23,10 @@
 # per-scene tool refuses; rerun with --resume, or use a new --tag).
 #
 # Arguments
-#   --results-root DIR / --dataset-root DIR   roots (paths with spaces are fine; quote them)
+#   --results-root DIR / --dataset-root DIR   roots (paths with spaces are fine; quote them).
+#                                --dataset-root may also be ONE scene folder (it has rgb/
+#                                and colmap*/): that scene alone is run. --results-root
+#                                may then also be <root>/<scene>.
 #   --tag T                      experiment tag (required except with --list-scenes)
 #   --estimated-joints auto|off|require       forwarded (auto: J0 continues when joints are missing)
 #   --gpu-memory-fraction F      forwarded to the diagnosis (cap on a shared GPU)
@@ -63,6 +66,15 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$MODE" ] || { echo "choose one of --list-scenes, --preflight-only, --execute" >&2; exit 2; }
 RESULTS_ROOT="${RESULTS_ROOT%/}"; DATASET_ROOT="${DATASET_ROOT%/}"
+# a single scene folder given as the dataset: run that scene only
+if [ -d "$DATASET_ROOT/rgb" ] && { [ -d "$DATASET_ROOT/colmap" ] || [ -d "$DATASET_ROOT/colmap_final" ]; }; then
+  ONE="$(basename "$DATASET_ROOT")"
+  if [ -n "$SCENES" ] && [ "$SCENES" != "$ONE" ]; then
+    echo "--dataset-root is the scene folder '$ONE' but --scenes says '$SCENES'" >&2; exit 2
+  fi
+  SCENES="$ONE"; DATASET_ROOT="$(dirname "$DATASET_ROOT")"
+  [ "$(basename "$RESULTS_ROOT")" = "$ONE" ] && RESULTS_ROOT="$(dirname "$RESULTS_ROOT")"
+fi
 [ -d "$RESULTS_ROOT" ] || { echo "no results root: $RESULTS_ROOT" >&2; exit 2; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
