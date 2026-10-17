@@ -154,8 +154,11 @@ def colmap_images(sparse):
         with open(b, "rb") as fh:
             return struct.unpack("<Q", fh.read(8))[0]
     if t.is_file():
-        rows = [r for r in t.read_text().splitlines() if r.strip() and not r.startswith("#")]
-        return len(rows) // 2
+        # two lines per image; the POINTS2D line may be empty
+        rows = [r for r in t.read_text().splitlines() if not r.startswith("#")]
+        while rows and not rows[-1].strip():
+            rows.pop()
+        return (len(rows) + 1) // 2
     return None
 cams = sorted(p.name for p in (d / "rgb").glob("cam_*") if p.is_dir()) if (d / "rgb").is_dir() else []
 if not cams:
@@ -238,7 +241,7 @@ for S in $SCENES; do
   fi
   read -r _ NF_ALL NC_ALL <<< "$CHK"
   if [ "$FRAMES" = "auto" ]; then NF=$NF_ALL; else NF=$FRAMES; fi
-  if [ "$CAMS" = "auto" ]; then NC=$NC_ALL; else NC=$CAMS; fi
+  if [ "$CAMS" = "auto" ] || [ "$CAMS" -gt "$NC_ALL" ]; then NC=$NC_ALL; else NC=$CAMS; fi
   if [ "$NF" -gt "$NF_ALL" ]; then
     echo "  !! --frames $NF but the scene has $NF_ALL -- skipping"
     STATUS+=("$S SKIPPED(frames $NF > $NF_ALL)"); continue

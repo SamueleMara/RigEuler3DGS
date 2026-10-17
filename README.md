@@ -174,8 +174,18 @@ what ran the GPU out of memory. It is refused with:
    must hold exactly one image per camera (its endpoint frame)
 ```
 
-Re-export `colmap/` with only the frame-0 image of each camera, as `colmap_final/` already does for
-the last frame.
+Fix it by keeping only the frame-0 image of each camera, with the same cameras and the same 3D
+points:
+
+```bash
+# writes <scene>/colmap_frame000000/ and checks it (3 images, poses identical to the source)
+$PY tools/make_endpoint_colmap.py --scene "$SCENE_DIR" --frame 0
+# or put it in place directly: colmap/ -> colmap_allframes/ (kept), new model -> colmap/
+$PY tools/make_endpoint_colmap.py --scene "$SCENE_DIR" --frame 0 --replace
+```
+
+Then run the driver as usual. The longer-term fix is for the converter to export `colmap/` this way,
+as it already does for `colmap_final/`.
 
 ### 2.4 Scenes without ground truth
 
