@@ -139,34 +139,67 @@ The scene names used in the original dataset are: `USB_100109 stapler_103111 bla
 | **Optional endpoint diagnostic** `run_fb_endpoint_correspondence_all.sh` | `--dataset-root "$DATA"` or one scene folder | `--results-root "$RES"` | Uses each scene's result tree; diagnostic tag determines subdirectory |
 
 The driver accepts `--input`/`--output` (or `-i`/`-o`), plus `--scenes`, `--stages`, `--frames`,
-`--cameras`, `--dry-run`, `--force` and `--help`. The environment variables `SRC_ROOT`, `OUT_ROOT`,
-`SCENES`, `STAGES`, `FRAMES`, `CAMS`, `DRY` and `FORCE` do the same; the command-line options win. The
-individual Python tools use explicit `--source` (one scene folder), `--model` and `--out` flags.
+`--cameras`, `--dry-run` and `--help`. The environment variables `SRC_ROOT`, `OUT_ROOT`, `SCENES`,
+`STAGES`, `FRAMES`, `CAMS` and `DRY` do the same; the command-line options win. The individual Python
+tools use explicit `--source` (one scene folder), `--model` and `--out` flags.
+
+A `--dry-run` never writes or deletes anything. It only prints the resolved paths, the input check
+and the commands.
 
 ### 2.3 Input check (automatic, before any GPU work)
 
 For every scene, the driver checks:
 
-* both `colmap/sparse/0` and `colmap_final/sparse/0` exist;
-* `rgb/cam_*` and `depth_npy/cam_*` exist with the same number of frames per camera;
-* the frame files are numbered `frame_000000, frame_000001, …` without gaps.
+* `colmap/sparse/0` and `colmap_final/sparse/0` exist, and **each holds exactly one image per
+  camera**. An endpoint model is one instant seen by every camera.
+* `rgb/cam_*` and `depth_npy/cam_*` exist, with the same number of frames per camera.
+* The frame files are numbered `frame_000000, frame_000001, …` without gaps. The RGB-D loader reads
+  them consecutively.
 
-A scene that fails is skipped with the reason printed, and the rest of the batch runs. With the
-defaults `--frames auto --cameras auto`, every frame and every camera of the scene is used. The
-backward run is anchored at the scene's last frame, so it needs the full sequence.
+A scene that fails is skipped with the reason printed, and the rest of the batch runs.
 
-**The real captures do not pass this check yet.** For example,
-`real/fridge_plastic_20261016_163314` has 3 cameras and 328 frames per camera, stored as
-`frame_000000, frame_000002, …, frame_000654` (every second index). The RGB-D loader reads frames
-consecutively, so the run is refused with:
+* `--frames auto` (the default) uses every frame of the scene. The backward run is anchored at the
+  last frame, so it needs the full sequence.
+* `--cameras` sets how many cameras Phase 1/2/3 use. The default is 8, as in the stable results;
+  `--cameras auto` uses all of them.
+* Static training always uses every camera in the COLMAP model.
+
+**Example of a failing scene.** `real/fridge_plastic_20261016_163314` has an initial model
+(`colmap/sparse/0`) holding **984 images**, every frame of its 3 cameras, while `colmap_final` holds
+3. The static "initial" model would then be trained on a moving object, and loading all 984 images is
+what ran the GPU out of memory. It is refused with:
 
 ```text
-!! input check failed -- skipping: rgb/cam_000: 328 frames numbered 0, 2, 4, ... 654, not 0..327; ...
+!! input check failed -- skipping: colmap/sparse/0 holds 984 images for 3 cameras; an endpoint model
+   must hold exactly one image per camera (its endpoint frame)
 ```
 
-To run it, the frames (and the image names inside the COLMAP models) must be renumbered to be
-contiguous, or the loader must learn to read the frame list. It also has no joint GT, so
-`--evaluate-gt` reports `GT_UNAVAILABLE`.
+Re-export `colmap/` with only the frame-0 image of each camera, as `colmap_final/` already does for
+the last frame.
+
+### 2.4 Scenes without ground truth
+
+The pipeline needs no GT. If `metadata/joint_info.json`, `metadata/frame_values.csv`,
+`pointcloud/joint_metadata.json` or `pointcloud/points3D_parts*.ply` are missing (as in the real
+captures), every stage still runs. Only the GT metrics are skipped:
+
+| Stage | Without GT |
+|---|---|
+| Phase 1 | `evaluation/optimized_3dgs_gt.json` says `OPTIMIZED_LABELED_3DGS_GT_NOT_FOUND`, and support metrics are not computed |
+| Phase 2 | `joint_reduction/gt_evaluation.json` says `GT_NOT_AVAILABLE`; the debug page shows "no GT available" |
+| Phase 3 | `evaluation_gt/phase3_gt_evaluation.json` has `gt_status` `GT_UNAVAILABLE`, or `GT_INCOMPLETE` when only `metadata/cameras.json` exists, and no fit is scored |
+
+### 2.5 GPU memory (8 GB card)
+
+* **Static training** keeps every camera image, depth map and mask on the CPU (`--data_device
+  cpu`) and moves only the view being trained.
+* **Phase 1/2/3** keep the RGB-D sequence on the CPU (`--frames-on-cpu`), as well as the endpoint
+  camera images (unused there).
+* The Phase-1 covariance repair falls back to the CPU if the GPU cannot allocate its workspace.
+* The driver sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+* What stays on the GPU is the render linearization of every camera used for the motion stages, and
+  it grows with the camera count. 8 cameras fit; 64 cameras (`--cameras auto` on
+  `preparation_64cams`) ran out of memory on some scenes even with the above.
 
 For reference, a completed Washer run under the example `RES` root is organised as follows:
 
@@ -251,13 +284,12 @@ SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 ph
 Defaults:
 
 * Static training: `ITERS=30000`.
-* Window: `--frames auto`, `--cameras auto`, i.e. every frame and camera of the scene (60 and 8 on
-  the synthetic data).
+* Window: `--frames auto` (every frame of the scene, 60 on the synthetic data); `--cameras 8` for
+  Phase 1/2/3 (`--cameras auto` = all).
 * Phase 1: `BOOT=12` iterations per frame, `IEKF_SN=64` (grouped-state size).
 * Support: `KNN=12`, `SNCOUNT=192` (coherence graph nodes), `FOLDS=5`.
 * Phase 2: `RIGID_ITERS=8` iterations per frame.
 * Phase 3: `PHASE3_ITERS=5` iterations per frame, `PHASE3_HYP=prismatic,revolute`.
-* `FORCE=1` reruns stages whose outputs already exist.
 
 The GPU is an 8 GB card. Don't run two of these at once, and leave other GPU jobs off while static
 training runs.
@@ -288,10 +320,10 @@ The lines in Sections 4.1–4.4 use `$PY`; define it as shown in Section 2.1 bef
 ```bash
 $PY train.py -s "$SRC/colmap"       -m "$OUT/static_bidi/initial" --images ../rgb --masks "$SRC/mask" -r 1 \
     --depths depth_npy --sapien_depth_is_metric --iterations 30000 --static_train_iters 30000 \
-    --test_iterations 999999 --disable_viewer --no_wandb
+    --test_iterations 999999 --disable_viewer --no_wandb --data_device cpu
 $PY train.py -s "$SRC/colmap_final" -m "$OUT/static_bidi/final"   --images ../rgb --masks "$SRC/mask" -r 1 \
     --depths depth_npy --sapien_depth_is_metric --iterations 30000 --static_train_iters 30000 \
-    --test_iterations 999999 --disable_viewer --no_wandb
+    --test_iterations 999999 --disable_viewer --no_wandb --data_device cpu
 ```
 
 ### 4.2 Phase 1 (free-motion IEKF) + rigid-coherence support

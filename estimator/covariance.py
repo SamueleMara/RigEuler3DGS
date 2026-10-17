@@ -345,10 +345,22 @@ def project_psd(P: torch.Tensor, floor_ratio: float | None = None,
     dz = d.clamp_min(1e-300)
     C = A / (dz.unsqueeze(2) * dz.unsqueeze(1))
     lam_list, vec_list = [], []
+    # Batched 12x12 eigendecompositions on the input's device; when the GPU
+    # solver cannot get its workspace (a full card on 64-camera runs asked for
+    # >1 GiB here), this and the remaining chunks go to the CPU instead of
+    # aborting the run. The CPU path costs ~3 s per 1e5 blocks.
+    on_cpu = C.device.type == "cpu"
     for s in range(0, C.shape[0], chunk):
-        l_, v_ = torch.linalg.eigh(C[s:s + chunk])
-        lam_list.append(l_)
-        vec_list.append(v_)
+        if not on_cpu:
+            try:
+                l_, v_ = torch.linalg.eigh(C[s:s + chunk])
+            except torch.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                on_cpu = True
+        if on_cpu:
+            l_, v_ = torch.linalg.eigh(C[s:s + chunk].cpu())
+        lam_list.append(l_.to(C.device))
+        vec_list.append(v_.to(C.device))
     lam = torch.cat(lam_list)
     vec = torch.cat(vec_list)
     # In correlation form the eigenvalues are O(1) by construction, so the

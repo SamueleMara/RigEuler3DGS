@@ -155,7 +155,7 @@ def main() -> int:
                                       load_scene, state_from_gaussians)
 
     # ---- scene ----------------------------------------------------------
-    dataset, pipe, gaussians, sc = load_scene(model, source)
+    dataset, pipe, gaussians, sc = load_scene(model, source, camera_device="cpu")
     cams_all = sc.getTrainCameras()
     ncam = min(args.cameras, len(cams_all))
     cameras = camera_specs(cams_all, ncam)

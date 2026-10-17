@@ -214,7 +214,8 @@ def main(argv=None) -> int:
 
     # ---- scene and RGB-D in processing order (identical to Phase 2) ------
     # inference_only: the loader would otherwise attach GT part labels to the model
-    dataset, pipe, gaussians, sc = load_scene(str(model), str(source), inference_only=True)
+    dataset, pipe, gaussians, sc = load_scene(str(model), str(source), inference_only=True,
+                                            camera_device="cpu")
     cams_all = sc.getTrainCameras()
     ncam = min(args.cameras, len(cams_all))
     cameras = camera_specs(cams_all, ncam)

@@ -28,23 +28,34 @@
 # --stages "..." static | phase1 | phase2 | phase3   (default: static phase1 phase2)
 # --frames N|auto   frames per sequence (default auto = every frame of the scene;
 #                   the backward run needs the whole sequence, ending at frame T)
-# --cameras N|auto  cameras (default auto = every rgb/cam_* folder)
-# --dry-run      print the commands only        --force   rerun existing stages
+# --cameras N|auto  cameras used by Phase 1/2/3 (default 8, the setting of the
+#                   stable results; auto = every rgb/cam_* folder). Static
+#                   training always uses every camera of the COLMAP model.
+#                   Each view keeps its own linearization on the GPU, so many
+#                   cameras (e.g. 64) need far more than an 8 GB card.
+# --dry-run      print the commands only
 #
 # The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
-# SCENES, STAGES, FRAMES, CAMS, DRY, FORCE), e.g.
+# SCENES, STAGES, FRAMES, CAMS, DRY), e.g.
 #   SCENES="washer_103776" STAGES="phase3" bash run_bidirectional_all.sh
 #
-# Every scene is checked before any GPU work: both COLMAP endpoints, rgb/ and
+# Every scene is checked before any GPU work: both COLMAP endpoints, each
+# holding exactly one image per camera (the endpoint frame), rgb/ and
 # depth_npy/ per camera, the same frame count per camera, and frame files
 # numbered frame_000000, frame_000001, ... without gaps (the RGB-D loader
 # reads them consecutively). A scene that fails the check is skipped with the
-# reason; the rest of the batch runs.
+# reason; the rest of the batch runs. No ground truth is needed: without
+# metadata/ or pointcloud/ GT files every stage runs and its GT metrics are
+# reported as unavailable.
+#
+# GPU memory: static training keeps every camera image, depth and mask on the
+# CPU (--data_device cpu) and moves one view at a time; the motion stages keep
+# the RGB-D frames (--frames-on-cpu) and the endpoint camera images on the CPU.
 #
 set -u
 cd "$(dirname "$0")"
 
-usage() { sed -n '3,46p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
 INPUT="" ; OUTPUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -55,7 +66,6 @@ while [ $# -gt 0 ]; do
     --frames)     FRAMES="$2"; shift 2;;
     --cameras)    CAMS="$2"; shift 2;;
     --dry-run)    DRY=1; shift;;
-    --force)      FORCE=1; shift;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -69,7 +79,7 @@ INPUT=${INPUT%/}; OUTPUT=${OUTPUT%/}
 STAGES=${STAGES:-"static phase1 phase2"}
 ITERS=${ITERS:-30000}
 FRAMES=${FRAMES:-auto}
-CAMS=${CAMS:-auto}
+CAMS=${CAMS:-8}
 BOOT=${BOOT:-12}            # Phase-1 IEKF iterations per frame
 RIGID_ITERS=${RIGID_ITERS:-8}
 KNN=${KNN:-12}
@@ -81,6 +91,8 @@ FOLDS=${FOLDS:-5}
 PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
 PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
+# fewer "reserved but unallocated" failures on the shared 8 GB card
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # FORCE=1 retrains/reruns even when the output exists. The final endpoint
 # models trained before the points3D_parts_final.ply lookup landed carry no
 # GT labels, so their debug pages have empty GT and metric panels; FORCE=1
@@ -132,6 +144,19 @@ d = Path(sys.argv[1]); errs = []
 for k in ("colmap/sparse/0", "colmap_final/sparse/0", "rgb", "depth_npy"):
     if not (d / k).is_dir():
         errs.append(f"missing {k}/")
+
+
+def colmap_images(sparse):
+    """Registered image count of a COLMAP model (images.bin header, else images.txt)."""
+    b, t = sparse / "images.bin", sparse / "images.txt"
+    if b.is_file():
+        import struct
+        with open(b, "rb") as fh:
+            return struct.unpack("<Q", fh.read(8))[0]
+    if t.is_file():
+        rows = [r for r in t.read_text().splitlines() if r.strip() and not r.startswith("#")]
+        return len(rows) // 2
+    return None
 cams = sorted(p.name for p in (d / "rgb").glob("cam_*") if p.is_dir()) if (d / "rgb").is_dir() else []
 if not cams:
     errs.append("no rgb/cam_* folders")
@@ -154,6 +179,15 @@ for c in cams:
             errs.append(f"depth_npy/{c} has {nd} frames, rgb/{c} has {len(idx)}")
 if counts and len(set(counts.values())) > 1:
     errs.append(f"cameras have different frame counts: {counts}")
+# each endpoint model is ONE instant seen by every camera: a model holding every
+# frame would train the "static" endpoint on a moving object (and load every
+# image of the sequence)
+for m in ("colmap", "colmap_final"):
+    sp = d / m / "sparse" / "0"
+    n = colmap_images(sp) if sp.is_dir() else None
+    if n is not None and cams and n != len(cams):
+        errs.append(f"{m}/sparse/0 holds {n} images for {len(cams)} cameras; an endpoint model must "
+                    f"hold exactly one image per camera (its endpoint frame)")
 print("FAIL " + "; ".join(errs) if errs else f"OK {min(counts.values())} {len(cams)}")
 PYEOF
 }
@@ -223,13 +257,14 @@ for S in $SCENES; do
         echo "  [static/$END] present, reusing  ($(du -h "$M/point_cloud/iteration_${ITERS}/point_cloud.ply" | cut -f1))"
       else
         echo "  [static/$END] training ${ITERS} iters  $(date +%T)"
-        rm -rf "$M"; mkdir -p "$M"
+        [ "$DRY" = "1" ] || { rm -rf "$M"; mkdir -p "$M"; }   # never touch disk in a dry run
         run "$M/train.log" \
           "$PY" train.py -s "$SRC/$CM" -m "$M" --images ../rgb \
             --masks "$SRC/mask" -r 1 \
             --depths depth_npy --sapien_depth_is_metric \
             --iterations "$ITERS" --static_train_iters "$ITERS" \
-            --test_iterations 999999 --disable_viewer --no_wandb
+            --test_iterations 999999 --disable_viewer --no_wandb \
+            --data_device cpu
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! static/$END failed rc=$RC"; tail -5 "$M/train.log"
@@ -256,7 +291,7 @@ for S in $SCENES; do
         echo "  [phase1/$DIR] present, reusing"
       else
         echo "  [phase1/$DIR] from static_bidi/$END  $(date +%T)"
-        rm -rf "$P1"; mkdir -p "$P1"
+        [ "$DRY" = "1" ] || { rm -rf "$P1"; mkdir -p "$P1"; }   # never touch disk in a dry run
         run "$LOGS/${S}_phase1_${DIR}.log" \
           "$PY" tools/run_motion_coherence_support.py \
             --scene "$S" --direction "$DIR" \
@@ -289,7 +324,7 @@ for S in $SCENES; do
         echo "  [phase2/$DIR] present, reusing"; continue
       fi
       echo "  [phase2/$DIR]  $(date +%T)"
-      rm -rf "$P2"; mkdir -p "$P2"
+      [ "$DRY" = "1" ] || { rm -rf "$P2"; mkdir -p "$P2"; }   # never touch disk in a dry run
       run "$LOGS/${S}_phase2_${DIR}.log" \
         "$PY" tools/run_rigid_se3_pipeline.py \
           --scene "$S" --direction "$DIR" \
@@ -324,7 +359,7 @@ for S in $SCENES; do
         echo "  [phase3/$DIR] present, reusing"; continue
       fi
       echo "  [phase3/$DIR]  $(date +%T)"
-      rm -rf "$P3"; mkdir -p "$P3"
+      [ "$DRY" = "1" ] || { rm -rf "$P3"; mkdir -p "$P3"; }   # never touch disk in a dry run
       run "$LOGS/${S}_phase3_${DIR}.log" \
         "$PY" tools/run_joint_phase3.py \
           --scene "$S" --direction "$DIR" \

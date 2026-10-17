@@ -63,8 +63,14 @@ from tools.iekf_artifacts import (  # noqa: E402
 
 
 def load_scene(model_path: str, source_path: str | None, sh_degree: int = 3,
-               *, inference_only: bool = False):
-    """Load the trained Gaussians and the real cameras of a scene."""
+               *, inference_only: bool = False, camera_device: str = "cuda"):
+    """Load the trained Gaussians and the real cameras of a scene.
+
+    `camera_device` is where each Camera keeps its endpoint image, depth and
+    masks. The motion stages never read those tensors (their RGB-D comes from
+    dataset_rgbd_frames), so they pass "cpu" and keep the GPU for the
+    linearization; only the camera geometry (view/projection matrices) is on
+    the GPU either way."""
     from argparse import Namespace
 
     from arguments import ModelParams, PipelineParams
@@ -95,7 +101,7 @@ def load_scene(model_path: str, source_path: str | None, sh_degree: int = 3,
     # Custom device None failed" line once PER CAMERA, and falls back to cuda.
     # Setting it here produces exactly that fallback without the eight
     # exception traces at startup.
-    args.data_device = "cuda"
+    args.data_device = camera_device
     cfg = Path(model_path) / "cfg_args"
     if cfg.exists():
         saved = eval(cfg.read_text(),
