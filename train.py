@@ -525,6 +525,16 @@ def _static_visual_loss(camera, gaussians, pipe, background, dataset, args, opt,
 
     if depth_weight > 0 and camera.depth_reliable:
         mask = camera.depth_mask.cuda()
+        if object_mode:
+            # Carving makes every background pixel transparent; depth measured
+            # there (walls, table, robot: 65-78% of the depth pixels on the real
+            # captures, 0% on the SAPIEN exports) would demand opaque geometry
+            # at that depth instead, and the two terms leave semi-transparent
+            # splats smeared over the background. Under carving, depth
+            # supervises the object only.
+            obj = object_alpha.cuda()
+            obj = obj[None] if obj.ndim == 2 else obj
+            mask = mask * (obj > 0.5).to(mask.dtype)
         err = torch.abs(
             (package["depth"] - camera.invdepthmap.cuda()) * mask)
         # Averaged over the MEASURED pixels, not over the frame. These depth
