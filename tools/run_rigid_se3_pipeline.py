@@ -110,6 +110,8 @@ def main() -> int:
     ap.add_argument("--no-refine", action="store_true",
                     help="skip the section 32 pose-space refinement")
     ap.add_argument("--frames-on-cpu", action="store_true")
+    from estimator.silhouette import add_cli as _sil_cli
+    _sil_cli(ap)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--direction", choices=("forward", "backward"),
                     default="forward",
@@ -311,9 +313,11 @@ def main() -> int:
                            sigma_wdot=args.sigma_wdot)
     state = RigidState(init["part"], rcfg)
 
-    def linearize(st, frame):
-        mu, Rg = st.gaussians(frame, mu0, R0)
-        return render_state(truth, mu, Rg, cameras, cfg, build_linearization)
+    from estimator.silhouette import activate_from_args, silhouette_closures
+    sil = activate_from_args(args, source, frame_ids, frames_raw)
+    linearize, sil_prec, sil_extend = silhouette_closures(
+        sil, truth, mu0, R0, cameras, cfg, render_state, build_linearization,
+        prec_at, obs_all, cam_ids)
 
     ctr = {"t": 0}
 
@@ -322,10 +326,10 @@ def main() -> int:
         return linearize(st, frame)
 
     def precision_fn(lin):
-        return prec_at(lin, ctr["t"])
+        return sil_prec(lin, ctr["t"])
 
-    obs_pairs = [[(o[0], o[1]) if o is not None else None for o in ob]
-                 for ob in obs_all]
+    obs_pairs = sil_extend([[(o[0], o[1]) if o is not None else None for o in ob]
+                            for ob in obs_all])
     res = run_rigid_window(state, mu0, R0, obs_pairs, _lin, precision_fn,
                            cfg=rcfg, label="rigid")
     part = res["part"]
@@ -333,6 +337,10 @@ def main() -> int:
 
     p2 = out / "phase2_rigid"
     p2.mkdir(parents=True, exist_ok=True)
+    if sil is not None:
+        _json(p2 / "silhouette_check.json", sil.summary())
+        from estimator.silhouette import set_active
+        set_active(None)                 # the debug renders below are object-only
     poses = np.stack([_se3_matrix(part.R[t], part.p[t]) for t in range(T)])
     # Section 13: the authoritative arrays are in ORIGINAL chronological
     # order, whatever order they were solved in. Everything downstream --

@@ -1751,6 +1751,9 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
             dtype=truth.mu.dtype)
         seed = state if ti > 1 else truth
+        from estimator.silhouette import get_active as _sil
+        if _sil() is not None:
+            _sil().set_frame(ti)          # processing index -> this frame's masks
         prior = []
         def capture_information(prior_block, image_block):
             prior.append(prior_block.detach().cpu())

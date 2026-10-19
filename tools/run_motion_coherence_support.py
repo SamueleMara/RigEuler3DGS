@@ -124,6 +124,8 @@ def main() -> int:
                     help="reuse an existing phase1/centers directory instead "
                          "of re-running Phase 1")
     ap.add_argument("--frames-on-cpu", action="store_true")
+    from estimator.silhouette import add_cli as _sil_cli
+    _sil_cli(ap)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
                     help="v2 = section 11-19 coherent-component extraction "
                          "(default); ncut = the superseded two-way normalized "
@@ -265,6 +267,8 @@ def main() -> int:
               f" (frame {endpoint_evidence['endpoint_original_frame']}),"
               f" expected {endpoint_evidence['expected_endpoint']}")
         cameras = frames_raw[0][1]
+        from estimator.silhouette import activate_from_args
+        sil = activate_from_args(args, source, frame_ids, frames_raw)
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
         print(f"  Phase 1 over {len(window)} frames ...")
@@ -276,6 +280,11 @@ def main() -> int:
         positions, _info = bootstrap_positions(truth, cameras, window, cfg,
                                                None, ns, verbose=True,
                                                observer=recorder)
+        if sil is not None:
+            (out / "silhouette_check.json").write_text(json.dumps(sil.summary(), indent=1))
+            sm = sil.summary()
+            print(f"  silhouette check: mean {sm['mean_alpha_outside_mask_fraction']:.3f}, "
+                  f"max {sm['max_alpha_outside_mask_fraction']:.3f} of the rendered alpha outside the mask")
         # Step 5: persist in ORIGINAL CHRONOLOGICAL indexing.
         #
         # `positions` comes back in PROCESSING order, so for a backward run

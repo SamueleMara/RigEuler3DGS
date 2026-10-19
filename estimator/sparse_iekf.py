@@ -217,6 +217,25 @@ class IEKFDiagnostics:
         return self.rows[-1] if self.rows else {}
 
 
+def _all_precisions(lin, rgbd_gt, cfg: IEKFConfig):
+    """_precisions, plus the object-mask measurement when one is active
+    (estimator/silhouette.py): object RGB-D only inside the mask, and the
+    silhouette views' distance-weighted alpha residual outside it."""
+    from .silhouette import get_active
+    sil = get_active()
+    n = getattr(lin, "num_object_views", None)
+    if sil is None or n is None:
+        return _precisions(lin.views, rgbd_gt, cfg)
+    gts = list(rgbd_gt)[:n]
+    out = []
+    for j, (p_rgb, p_d, r_rgb, r_d) in enumerate(_precisions(lin.views[:n], gts, cfg)):
+        M = sil.object_gate(j, p_rgb.device).to(p_rgb.dtype)
+        out.append((p_rgb * M[None], p_d * M, r_rgb, r_d))
+    for j, ob in enumerate(gts):
+        out.append(sil.terms(j, lin.views[j], lin.views[n + j], ob[1], ob[2]))
+    return out
+
+
 def _precisions(views, rgbd_gt, cfg: IEKFConfig):
     """Per-camera (RGB precision, depth precision, RGB residual, depth residual).
 
@@ -308,7 +327,11 @@ def evaluate_true_map_energy(
     lin = build_linearization(state, cameras, background=background,
                               eps_depth=cfg.eps_depth,
                               antialiasing=cfg.antialiasing, debug=cfg.debug)
-    prec = _precisions(lin.views, rgbd_gt, cfg)
+    from .silhouette import get_active
+    if get_active() is not None:
+        lin = get_active().augment(lin, state, cameras, eps_depth=cfg.eps_depth,
+                                   antialiasing=cfg.antialiasing, debug=cfg.debug)
+    prec = _all_precisions(lin, rgbd_gt, cfg)
     meas = 0.0
     for p_rgb, p_d, r_rgb, r_d in prec:
         meas += float(measurement_energy(r_rgb, p_rgb))
@@ -464,7 +487,7 @@ def iekf_frame_step(
     for j in range(int(cfg.max_iters)):
         _bar.to(j)
         # --- 3. Nonlinear render + frozen linearization cache --------------
-        prec = _precisions(lin.views, rgbd_gt, cfg)
+        prec = _all_precisions(lin, rgbd_gt, cfg)
         precisions = [(p_rgb, p_d) for p_rgb, p_d, _, _ in prec]
         residuals = [(r_rgb, r_d) for _, _, r_rgb, r_d in prec]
 
@@ -720,7 +743,7 @@ def iekf_frame_step(
     _bar.close()
 
     # --- 11. Approximate posterior marginals, ONCE (section 17) ------------
-    prec = _precisions(lin.views, rgbd_gt, cfg)
+    prec = _all_precisions(lin, rgbd_gt, cfg)
     fisher_pose = lin.build_block_fisher([(p, d) for p, d, _, _ in prec])
     Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
     # Invert in float64 and project back onto the PSD cone. The measurement

@@ -199,7 +199,65 @@ captures), every stage still runs. Only the GT metrics are skipped:
 | Phase 2 | `joint_reduction/gt_evaluation.json` says `GT_NOT_AVAILABLE`; the debug page shows "no GT available" |
 | Phase 3 | `evaluation_gt/phase3_gt_evaluation.json` has `gt_status` `GT_UNAVAILABLE`, or `GT_INCOMPLETE` when only `metadata/cameras.json` exists, and no fit is scored |
 
-### 2.5 GPU memory (8 GB card)
+### 2.5 Object masks in the motion stages (`--object-masks`, opt-in)
+
+**Why masks are needed on real data.** On the synthetic scenes the background is black and has no
+depth, which is exactly what the renderer draws where no Gaussian is. So the full-frame RGB term
+already acts as a silhouette constraint. On real captures that is not true:
+
+* the background is textured (mean RGB about 0.46) and has depth on about half the frame;
+* foreground occluders such as the robot or hand cover 11–14% of the frame.
+
+Without masks, Phase 1/2/3 let background and robot pixels pull object Gaussians toward them, and
+nothing penalises a Gaussian that has left the object.
+
+**Why a background colour target is not enough in the EKF.** Appearance and opacity are frozen, so a
+stray Gaussian cannot fade as it does in static carving; it can only move.
+
+* **Camouflage:** against a fixed background colour, a Gaussian of that colour leaves no residual.
+* **Flat landscape:** even a colour-free alpha target gives no translation gradient to a footprint
+  wholly outside the mask. Such Gaussians stay stuck.
+
+**What `--object-masks` does** (`estimator/silhouette.py`), for every frame and camera:
+
+* **Object pixels (inside the mask):** recorded RGB and depth, as before.
+* **Occluder pixels** (outside the mask, recorded surface in front of the rendered object, e.g. the
+  robot in front of the door): no claim, because the object may be hidden there.
+* **Absent pixels** (outside the mask otherwise): a silhouette measurement.
+  * Each camera gets a second "silhouette view": the same Gaussians rendered black over white, so the
+    colour is exactly 1 − alpha and the existing CUDA JVP/VJP give the alpha Jacobian.
+  * The target is alpha = 0, weighted by w = 1 + (D − band)/d0, where D is the distance to the mask.
+    So the weight is full strength at the edge and grows with distance.
+  * Every stray Gaussian therefore has a descent direction back to the mask, whatever its colour.
+
+**GT-free check:** each stage writes `silhouette_check.json`, the share of the rendered alpha on
+absent pixels per frame: Phase 1 in `<dir>/`, Phase 2 in `<dir>_rigid/phase2_rigid/`, Phase 3 in
+`<dir>_joint/<type>/`.
+
+**Options:** `--silhouette-d0-px` (10), `--silhouette-band-px` (2), `--silhouette-dmax-px` (100),
+`--silhouette-occluder-tol-m` (0.05). Turn it on for the whole pipeline with:
+
+```bash
+bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "static phase1 phase2 phase3" --object-masks
+```
+
+**Status:** opt-in, not yet validated at full scale.
+
+* Tests: `tests/test_object_silhouette.py`, 11 checks on the CUDA renderer. They cover the 1 − A
+  identity, the alpha JVP against finite differences, both failure modes, the pull back to the mask
+  for dark and bright Gaussians, and occluders.
+* Smoke runs on synthetic `fridge_10905` forward, 2 cameras and 1 iteration per frame:
+
+  | stage | without masks | with masks |
+  |---|---|---|
+  | Phase 2 axis error | 0.16° | 0.03° |
+  | Phase 2 axis-line error | 0.9 cm | 2.2 cm |
+  | Phase 3 angle MAE | 0.0072 rad | 0.0061 rad |
+
+* An A/B at the standard settings on synthetic and real scenes is still to be run before making it
+  the default.
+
+### 2.6 GPU memory (8 GB card)
 
 * **Static training** keeps every camera image, depth map and mask on the CPU (`--data_device
   cpu`) and moves only the view being trained.

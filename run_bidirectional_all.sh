@@ -33,6 +33,10 @@
 #                   training always uses every camera of the COLMAP model.
 #                   Each view keeps its own linearization on the GPU, so many
 #                   cameras (e.g. 64) need far more than an 8 GB card.
+# --object-masks  Phase 1/2/3 use mask/<cam>/frame_NNNNNN.png in the RGB-D
+#                 measurement (object RGB-D inside the mask, a distance-weighted
+#                 silhouette residual outside it; occluders allowed) and write a
+#                 GT-free silhouette_check.json. Off by default.
 # --dry-run      print the commands only
 #
 # The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
@@ -66,6 +70,7 @@ while [ $# -gt 0 ]; do
     --frames)     FRAMES="$2"; shift 2;;
     --cameras)    CAMS="$2"; shift 2;;
     --dry-run)    DRY=1; shift;;
+    --object-masks) OBJECT_MASKS=1; shift;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -91,6 +96,8 @@ FOLDS=${FOLDS:-5}
 PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
 PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
+OBJECT_MASKS=${OBJECT_MASKS:-0}
+MASKARGS=(); [ "$OBJECT_MASKS" = "1" ] && MASKARGS=(--object-masks)
 # fewer "reserved but unallocated" failures on the shared 8 GB card
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # FORCE=1 retrains/reruns even when the output exists. The final endpoint
@@ -199,6 +206,7 @@ echo "input root : $SRC_ROOT"
 echo "scenes     : $SCENES"
 echo "output root: $OUT_ROOT   (each scene -> $OUT_ROOT/<scene>/)"
 echo "stages     : $STAGES"
+[ "$OBJECT_MASKS" = "1" ] && echo "object masks: ON (Phase 1/2/3 silhouette measurement)"
 [ "$DRY" = "1" ] || mkdir -p "$OUT_ROOT"
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -302,7 +310,7 @@ for S in $SCENES; do
             --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
-            --cv-folds "$FOLDS" --frames-on-cpu --out "$P1"
+            --cv-folds "$FOLDS" --frames-on-cpu "${MASKARGS[@]}" --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! phase1/$DIR failed rc=$RC"
@@ -333,7 +341,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --frames "$NF" --cameras "$NC" \
-          --rigid-iters "$RIGID_ITERS" --frames-on-cpu \
+          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${MASKARGS[@]}" \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
           --out "$P2"
@@ -368,7 +376,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
-          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu \
+          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${MASKARGS[@]}" \
           --evaluate-gt --out "$P3"
       RC=$?
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
