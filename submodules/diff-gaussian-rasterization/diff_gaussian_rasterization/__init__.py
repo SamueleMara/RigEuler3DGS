@@ -623,3 +623,40 @@ def iekf_fisher_to_dense(fisher21: torch.Tensor) -> torch.Tensor:
             out[:, b, a] = fisher21[:, t]
             t += 1
     return out
+
+
+# ---------------------------------------------------------------------------
+# Visible-object-alpha operators for negative mask rays (19 Oct addendum).
+# Built separately as _C_vis (setup_vis.py); imported lazily so nothing changes
+# for code that never calls them. ray_mode [H,W] int32: 0 no claim, 1 trusted
+# full-empty ray (A_vis = A), 2 measured non-object surface at z_obs [H,W]
+# (only contributors with their own camera depth d_i < z_obs - delta_z count).
+# ---------------------------------------------------------------------------
+def _vis():
+    from . import _C_vis
+    return _C_vis
+
+
+def iekf_visible_alpha(cache: IEKFLinearizationCache, ray_mode, z_obs, delta_z: float):
+    """A_vis at the frozen linearization: (A_vis, T_front, n_contrib, n_front, n_behind)."""
+    return _vis().iekf_visible_alpha(
+        *cache._args(), cache.image_height, cache.image_width,
+        ray_mode.contiguous(), z_obs.contiguous(), float(delta_z), cache.debug)
+
+
+def iekf_vis_apply_H(cache: IEKFLinearizationCache, ray_mode, z_obs, delta_z: float, pose_delta):
+    """dA_vis [H,W] for a [P,6] pose tangent (same tangent convention as iekf_apply_H)."""
+    return _vis().iekf_vis_apply_H(
+        *cache._args(), cache.means3D, cache.viewmatrix, cache.projmatrix,
+        cache.tanfovx, cache.tanfovy, cache.image_height, cache.image_width,
+        ray_mode.contiguous(), z_obs.contiguous(), float(delta_z), pose_delta.contiguous(), cache.debug)
+
+
+def iekf_vis_apply_HT(cache: IEKFLinearizationCache, ray_mode, z_obs, delta_z: float,
+                      z_alpha, final_T_front, n_contrib):
+    """H_A^T z_alpha -> [P,6]; stops at the renderer's last contributor per pixel."""
+    return _vis().iekf_vis_apply_HT(
+        *cache._args(), cache.means3D, cache.viewmatrix, cache.projmatrix,
+        cache.tanfovx, cache.tanfovy, cache.image_height, cache.image_width,
+        ray_mode.contiguous(), z_obs.contiguous(), float(delta_z),
+        z_alpha.contiguous(), final_T_front.contiguous(), n_contrib.contiguous(), cache.debug)

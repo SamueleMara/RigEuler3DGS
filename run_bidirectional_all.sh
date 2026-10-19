@@ -33,10 +33,13 @@
 #                   training always uses every camera of the COLMAP model.
 #                   Each view keeps its own linearization on the GPU, so many
 #                   cameras (e.g. 64) need far more than an 8 GB card.
-# --object-masks  Phase 1/2/3 use mask/<cam>/frame_NNNNNN.png in the RGB-D
-#                 measurement (object RGB-D inside the mask, a distance-weighted
-#                 silhouette residual outside it; occluders allowed) and write a
-#                 GT-free silhouette_check.json. Off by default.
+# --object-mask-constraint off|visible-negative-hard   (default off)
+#                hard visible-object-opacity constraint on trusted negative mask
+#                rays in Phase 1/2/3 (estimator/visibility_constraint.py); with
+#                --mask-ray-semantics trusted-full-ray|known-nonobject-depth|conservative,
+#                --mask-depth-noise-m (required for known-nonobject-depth),
+#                --mask-boundary-px (2), --mask-alpha-epsilon (0.05),
+#                --mask-subdir NAME (masks read from <scene>/NAME; default mask)
 # --dry-run      print the commands only
 #
 # The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
@@ -70,7 +73,12 @@ while [ $# -gt 0 ]; do
     --frames)     FRAMES="$2"; shift 2;;
     --cameras)    CAMS="$2"; shift 2;;
     --dry-run)    DRY=1; shift;;
-    --object-masks) OBJECT_MASKS=1; shift;;
+    --object-mask-constraint) VIS_MODE="$2"; shift 2;;
+    --mask-ray-semantics)     VIS_SEM="$2"; shift 2;;
+    --mask-depth-noise-m)     VIS_DNOISE="$2"; shift 2;;
+    --mask-boundary-px)       VIS_BAND="$2"; shift 2;;
+    --mask-alpha-epsilon)     VIS_EPS="$2"; shift 2;;
+    --mask-subdir)            VIS_SUBDIR="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -96,8 +104,13 @@ FOLDS=${FOLDS:-5}
 PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
 PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
-OBJECT_MASKS=${OBJECT_MASKS:-0}
-MASKARGS=(); [ "$OBJECT_MASKS" = "1" ] && MASKARGS=(--object-masks)
+VIS_MODE=${VIS_MODE:-off}
+VISARGS=()
+if [ "$VIS_MODE" != "off" ]; then
+  VISARGS=(--object-mask-constraint "$VIS_MODE" --mask-ray-semantics "${VIS_SEM:-trusted-full-ray}"
+           --mask-boundary-px "${VIS_BAND:-2}" --mask-alpha-epsilon "${VIS_EPS:-0.05}")
+  [ -n "${VIS_DNOISE:-}" ] && VISARGS+=(--mask-depth-noise-m "$VIS_DNOISE")
+fi
 # fewer "reserved but unallocated" failures on the shared 8 GB card
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # FORCE=1 retrains/reruns even when the output exists. The final endpoint
@@ -206,7 +219,7 @@ echo "input root : $SRC_ROOT"
 echo "scenes     : $SCENES"
 echo "output root: $OUT_ROOT   (each scene -> $OUT_ROOT/<scene>/)"
 echo "stages     : $STAGES"
-[ "$OBJECT_MASKS" = "1" ] && echo "object masks: ON (Phase 1/2/3 silhouette measurement)"
+[ "$VIS_MODE" != "off" ] && echo "mask constraint: ${VISARGS[*]}"
 [ "$DRY" = "1" ] || mkdir -p "$OUT_ROOT"
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -235,6 +248,7 @@ T_ALL=$(date +%s)
 
 for S in $SCENES; do
   SRC="$SRC_ROOT/$S"
+  VISSRC=(); [ "$VIS_MODE" != "off" ] && VISSRC=(--mask-source "$SRC/${VIS_SUBDIR:-mask}")
   OUT="$OUT_ROOT/$S"
   BIDI="$OUT/bidirectional"
   LOGS="$OUT/logs"
@@ -310,7 +324,7 @@ for S in $SCENES; do
             --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
-            --cv-folds "$FOLDS" --frames-on-cpu "${MASKARGS[@]}" --out "$P1"
+            --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! phase1/$DIR failed rc=$RC"
@@ -341,7 +355,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --frames "$NF" --cameras "$NC" \
-          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${MASKARGS[@]}" \
+          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
           --out "$P2"
@@ -376,7 +390,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
-          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${MASKARGS[@]}" \
+          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" \
           --evaluate-gt --out "$P3"
       RC=$?
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then

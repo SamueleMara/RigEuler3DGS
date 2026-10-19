@@ -1751,16 +1751,31 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
             dtype=truth.mu.dtype)
         seed = state if ti > 1 else truth
-        from estimator.silhouette import get_active as _sil
-        if _sil() is not None:
-            _sil().set_frame(ti)          # processing index -> this frame's masks
         prior = []
         def capture_information(prior_block, image_block):
             prior.append(prior_block.detach().cpu())
+        vis_seq = getattr(args, "visibility_constraint", None)
         new_state, _, diag = iekf_frame_step(seed, P, obs, cameras,
                                              dt=args.dt, cfg=bcfg,
                                              partition=partition,
-                                             information_observer=capture_information if observer else None)
+                                             information_observer=capture_information if observer else None,
+                                             visibility=None if vis_seq is None else vis_seq.for_frame(ti))
+        if vis_seq is not None:
+            ev = next((r for r in diag.rows if r.get("event") == "visibility"), None)
+            if ev is not None:
+                vis_seq.report.append({"processing_index": ti, "frame": fid, "status": ev["status"],
+                                       "final_audit": ev["final_audit"],
+                                       "rays_violated_at_reference": ev["rays_violated_at_reference"],
+                                       "constrained_steps": ev["constrained_steps"],
+                                       "rejected_by_audit": ev["rejected_by_audit"],
+                                       "persistent": ev.get("persistent_violation_classification"),
+                                       "iterations": [{k: it.get(k) for k in (
+                                           "iteration", "accepted", "status", "active", "hard_rows",
+                                           "violated_at_reference", "aggregate_row", "qp_rounds", "qp_rows", "qp_cg", "qp_cg_seconds",
+                                           "second_order_corrections", "constraint_seconds", "released_now")}
+                                           | {"audit_ok": (it.get("audit") or {}).get("ok"),
+                                              "new_violations": (it.get("audit") or {}).get("new_violations")}
+                                           for it in ev.get("iterations", [])]})
         state = new_state
         if observer is not None:
             observer(ti, state, prior[0])

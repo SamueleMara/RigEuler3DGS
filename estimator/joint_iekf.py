@@ -164,7 +164,7 @@ def _energy(linearize, state, frame, mu0, R0, observation, precision_fn):
 
 def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                precision_fn, prior_information: Tensor,
-               cfg: JointIEKFConfig | None = None) -> FrameRecord:
+               cfg: JointIEKFConfig | None = None, visibility=None) -> FrameRecord:
     """Section 13: one Phase-2 frame, with Phase-1's solver and acceptance.
 
     `linearize(state, frame) -> FrameLinearization` and
@@ -181,6 +181,21 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     dev = mu0.device
     n = state.dim
     metric = _metric(prior_information, cfg)
+    # Negative-ray constraint (opt-in, visibility_constraint.py): object-valid
+    # RGB-D only, visible alpha attached to every linearization, the stage's
+    # own lift J_g = state.jvp / state.vjp for C = J_A J_g.
+    if visibility is not None:
+        _lin0, _prec0 = linearize, precision_fn
+
+        def linearize(st, fr, _f=_lin0):
+            L = _f(st, fr)
+            L.visibility_values = visibility.evaluate(L)
+            return L
+
+        def precision_fn(L, _f=_prec0):
+            return [(pc * M.to(pc.device, pc.dtype)[None] if pc.dim() == 3 else pc * M.to(pc.device, pc.dtype),
+                     pd * M.to(pd.device, pd.dtype))
+                    for (pc, pd), M in zip(_f(L), visibility.masks, strict=True)]
     tr = TrustRegionConfig(radius_init=cfg.radius_init,
                            max_pcg_iters=cfg.max_cg_iters)
     radius = cfg.radius_init
@@ -192,6 +207,15 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     accepted_count = 0
     rho_last = float("nan")
     it = 0
+    vis_ref = vis_cur = vis_last = None
+    vis_log = []
+    if visibility is not None:
+        visibility.check_views(lin)
+        if len(observation) != visibility.ncam:
+            raise AssertionError(f"{len(observation)} observations but {visibility.ncam} cameras of masks: "
+                                 "refusing a silent zip truncation")
+        vis_ref = visibility.row_values(lin.visibility_values)
+        vis_cur = vis_ref
 
     # Each iteration re-renders the whole scene, so at full scale this is
     # seconds per step. It also breaks early, hence absolute positioning.
@@ -255,21 +279,62 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
         if not torch.isfinite(step).all() or float(step.norm()) == 0.0:
             break
 
+        import copy
+        from .joint_process import apply_correction
+        vis_audit = vis_info = None
+        if visibility is not None:
+            # constrained correction (projection of the trust-region step onto
+            # C d <= u, C = J_A J_g) with up to two second-order corrections
+            from .visibility_constraint import constrained_step
+
+            def _lift(v, _st=state):
+                return _st.jvp(frame, v.to(dev).double(), mu0, R0).float()
+
+            def _liftT(pose, _st=state):
+                return _st.vjp(frame, pose.double(), mu0, R0).cpu().double()
+            step_tr = step
+            margin = torch.zeros_like(vis_cur)
+            n_soc = 0
+            while True:
+                step, vis_info, lin_pred = constrained_step(
+                    visibility, lin, lin.visibility_values, vis_ref, vis_cur, A_mv, b, _lift, _liftT,
+                    step_tr, radius, metric, dim_state=n, M_inv=M_inv, margin=margin)
+                vis_last = (lin, A_mv, b, _lift, _liftT, M_inv)
+                trial = copy.deepcopy(state)
+                trial, _G = apply_correction(trial, frame, step, transport=False)
+                e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
+                                         precision_fn)
+                vis_new = visibility.row_values(lin_new.visibility_values)
+                vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
+                if vis_audit["ok"] or n_soc >= 2:
+                    break
+                hard = visibility.hard_rows(vis_ref)
+                over = hard & (vis_new > visibility.policy.epsilon + visibility.policy.audit_tol)
+                if not bool(over.any()):
+                    break
+                err = (vis_new - (vis_cur + torch.nan_to_num(lin_pred, nan=0.0))).clamp_min(0.0)
+                margin = margin + torch.where(over, err + visibility.policy.audit_tol, torch.zeros_like(err))
+                n_soc += 1
+            vis_info["second_order_corrections"] = n_soc
+
         # ---- predicted reduction from the SAME quadratic model ----------
         pred = float((b * step).sum() - 0.5 * (step * A_mv(step)).sum())
 
         # ---- trial retraction, rerender, Phase-1 acceptance -------------
-        import copy
-        trial = copy.deepcopy(state)
-        from .joint_process import apply_correction
-        trial, _G = apply_correction(trial, frame, step, transport=False)
-        e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
-                                 precision_fn)
+        if visibility is None:
+            trial = copy.deepcopy(state)
+            trial, _G = apply_correction(trial, frame, step, transport=False)
+            e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
+                                     precision_fn)
         actual = energy - e_new
         rho = actual / pred if pred > 0 else float("-inf")
+        if vis_audit is not None and not vis_audit["ok"]:
+            rho = float("nan")              # nonlinear audit failed: reject and shrink
         rho_last = rho
         radius, accept = adapt_radius(radius, rho, res.boundary_hit, actual, tr)
+        took = False
         if accept and math.isfinite(e_new) and e_new < energy:
+            took = True
             # the accepted step is applied to the REAL state, with the
             # covariance carried across the basis change (section 15)
             state, G = apply_correction(state, frame, step, transport=False)
@@ -279,6 +344,11 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                 if abs(float(torch.det(G))) > 1e-12 else prior_information)
             energy, lin = e_new, lin_new
             accepted_count += 1
+            if visibility is not None:
+                vis_cur = vis_new
+        if visibility is not None:
+            vis_log.append({"iteration": it, "accepted": took,
+                            **(vis_info or {}), "audit": vis_audit})
         _bar.note(f"rho {rho:+.3f} E {energy:.4e} "
                   f"{'accept' if accept else 'reject'}")
         if cfg.verbose:
@@ -288,6 +358,28 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
             break
 
     _bar.close()
+    vis_summary = None
+    if visibility is not None:
+        final = visibility.audit(vis_ref, vis_ref, vis_cur)
+        persistent = None
+        if final["violating_now"] == 0:
+            status = "FEASIBLE"
+        elif vis_last is not None:
+            from .visibility_constraint import classify_persistent
+            L_, A_, b_, lf_, lfT_, M_ = vis_last
+            persistent = classify_persistent(visibility, L_, L_.visibility_values, vis_ref,
+                                             visibility.row_values(L_.visibility_values),
+                                             A_, b_, lf_, lfT_, dim_state=n, M_inv=M_)
+            status = persistent["status"]
+        else:
+            status = "UNRESOLVED_INFEASIBLE"
+        vis_summary = {"status": status, "final_audit": final, "coverage": visibility.coverage(),
+                       "rays_violated_at_reference": int((vis_ref > visibility.policy.epsilon).sum()),
+                       "persistent_violation_classification": persistent,
+                       "constrained_steps": sum(1 for r in vis_log if r.get("status") not in (None, "INACTIVE")),
+                       "rejected_by_audit": sum(1 for r in vis_log if r.get("audit") and not r["audit"]["ok"]),
+                       "posterior_note": "unconstrained information inverse; truncated by active inequalities",
+                       "iterations": vis_log}
 
     # ---- section 14: the exact 6x6 posterior, by probing the operator ----
     prec = precision_fn(lin)
@@ -326,12 +418,13 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                            H_info[getattr(state, "geometry_slice",
                                           slice(2, 6)),
                                   getattr(state, "geometry_slice",
-                                          slice(2, 6))]).tolist()})
+                                          slice(2, 6))]).tolist(),
+                       **({"visibility": vis_summary} if vis_summary is not None else {})})
 
 
 def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
                times=None, cfg: JointIEKFConfig | None = None,
-               label: str = "") -> dict:
+               label: str = "", visibility=None) -> dict:
     """Sections 6, 13-16: the recursive filter over a whole window.
 
     Predict, update, reset, with the joint covariance carried from frame to
@@ -395,7 +488,8 @@ def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
         prior_info = 0.5 * (prior_info + prior_info.T)
 
         rec = frame_step(state, frame, mu0, R0, observations[frame],
-                         linearize, precision_fn, prior_info, cfg)
+                         linearize, precision_fn, prior_info, cfg,
+                         visibility=None if visibility is None else visibility.for_frame(frame))
 
         # section 16: keep the representation continuous before storing
         flips = apply_sign_gauge(state, reference)

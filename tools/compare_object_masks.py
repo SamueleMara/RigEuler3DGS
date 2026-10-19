@@ -1,5 +1,6 @@
 #!/usr/bin/env python
-"""A/B of the motion stages with and without --object-masks (evaluation only).
+"""A/B of the motion stages with and without the hard negative-ray constraint
+(--object-mask-constraint visible-negative-hard), evaluation only.
 
 Reads, for every scene x direction present in BOTH results roots, the scores
 each stage already wrote after its inference finished:
@@ -11,7 +12,8 @@ each stage already wrote after its inference finished:
                hypothesis; gamma_1DOF, unexplained share (GT-free)
   Phase 3   <dir>_joint/evaluation_gt/phase3_gt_evaluation.json
             -> axis angle, line distance, coordinate MAE of the GT-type fit
-  both      silhouette_check.json (GT-free): rendered alpha outside the mask
+  with      visibility_constraint.json per stage (GT-free): share of frames that
+            end FEASIBLE and the mean number of violating negative rays
 
 The GT type is used only to pick which of the two reported hypotheses to
 score; nothing here feeds back into a run.
@@ -35,8 +37,10 @@ METRICS = [  # (key, label, better)
     ("p2_unexplained", "P2 unexplained share", "low"),
     ("p3_axis_deg", "P3 axis error [deg]", "low"), ("p3_line_m", "P3 axis-line error [m]", "low"),
     ("p3_coord_mae", "P3 coordinate MAE", "low"),
-    ("sil_p1", "P1 alpha outside mask", "low"), ("sil_p2", "P2 alpha outside mask", "low"),
-    ("sil_p3", "P3 alpha outside mask", "low"),
+    ("vis_p1_feasible", "P1 frames FEASIBLE (constraint)", "high"),
+    ("vis_p2_feasible", "P2 frames FEASIBLE (constraint)", "high"),
+    ("vis_p3_feasible", "P3 frames FEASIBLE (constraint)", "high"),
+    ("vis_p2_violating", "P2 mean violating rays", "low"),
 ]
 
 
@@ -65,9 +69,14 @@ def scores(bidi: Path, d: str) -> dict:
         r["p1_recall"] = tp / (tp + fn) if tp + fn else None
         if r["p1_precision"] is not None and r["p1_recall"] is not None and r["p1_precision"] + r["p1_recall"] > 0:
             r["p1_f1"] = 2 * r["p1_precision"] * r["p1_recall"] / (r["p1_precision"] + r["p1_recall"])
-    s1 = _load(bidi / d / "silhouette_check.json")
-    if s1:
-        r["sil_p1"] = _num(s1.get("mean_alpha_outside_mask_fraction"))
+    def vis_stats(js):
+        fr = (js or {}).get("frames") or []
+        if not fr:
+            return None, None
+        feas = sum(1 for f in fr if f.get("status") == "FEASIBLE") / len(fr)
+        viol = sum((f.get("final_audit") or {}).get("violating_now", 0) for f in fr) / len(fr)
+        return feas, viol
+    r["vis_p1_feasible"], _ = vis_stats(_load(bidi / d / "visibility_constraint.json"))
     g = _load(bidi / f"{d}_rigid" / "joint_reduction" / "gt_evaluation.json")
     gt_type = None
     if g and g.get("available"):
@@ -80,9 +89,8 @@ def scores(bidi: Path, d: str) -> dict:
     if s:
         r["p2_gamma"] = _num((s.get("one_dof") or {}).get("gamma_1dof"))
         r["p2_unexplained"] = _num((s.get("support_rigidity") or {}).get("unexplained_fraction_final"))
-    s2 = _load(bidi / f"{d}_rigid" / "phase2_rigid" / "silhouette_check.json")
-    if s2:
-        r["sil_p2"] = _num(s2.get("mean_alpha_outside_mask_fraction"))
+    r["vis_p2_feasible"], r["vis_p2_violating"] = vis_stats(
+        _load(bidi / f"{d}_rigid" / "phase2_rigid" / "visibility_constraint.json"))
     e3 = _load(bidi / f"{d}_joint" / "evaluation_gt" / "phase3_gt_evaluation.json")
     if e3 and e3.get("fits"):
         t = gt_type or (e3.get("gt_joint") or {}).get("type")
@@ -90,9 +98,7 @@ def scores(bidi: Path, d: str) -> dict:
         r["p3_axis_deg"] = _num(f.get("axis_angle_deg"))
         r["p3_line_m"] = _num(f.get("line_distance_m"))
         r["p3_coord_mae"] = _num(f.get("coord_mae")) if f.get("matches_gt_type") else None
-        s3 = _load(bidi / f"{d}_joint" / str(t) / "silhouette_check.json")
-        if s3:
-            r["sil_p3"] = _num(s3.get("mean_alpha_outside_mask_fraction"))
+        r["vis_p3_feasible"], _ = vis_stats(_load(bidi / f"{d}_joint" / str(t) / "visibility_constraint.json"))
     r["gt_type"] = gt_type
     return r
 
@@ -132,7 +138,7 @@ def main(argv=None) -> int:
         w.writeheader()
         w.writerows(rows)
     # summary: per metric, how many runs improve / worsen, and the medians
-    L = [f"# --object-masks A/B\n", f"baseline (without): `{A}`  \nwith masks: `{B}`  \n"
+    L = [f"# Negative-ray constraint A/B\n", f"baseline (without): `{A}`  \nwith masks: `{B}`  \n"
          f"{len(rows)} scene x direction runs. GT used for scoring only.\n",
          "\n## Summary per metric\n", "| metric | runs | better with masks | worse | median without | median with |",
          "|---|---|---|---|---|---|"]
@@ -151,7 +157,7 @@ def main(argv=None) -> int:
     for title, keys in (("Phase 2 joint (GT-type hypothesis)", ["p2_axis_deg", "p2_line_m", "p2_gamma"]),
                         ("Phase 3 per-frame displacement", ["p3_coord_mae", "p3_axis_deg"]),
                         ("Phase 1 support", ["p1_precision", "p1_recall"]),
-                        ("Silhouette check (GT-free)", ["sil_p1", "sil_p2", "sil_p3"])):
+                        ("Constraint status (GT-free)", ["vis_p1_feasible", "vis_p2_feasible", "vis_p3_feasible"])):
         L += [f"\n## {title}\n", "| scene | dir | " + " | ".join(f"{l} without / with" for k, l, _ in METRICS if k in keys) + " |",
               "|---|---|" + "---|" * len(keys)]
         for r in rows:

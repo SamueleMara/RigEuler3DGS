@@ -1,4 +1,13 @@
-"""Object masks in the RGB-D measurement: where the object is absent, it must not render.
+"""WITHDRAWN DIAGNOSTIC PROTOTYPE -- not used by any pipeline stage.
+
+Superseded by the analytic visible-alpha constraint (estimator/visibility_constraint.py,
+CODEX_IMPLEMENT_ANALYTIC_BACKGROUND_VISIBILITY_CONSTRAINED_IEKF_2026-10-19.md): the
+distance-weighted D*A pseudo-observation, the black-on-white auxiliary views and the
+occlusion gate on the model's composited depth below are not a calibrated measurement
+model. Kept only so tests/test_object_silhouette.py can reproduce the camouflage and
+flat-landscape analysis.
+
+Object masks in the RGB-D measurement: where the object is absent, it must not render.
 
 Why this is needed on real captures. The synthetic exports have a black
 background without depth, which is exactly what the renderer produces where no

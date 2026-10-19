@@ -92,8 +92,8 @@ def parse_args(argv=None):
     ap.add_argument("--prior-q", type=float, default=1.0, help="prior sd of q at the anchor (m or rad)")
     ap.add_argument("--prior-qdot", type=float, default=1.0, help="prior sd of qdot (per frame)")
     ap.add_argument("--frames-on-cpu", action="store_true")
-    from estimator.silhouette import add_cli as _sil_cli
-    _sil_cli(ap)
+    from estimator.visibility_constraint import add_cli as _vis_cli
+    _vis_cli(ap)
     ap.add_argument("--evaluate-gt", action="store_true",
                     help="after the fits are written, score them against the dataset GT "
                          "(evaluation only, into <out>/evaluation_gt/)")
@@ -256,14 +256,6 @@ def main(argv=None) -> int:
     del lin0
     cam_ids = list(range(ncam))
     obs_pairs = [[(o[0], o[1]) if o is not None else None for o in ob] for ob in obs_all]
-    from estimator.silhouette import activate_from_args, silhouette_closures
-    sil = activate_from_args(args, source, frame_ids, frames_raw)
-
-    def base_prec(lin, t):
-        return effective_precision(lin, obs_all[t], cam_ids, cfg, model_error)
-    sil_lin, sil_prec, sil_extend = silhouette_closures(
-        sil, truth, mu0, R0, cameras, cfg, render_state, build_linearization, base_prec, obs_all, cam_ids)
-    obs_pairs = sil_extend(obs_pairs)
 
     init = load_initialisation(p2, members, mu0, T)
     wanted = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
@@ -285,17 +277,22 @@ def main(argv=None) -> int:
 
         def lin(st, t, _ctr=ctr):
             _ctr["t"] = t
-            return sil_lin(st, t)
+            mu, Rg = st.gaussians(t, mu0, R0)
+            return render_state(truth, mu, Rg, cameras, cfg, build_linearization)
 
         def prec(l, _ctr=ctr):
-            return sil_prec(l, _ctr["t"])
-
-        if sil is not None:
-            sil.check = {}
+            return effective_precision(l, obs_all[_ctr["t"]], cam_ids, cfg, model_error)
 
         print(f"\n  Phase 3 {name}: {args.iters} iterations per frame")
         t0 = time.time()
-        fit = fit_model(state, mu0, obs_pairs, lin, prec, jcfg, label=name)
+        from estimator.visibility_constraint import from_args as _vis_from_args
+        vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
+        fit = fit_model(state, mu0, obs_pairs, lin, prec, jcfg, label=name, visibility=vis_seq)
+        if vis_seq is not None:
+            vrows = [{"processing_index": k, **{kk: vv for kk, vv in (r.observability.get("visibility") or {}).items()
+                                                if kk != "iterations"}}
+                     for k, r in enumerate(fit["records"]) if r.observability.get("visibility")]
+            _json(out / name / "visibility_constraint.json", {"policy": vis_seq.policy.to_dict(), "mask_root": getattr(vis_seq, "mask_root", None), "frames": vrows})
         recs = fit["records"]
         p = state.parts[0]
         q = (p.s if name == "prismatic" else p.theta).tolist()
@@ -326,9 +323,6 @@ def main(argv=None) -> int:
             "posterior_sd_q_last": float(recs[-1].posterior[0, 0]) ** 0.5,
             "seconds": round(time.time() - t0, 1), **init["notes"].get(name, {})}
         _json(d / "geometry.json", summary_h[name])
-        if sil is not None:
-            _json(d / "silhouette_check.json", sil.summary())
-            summary_h[name]["silhouette_check_mean"] = sil.summary()["mean_alpha_outside_mask_fraction"]
         print(f"    {name}: energy {summary_h[name]['energy_total_before']:.4e} -> {e_tot:.4e}, "
               f"range {summary_h[name]['coordinate_range']:.4f}, "
               f"{summary_h[name]['frames_with_accepted_steps']}/{T} frames moved")
@@ -351,7 +345,6 @@ def main(argv=None) -> int:
         "joint_types_run": [k for k in fitted],
         "type_note": ("the type is an input (--hypotheses), never changed here; with both, each "
                       "hypothesis keeps its own fixed joint-identification geometry"),
-        "object_masks": None if sil is None else sil.config(),
         "gt_used_in_inference": False,
         "runtime_s": round(time.time() - t_start, 1)}
     _json(out / "summary.json", summary)

@@ -29,6 +29,7 @@ No Adam, no autograd, no loss.backward() anywhere in this file (section 36).
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
@@ -217,22 +218,17 @@ class IEKFDiagnostics:
         return self.rows[-1] if self.rows else {}
 
 
-def _all_precisions(lin, rgbd_gt, cfg: IEKFConfig):
-    """_precisions, plus the object-mask measurement when one is active
-    (estimator/silhouette.py): object RGB-D only inside the mask, and the
-    silhouette views' distance-weighted alpha residual outside it."""
-    from .silhouette import get_active
-    sil = get_active()
-    n = getattr(lin, "num_object_views", None)
-    if sil is None or n is None:
-        return _precisions(lin.views, rgbd_gt, cfg)
-    gts = list(rgbd_gt)[:n]
+def _object_valid(prec, visibility):
+    """With a negative-ray constraint active, the RGB-D likelihood is restricted to
+    object-valid rays (M = 1): the object-only model cannot explain background RGB
+    or background depth, and the constraint -- not a fictitious background fit --
+    is what speaks for the negative rays."""
+    if visibility is None:
+        return prec
     out = []
-    for j, (p_rgb, p_d, r_rgb, r_d) in enumerate(_precisions(lin.views[:n], gts, cfg)):
-        M = sil.object_gate(j, p_rgb.device).to(p_rgb.dtype)
-        out.append((p_rgb * M[None], p_d * M, r_rgb, r_d))
-    for j, ob in enumerate(gts):
-        out.append(sil.terms(j, lin.views[j], lin.views[n + j], ob[1], ob[2]))
+    for (p_rgb, p_d, r_rgb, r_d), M in zip(prec, visibility.masks, strict=True):
+        Mf = M.to(p_rgb.device, p_rgb.dtype)
+        out.append((p_rgb * Mf[None], p_d * Mf, r_rgb, r_d))
     return out
 
 
@@ -321,17 +317,18 @@ def evaluate_true_map_energy(
     cameras: Sequence[CameraSpec],
     cfg: IEKFConfig,
     background: torch.Tensor | None = None,
+    visibility=None,
 ) -> tuple[float, dict, FrameLinearization]:
     """Section 13's J(delta) = prior energy + measurement energy, evaluated on
-    the TRUE nonlinear render -- this is what acceptance is judged on."""
+    the TRUE nonlinear render -- this is what acceptance is judged on. With a
+    negative-ray constraint the measurement term is on object-valid rays and the
+    trial's visible-alpha values are attached to the linearization for the audit."""
     lin = build_linearization(state, cameras, background=background,
                               eps_depth=cfg.eps_depth,
                               antialiasing=cfg.antialiasing, debug=cfg.debug)
-    from .silhouette import get_active
-    if get_active() is not None:
-        lin = get_active().augment(lin, state, cameras, eps_depth=cfg.eps_depth,
-                                   antialiasing=cfg.antialiasing, debug=cfg.debug)
-    prec = _all_precisions(lin, rgbd_gt, cfg)
+    prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
+    if visibility is not None:
+        lin.visibility_values = visibility.evaluate(lin)
     meas = 0.0
     for p_rgb, p_d, r_rgb, r_d in prec:
         meas += float(measurement_energy(r_rgb, p_rgb))
@@ -355,6 +352,7 @@ def iekf_frame_step(
     background: torch.Tensor | None = None,
     partition=None,
     information_observer: Callable | None = None,
+    visibility=None,
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
@@ -378,6 +376,14 @@ def iekf_frame_step(
     if not cfg.multiview and len(cameras) > 1:
         cameras = list(cameras)[:1]
         rgbd_gt = list(rgbd_gt)[:1]
+        if visibility is not None:
+            raise ValueError("the negative-ray constraint needs the multiview observation set")
+    if visibility is not None:
+        if not cfg.use_trust_region:
+            raise ValueError("the negative-ray constraint is implemented on the trust-region step only")
+        if not (len(cameras) == len(rgbd_gt) == visibility.ncam):
+            raise AssertionError(f"{len(cameras)} cameras, {len(rgbd_gt)} observations, "
+                                 f"{visibility.ncam} masks: refusing a silent truncation")
     diag = IEKFDiagnostics()
     frozen_before = ((state_prev_post.colors.clone(), state_prev_post.opacity.clone(),
                       state_prev_post.scales.clone()) if cfg.frozen_appearance else None)
@@ -417,7 +423,7 @@ def iekf_frame_step(
     x = x_prior
     lm = float(cfg.lm_initial)
     energy, parts, lin = evaluate_true_map_energy(
-        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background)
+        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
 
     # --- 2b. V2 section 4: the scaled trust region -------------------------
     # The metric is built ONCE per frame and never changes inside the loop, so
@@ -457,6 +463,17 @@ def iekf_frame_step(
 
     radius = float(cfg.trust_radius_init)
     tr_history = TrustRegionHistory()
+    vis_ref = vis_cur = None
+    vis_log = []
+    vis_last = None
+    if visibility is not None:
+        vis_ref = visibility.row_values(lin.visibility_values)
+        vis_cur = vis_ref
+        diag.add(iteration=-1, event="visibility_reference", **visibility.coverage(),
+                 policy=visibility.policy.to_dict(),
+                 rays_violated_at_reference=int((vis_ref > visibility.policy.epsilon).sum()),
+                 max_violation_at_reference=float((vis_ref - visibility.policy.epsilon).clamp_min(0).max())
+                 if vis_ref.numel() else 0.0)
     g0_norm: float | None = None
     obs_report = None
     # A predicted reduction below this fraction of the objective is round-off,
@@ -487,7 +504,7 @@ def iekf_frame_step(
     for j in range(int(cfg.max_iters)):
         _bar.to(j)
         # --- 3. Nonlinear render + frozen linearization cache --------------
-        prec = _all_precisions(lin, rgbd_gt, cfg)
+        prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
         precisions = [(p_rgb, p_d) for p_rgb, p_d, _, _ in prec]
         residuals = [(r_rgb, r_d) for _, _, r_rgb, r_d in prec]
 
@@ -622,12 +639,62 @@ def iekf_frame_step(
                 step = step.clone()
                 step[:, :POSE_DIM] = projected
 
+            # Negative-ray constraint (opt-in): the correction is the A-norm
+            # projection of the trust-region step onto the linearized
+            # constraints, lifted by THIS stage's map J_g; a trial the full
+            # nonlinear audit rejects gets up to two second-order corrections
+            # (bounds tightened by the observed linearization error) before the
+            # radius shrinks.
+            vis_info = None
+            if visibility is not None:
+                from .visibility_constraint import constrained_step
+                if expand_step is not None:
+                    def _lift(v):
+                        return extract_pose(expand_step(v))
+
+                    def _liftT(pose):
+                        return _GT(embed_pose_to_full_state(pose))
+                else:
+                    def _lift(v):
+                        return extract_pose(v)
+
+                    def _liftT(pose):
+                        return embed_pose_to_full_state(pose)
+                step_tr = solve_step
+                margin = torch.zeros_like(vis_cur)
+                n_soc = 0
+                _t_vis = time.perf_counter()
+                while True:
+                    solve_step, vis_info, lin_pred = constrained_step(
+                        visibility, lin, lin.visibility_values, vis_ref, vis_cur, A_solve, solve_b,
+                        _lift, _liftT, step_tr, radius, solve_metric, M_inv=solve_precond, margin=margin,
+                        release_aggregate=False)
+                    vis_last = (lin, A_solve, solve_b, _lift, _liftT, solve_precond)
+                    step = expand_step(solve_step) if expand_step is not None else solve_step
+                    x_try = boxplus(x, step)
+                    e_try, parts_try, lin_try = evaluate_true_map_energy(
+                        x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
+                    vis_new = visibility.row_values(lin_try.visibility_values)
+                    vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
+                    if vis_audit["ok"] or n_soc >= 2:
+                        break
+                    hard = visibility.hard_rows(vis_ref)
+                    over = hard & (vis_new > visibility.policy.epsilon + visibility.policy.audit_tol)
+                    err = (vis_new - (vis_cur + torch.nan_to_num(lin_pred, nan=0.0))).clamp_min(0.0)
+                    if not bool(over.any()):
+                        break                      # the aggregate filter failed: shrink instead
+                    margin = margin + torch.where(over, err + visibility.policy.audit_tol, torch.zeros_like(err))
+                    n_soc += 1
+                vis_info["second_order_corrections"] = n_soc
+                vis_info["constraint_seconds"] = time.perf_counter() - _t_vis
+
             # The model decrease is the one the solver actually minimized, so
             # it is evaluated in the solved space.
             predicted = predicted_reduction(solve_step, solve_b, A_solve)
-            x_try = boxplus(x, step)
-            e_try, parts_try, lin_try = evaluate_true_map_energy(
-                x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background)
+            if visibility is None:
+                x_try = boxplus(x, step)
+                e_try, parts_try, lin_try = evaluate_true_map_energy(
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
             actual = energy_before - e_try
             # Section 4.4's gain ratio. A predicted reduction at round-off is
             # not evidence of anything, so rho is NaN there and adapt_radius
@@ -637,8 +704,17 @@ def iekf_frame_step(
                    if predicted > significance_floor * max(abs(energy_before), 1.0)
                    else float("nan"))
             radius_before = radius
+            if visibility is not None and not vis_audit["ok"]:
+                # the full nonlinear render creates visible object opacity on a
+                # trusted negative ray, or grows the pre-existing violation: reject
+                rho = float("nan")
             radius, accepted = adapt_radius(radius, rho, sres.boundary_hit,
                                             actual, tr_cfg)
+            if visibility is not None:
+                if accepted:
+                    vis_cur = vis_new
+                vis_log.append({"iteration": j, "accepted": accepted, **(vis_info or {}),
+                                "audit": vis_audit})
             trial_energy = e_try
             if accepted:
                 x, energy, lin, parts = x_try, e_try, lin_try, parts_try
@@ -680,7 +756,7 @@ def iekf_frame_step(
             while alpha >= cfg.alpha_min:
                 x_try = boxplus(x, alpha * step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
-                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background)
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
                 if e_try < energy:
                     x, energy, lin, parts = x_try, e_try, lin_try, parts_try
                     lm = max(cfg.lm_min, lm * cfg.lm_accept_scale)
@@ -741,9 +817,39 @@ def iekf_frame_step(
             break
 
     _bar.close()
+    if visibility is not None:
+        final = visibility.audit(vis_ref, vis_ref, vis_cur)
+        eps = visibility.policy.epsilon
+        indist = max([r.get("indistinguishable_violations", 0) for r in vis_log] or [0])
+        persistent = None
+        if final["violating_now"] == 0:
+            status = "FEASIBLE"
+        elif vis_last is not None:
+            # classification only (the state is not changed): one restoration QP
+            # with the operators of the last constrained linearization
+            from .visibility_constraint import classify_persistent
+            L_, A_, b_, lf_, lfT_, M_ = vis_last
+            persistent = classify_persistent(visibility, L_, L_.visibility_values, vis_ref,
+                                             visibility.row_values(L_.visibility_values),
+                                             A_, b_, lf_, lfT_, M_inv=M_)
+            persistent["classified_at"] = ("final linearization" if L_ is lin
+                                           else "last constrained linearization (one step before the final state)")
+            status = persistent["status"]
+        else:
+            status = "UNRESOLVED_INFEASIBLE"
+        diag.add(iteration=-3, event="visibility", status=status, final_audit=final,
+                 persistent_violation_classification=persistent,
+                 rays_violated_at_reference=int((vis_ref > eps).sum()),
+                 indistinguishable_violations=indist,
+                 constrained_steps=sum(1 for r in vis_log if r.get("status") not in (None, "INACTIVE")),
+                 rejected_by_audit=sum(1 for r in vis_log if r.get("audit") and not r["audit"]["ok"]),
+                 posterior_note=("unconstrained normal-operator inverse at the accepted state; with "
+                                 "active inequalities the posterior is truncated, so this covariance "
+                                 "is an approximation"),
+                 iterations=vis_log)
 
     # --- 11. Approximate posterior marginals, ONCE (section 17) ------------
-    prec = _all_precisions(lin, rgbd_gt, cfg)
+    prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
     fisher_pose = lin.build_block_fisher([(p, d) for p, d, _, _ in prec])
     Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
     # Invert in float64 and project back onto the PSD cone. The measurement

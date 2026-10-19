@@ -327,7 +327,7 @@ def kabsch_initialize(members: Tensor, mu0: Tensor, positions,
 def run_rigid_window(state: RigidState, mu0: Tensor, R0, observations,
                      linearize, precision_fn, times=None,
                      cfg: RigidIEKFConfig | None = None,
-                     label: str = "rigid") -> dict:
+                     label: str = "rigid", visibility=None) -> dict:
     """Predict / update / reset over the whole window.
 
     Frame 0 is the canonical gauge and carries no information about anything:
@@ -378,7 +378,8 @@ def run_rigid_window(state: RigidState, mu0: Tensor, R0, observations,
         prior_info = 0.5 * (prior_info + prior_info.T)
 
         rec = frame_step(state, frame, mu0, R0, observations[frame],
-                         linearize, precision_fn, prior_info, jcfg)
+                         linearize, precision_fn, prior_info, jcfg,
+                         visibility=None if visibility is None else visibility.for_frame(frame))
         state.covariance = rec.posterior
         part = state.parts[0]
         records.append(rec)

@@ -64,7 +64,7 @@ cameras and 60 frames; any number of cameras and frames is accepted.
   colmap_final/sparse/0    the same at the last frame           (static "final" model)
   rgb/cam_XXX/frame_XXXXXX.png
   depth_npy/cam_XXX/frame_XXXXXX.npy    metric Z in metres, 0 = invalid
-  mask/cam_XXX/...                      object silhouettes (static training only)
+  mask/cam_XXX/...                      object silhouettes (static training; motion stages with --object-mask-constraint)
   metadata/, pointcloud/                GT: used ONLY for evaluation
 ```
 
@@ -199,63 +199,105 @@ captures), every stage still runs. Only the GT metrics are skipped:
 | Phase 2 | `joint_reduction/gt_evaluation.json` says `GT_NOT_AVAILABLE`; the debug page shows "no GT available" |
 | Phase 3 | `evaluation_gt/phase3_gt_evaluation.json` has `gt_status` `GT_UNAVAILABLE`, or `GT_INCOMPLETE` when only `metadata/cameras.json` exists, and no fit is scored |
 
-### 2.5 Object masks in the motion stages (`--object-masks`, opt-in)
+### 2.5 Object masks in the motion stages (`--object-mask-constraint`, opt-in)
 
-**Why masks are needed on real data.** On the synthetic scenes the background is black and has no
-depth, which is exactly what the renderer draws where no Gaussian is. So the full-frame RGB term
-already acts as a silhouette constraint. On real captures that is not true:
+Code audit and proofs: [docs/BACKGROUND_MASK_IEKF_AUDIT_2026_10_19.md](docs/BACKGROUND_MASK_IEKF_AUDIT_2026_10_19.md).
 
-* the background is textured (mean RGB about 0.46) and has depth on about half the frame;
-* foreground occluders such as the robot or hand cover 11–14% of the frame.
+**The problem.** Phase 1/2/3 fit full-frame RGB and the valid depth over a constant render background
+(black). The renderer's background derivative is correct, and was checked numerically on four
+backgrounds. Even so, a Gaussian outside the object can sit where nothing penalises it:
 
-Without masks, Phase 1/2/3 let background and robot pixels pull object Gaussians toward them, and
-nothing penalises a Gaussian that has left the object.
+* on the synthetic scenes the observed background is black and has no depth, so a dark Gaussian
+  outside the mask leaves no residual;
+* on real captures the background is textured and has depth, so object Gaussians can fit it.
 
-**Why a background colour target is not enough in the EKF.** Appearance and opacity are frozen, so a
-stray Gaussian cannot fade as it does in static carving; it can only move.
+**What the constraint does.** The per-frame object mask is a measurement of where the object is
+**not**. For each such ray, the object's visible opacity must stay at most ε:
 
-* **Camouflage:** against a fixed background colour, a Gaussian of that colour leaves no residual.
-* **Flat landscape:** even a colour-free alpha target gives no translation gradient to a footprint
-  wholly outside the mask. Such Gaussians stay stuck.
+    A_vis = 1 − Π_i (1 − g_i α_i) ≤ ε
 
-**What `--object-masks` does** (`estimator/silhouette.py`), for every frame and camera:
+* The contributors are the renderer's own, with the same cut-off and clamp.
+* For a ray with no surface in front of the object (`trusted-full-ray`), g_i = 1.
+* For a ray in front of a measured non-object surface (`known-nonobject-depth`),
+  g_i = 1[splat depth < z_obs − δz]. Only splats in front of that surface count, and each is judged
+  by its own depth, never by the composited depth.
 
-* **Object pixels (inside the mask):** recorded RGB and depth, as before.
-* **Occluder pixels** (outside the mask, recorded surface in front of the rendered object, e.g. the
-  robot in front of the door): no claim, because the object may be hidden there.
-* **Absent pixels** (outside the mask otherwise): a silhouette measurement.
-  * Each camera gets a second "silhouette view": the same Gaussians rendered black over white, so the
-    colour is exactly 1 − alpha and the existing CUDA JVP/VJP give the alpha Jacobian.
-  * The target is alpha = 0, weighted by w = 1 + (D − band)/d0, where D is the distance to the mask.
-    So the weight is full strength at the edge and grows with distance.
-  * Every stray Gaussian therefore has a descent direction back to the mask, whatever its colour.
+Every IEKF iteration then works as follows:
 
-**GT-free check:** each stage writes `silhouette_check.json`, the share of the rendered alpha on
-absent pixels per frame: Phase 1 in `<dir>/`, Phase 2 in `<dir>_rigid/phase2_rigid/`, Phase 3 in
-`<dir>_joint/<type>/`.
+1. **Solve.** The step solves the constrained MAP problem: the trust-region step is projected onto
+   `A_vis + C_s δ ≤ ε` (a dual active-set solver, `solve_qp_projection` in `estimator/constrained_qp.py`). C_s is the visible-alpha
+   Jacobian (native CUDA JVP/VJP, `_C_vis`) lifted through the stage's own state, so the same code
+   serves Phase 1 (free Gaussians), Phase 2 (rigid SE(3)) and Phase 3 (per-frame joint
+   displacement, with the joint geometry and type fixed).
+2. **Re-render and audit.** The trial state is re-rendered and audited on every negative ray:
+   * no new violation;
+   * the total of the violations already present at the frame start does not grow.
+   A failing step is rejected.
+3. **Likelihood.** The RGB-D likelihood uses object pixels only (mask = 1).
 
-**Options:** `--silhouette-d0-px` (10), `--silhouette-band-px` (2), `--silhouette-dmax-px` (100),
-`--silhouette-occluder-tol-m` (0.05). Turn it on for the whole pipeline with:
+**Where it stops.** The constraint never invents a direction. A Gaussian that is stranded far outside
+the mask, offscreen, or behind measured depth has no information pulling it back, so it stays on its
+anchored trajectory. The frame is then reported as not `FEASIBLE`. If keeping the rays dark would
+contradict the RGB-D, for example a whole rigid part held back to hide one misowned Gaussian, those
+rays are released and the frame is reported as `MODEL_OWNERSHIP_INFEASIBLE`.
+
+**Output.** Each stage writes `visibility_constraint.json`:
+
+* contents: the resolved policy, the per-frame status (`FEASIBLE`, `MODEL_OWNERSHIP_INFEASIBLE`,
+  `UNRESOLVED_INFEASIBLE`, `INDISTINGUISHABLE`), ray counts, the audits, and the accepted and
+  rejected steps;
+* location: Phase 1 in `<dir>/`, Phase 2 in `<dir>_rigid/phase2_rigid/`, Phase 3 in
+  `<dir>_joint/<type>/`.
+
+**Options:**
+
+| option | default | meaning |
+|---|---|---|
+| `--object-mask-constraint {off,visible-negative-hard}` | `off` | turn the constraint on |
+| `--mask-ray-semantics {trusted-full-ray,known-nonobject-depth,conservative}` | `trusted-full-ray` | how a negative ray is read: `trusted-full-ray` for the synthetic SAPIEN scenes (no occluders); `known-nonobject-depth` for real captures with measured surfaces; `conservative` counts the rays but constrains none |
+| `--mask-source DIR` | `<source>/mask` | the mask directory itself (`<cam>/frame_NNNNNN.png`); in `run_bidirectional_all.sh` use `--mask-subdir NAME` for `<scene>/NAME` |
+| `--mask-depth-noise-m S` | none | required by `known-nonobject-depth`, which is refused without it; δz = 3S |
+| `--mask-boundary-px N` | 2 | rays within N px of the mask edge are left free (antialiasing, Gaussian tails) |
+| `--mask-alpha-epsilon E` | 0.05 | ε |
+
+The driver forwards these flags to Phase 1, 2 and 3, and only when the mode is not `off`:
 
 ```bash
-bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "static phase1 phase2 phase3" --object-masks
+bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "phase1 phase2 phase3" \
+  --object-mask-constraint visible-negative-hard --mask-ray-semantics trusted-full-ray
 ```
 
-**Status:** opt-in, not yet validated at full scale.
+**A/B on the synthetic scenes**, at the same static endpoints:
 
-* Tests: `tests/test_object_silhouette.py`, 11 checks on the CUDA renderer. They cover the 1 − A
-  identity, the alpha JVP against finite differences, both failure modes, the pull back to the mask
-  for dark and bright Gaussians, and occluders.
-* Smoke runs on synthetic `fridge_10905` forward, 2 cameras and 1 iteration per frame:
+* without the constraint: the Phase 1/2 results under `ours/` are copied, never linked, because the
+  drive is exFAT; only Phase 3 is rerun;
+* with the constraint: Phase 1/2/3 are rerun.
 
-  | stage | without masks | with masks |
-  |---|---|---|
-  | Phase 2 axis error | 0.16° | 0.03° |
-  | Phase 2 axis-line error | 0.9 cm | 2.2 cm |
-  | Phase 3 angle MAE | 0.0072 rad | 0.0061 rad |
+The table goes to `$RES/object_masks_ab/`:
 
-* An A/B at the standard settings on synthetic and real scenes is still to be run before making it
-  the default.
+```bash
+bash scripts/run_object_mask_ab.sh            # --dry-run to preview, --compare-only to redo the table
+```
+
+**Tests** (real CUDA renderer):
+
+| test file | checks |
+|---|---|
+| `tests/test_background_compositing_audit.py` | 11 |
+| `tests/test_visible_alpha_operators.py` | 12 |
+| `tests/test_constrained_qp.py` | 21 |
+| `tests/test_visibility_constrained_iekf_phase1.py` | 12 |
+| `tests/test_visibility_constrained_iekf_phase23.py` | 8 |
+
+**Building `_C_vis`.** This is a separate extension; `_C` is unchanged:
+
+```bash
+cd submodules/diff-gaussian-rasterization && python setup_vis.py build_ext --inplace --build-temp build_vis
+```
+
+**Withdrawn.** The earlier `--object-masks` prototype (`estimator/silhouette.py`) is no longer used
+by any stage. It rendered black-on-white silhouette views and applied a distance-weighted pull
+toward the mask, a measurement model without justification.
 
 ### 2.6 GPU memory (8 GB card)
 

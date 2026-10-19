@@ -236,14 +236,14 @@ def residual_split(state, mu0, truth, cameras, frames, cfg, precision_fn,
 
 
 def fit_model(state, mu0, observations, linearize, precision_fn,
-              cfg: JointIEKFConfig, label: str = ""):
+              cfg: JointIEKFConfig, label: str = "", visibility=None):
     """Section 28: the shared IEKF, unchanged, driving a physical model.
 
     `label` only names the model on the progress bar; the fit is identical
     whatever it says.
     """
     return run_window(state, mu0, None, observations, linearize, precision_fn,
-                      cfg=cfg, label=label)
+                      cfg=cfg, label=label, visibility=visibility)
 
 
 def heldout_delta(e_p: float, e_r: float) -> float:
