@@ -105,13 +105,26 @@ if [ "$COMPARE_ONLY" != "1" ]; then
   OK="${OK# }"
   [ -n "$OK" ] || { echo "no scene ready"; exit 1; }
   echo
-  echo "=== 1/2  WITHOUT ($WITH off): Phase 3 on the stable Phase 1/2 results"
-  bash run_bidirectional_all.sh --input "$DATA" --output "$NOMASK" --scenes "$OK" \
-    --stages "phase3" "${DRYFLAG[@]}"
-  echo
-  echo "=== 2/2  WITH $WITH: Phase 1, 2 and 3"
-  bash run_bidirectional_all.sh --input "$DATA" --output "$MASKS" --scenes "$OK" \
-    --stages "phase1 phase2 phase3" "${MODEARGS[@]}" "${DRYFLAG[@]}"
+  C1=(bash run_bidirectional_all.sh --input "$DATA" --output "$NOMASK" --scenes "$OK" --stages "phase3")
+  C2=(bash run_bidirectional_all.sh --input "$DATA" --output "$MASKS" --scenes "$OK"
+      --stages "phase1 phase2 phase3" "${MODEARGS[@]}")
+  if [ "$DRY" = "1" ]; then
+    # A dry run copies nothing, so the driver's own dry run would find no static
+    # model in the (still empty) destination roots and report every scene as
+    # "static/initial missing". Print the commands instead; the copy plan above
+    # already checked that every source model exists.
+    echo "=== 1/2  WITHOUT ($WITH off): Phase 3 on the stable Phase 1/2 results"
+    echo "  + $(printf '%q ' "${C1[@]}")"
+    echo "=== 2/2  WITH $WITH: Phase 1, 2 and 3"
+    echo "  + $(printf '%q ' "${C2[@]}")"
+    echo "  (dry run: nothing was copied; the static models above are copied on the real run)"
+  else
+    echo "=== 1/2  WITHOUT ($WITH off): Phase 3 on the stable Phase 1/2 results"
+    "${C1[@]}"
+    echo
+    echo "=== 2/2  WITH $WITH: Phase 1, 2 and 3"
+    "${C2[@]}"
+  fi
 fi
 
 echo
