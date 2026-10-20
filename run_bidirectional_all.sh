@@ -40,6 +40,16 @@
 #                --mask-depth-noise-m (required for known-nonobject-depth),
 #                --mask-boundary-px (2), --mask-alpha-epsilon (0.05),
 #                --mask-subdir NAME (masks read from <scene>/NAME; default mask)
+# --observation-mode original|masked-rgb-constant|masked-rgb-expected-quad
+#                (default original = the unchanged full-frame observation).
+#                masked-rgb-*: Phase 1/2/3 observe the masked object RGB composited
+#                on a known artificial background (rendered on the same one) and
+#                depth on the object only (estimator/masked_observation.py);
+#                expected-quad adds the exact Uniform[0,1]-background expectation
+#                term. With --rgb-background-constant R G B (constant mode) or
+#                --rgb-background-distribution uniform01 (expected mode, default),
+#                and --mask-subdir. Never combined with --object-mask-constraint;
+#                static training receives none of these switches.
 # --dry-run      print the commands only
 #
 # The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
@@ -63,7 +73,7 @@ set -u
 cd "$(dirname "$0")"
 
 usage() { sed -n '3,/^set -u/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; }
-INPUT="" ; OUTPUT=""
+INPUT="" ; OUTPUT="" ; OBS_BG=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -i|--input)   INPUT="$2"; shift 2;;
@@ -79,6 +89,9 @@ while [ $# -gt 0 ]; do
     --mask-boundary-px)       VIS_BAND="$2"; shift 2;;
     --mask-alpha-epsilon)     VIS_EPS="$2"; shift 2;;
     --mask-subdir)            VIS_SUBDIR="$2"; shift 2;;
+    --observation-mode)       OBS_MODE="$2"; shift 2;;
+    --rgb-background-constant) OBS_BG=("$2" "$3" "$4"); shift 4;;
+    --rgb-background-distribution) OBS_DIST="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -110,6 +123,22 @@ if [ "$VIS_MODE" != "off" ]; then
   VISARGS=(--object-mask-constraint "$VIS_MODE" --mask-ray-semantics "${VIS_SEM:-trusted-full-ray}"
            --mask-boundary-px "${VIS_BAND:-2}" --mask-alpha-epsilon "${VIS_EPS:-0.05}")
   [ -n "${VIS_DNOISE:-}" ] && VISARGS+=(--mask-depth-noise-m "$VIS_DNOISE")
+fi
+OBS_MODE=${OBS_MODE:-original}
+OBSARGS=()
+case "$OBS_MODE" in
+  original) [ ${#OBS_BG[@]} -eq 0 ] && [ -z "${OBS_DIST:-}" ] || { echo "--rgb-background-* needs a masked --observation-mode" >&2; exit 2; };;
+  masked-rgb-constant)
+    [ ${#OBS_BG[@]} -eq 3 ] || { echo "masked-rgb-constant needs --rgb-background-constant R G B" >&2; exit 2; }
+    OBSARGS=(--observation-mode "$OBS_MODE" --rgb-background-constant "${OBS_BG[@]}");;
+  masked-rgb-expected-quad)
+    [ ${#OBS_BG[@]} -eq 0 ] || { echo "--rgb-background-constant is for masked-rgb-constant" >&2; exit 2; }
+    OBSARGS=(--observation-mode "$OBS_MODE" --rgb-background-distribution "${OBS_DIST:-uniform01}");;
+  *) echo "unknown --observation-mode $OBS_MODE" >&2; exit 2;;
+esac
+if [ "$OBS_MODE" != "original" ] && [ "$VIS_MODE" != "off" ]; then
+  echo "--observation-mode $OBS_MODE and --object-mask-constraint $VIS_MODE are different measurement models; choose one" >&2
+  exit 2
 fi
 # fewer "reserved but unallocated" failures on the shared 8 GB card
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
@@ -220,6 +249,7 @@ echo "scenes     : $SCENES"
 echo "output root: $OUT_ROOT   (each scene -> $OUT_ROOT/<scene>/)"
 echo "stages     : $STAGES"
 [ "$VIS_MODE" != "off" ] && echo "mask constraint: ${VISARGS[*]}"
+[ "$OBS_MODE" != "original" ] && echo "observation: ${OBSARGS[*]} (masks <scene>/${VIS_SUBDIR:-mask})"
 [ "$DRY" = "1" ] || mkdir -p "$OUT_ROOT"
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -248,7 +278,7 @@ T_ALL=$(date +%s)
 
 for S in $SCENES; do
   SRC="$SRC_ROOT/$S"
-  VISSRC=(); [ "$VIS_MODE" != "off" ] && VISSRC=(--mask-source "$SRC/${VIS_SUBDIR:-mask}")
+  VISSRC=(); { [ "$VIS_MODE" != "off" ] || [ "$OBS_MODE" != "original" ]; } && VISSRC=(--mask-source "$SRC/${VIS_SUBDIR:-mask}")
   OUT="$OUT_ROOT/$S"
   BIDI="$OUT/bidirectional"
   LOGS="$OUT/logs"
@@ -324,7 +354,7 @@ for S in $SCENES; do
             --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
-            --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" --out "$P1"
+            --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! phase1/$DIR failed rc=$RC"
@@ -355,7 +385,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --frames "$NF" --cameras "$NC" \
-          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" \
+          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
           --out "$P2"
@@ -390,7 +420,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
-          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${VISSRC[@]}" \
+          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" \
           --evaluate-gt --out "$P3"
       RC=$?
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then

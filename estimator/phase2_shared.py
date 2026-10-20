@@ -89,7 +89,73 @@ def weighted_energy(lin, obs_all, cam_ids, precisions):
     return rows
 
 
-def render_state(truth, mu, Rg, cameras, cfg, build_linearization):
+def effective_precision_masked(lin, prepared_all, cam_ids, cfg, model_error=None):
+    """The masked observation mode's (W_rgb, W_depth) per camera, for a camera subset.
+
+    W_rgb is FIXED: 1/(sigma_sensor^2 + sigma_model^2) per pixel and channel (the
+    same sensor + model-error variance as `effective_precision`, estimated once),
+    WITHOUT the residual-dependent Student-t weight, because the exact background
+    expectation is defined for a fixed quadratic RGB cost. Depth keeps the existing
+    robust precision, on V_used = V_orig AND M (and the pre-existing coverage gate).
+    """
+    from .masked_observation import depth_precision
+    out = []
+    for j, c in enumerate(cam_ids):
+        v = lin.views[j]
+        ob = prepared_all[c].to(v.rgb.device)
+        if model_error is not None:
+            pr = model_error.effective_rgb_precision(c, cfg.rgb_sigma).expand_as(v.rgb).contiguous()
+        else:
+            pr = torch.full_like(v.rgb, 1.0 / (cfg.rgb_sigma ** 2))
+        r_d = torch.where(ob.depth_valid, ob.depth_observed - v.depth, torch.zeros_like(v.depth))
+        pd, valid = depth_precision(v, ob, r_d, cfg)
+        if model_error is not None:
+            sv = torch.ones_like(pd) * (cfg.depth_sigma_a ** 2)
+            pd = model_error.effective_depth_precision(c, sv, robust_weight=pd * sv)
+            pd = pd * valid.to(pd.dtype)
+        out.append((pr, pd))
+    return out
+
+
+def weighted_energy_masked(lin, prepared_all, cam_ids, precisions, model):
+    """The masked objective per camera: RGB on the known background, foreground depth
+    and (expected mode) 1/2 kappa (A - M)^2."""
+    from .masked_observation import residuals
+    rows = []
+    for j, c in enumerate(cam_ids):
+        v = lin.views[j]
+        ob = prepared_all[c].to(v.rgb.device)
+        pc, pd = precisions[j]
+        r_c, r_d, r_a = residuals(v, ob, model.background_tensor(v.rgb.device))
+        er = 0.5 * float((pc.double() * r_c.double().square()).sum())
+        ed = 0.5 * float((pd.double() * r_d.double().square()).sum())
+        ea = 0.5 * float((model.kappa(pc).double() * r_a.double().square()).sum())
+        rows.append({"camera": c, "rgb": er, "depth": ed, "alpha": ea, "total": er + ed + ea})
+    return rows
+
+
+class PreparedFrames:
+    """Lazy, per-frame PreparedRGBD lists (processing order) for the Phase 2/3 filters:
+    a frame is prepared when first touched and kept until another frame is asked for,
+    so a long real sequence is never duplicated in memory."""
+
+    def __init__(self, masked_seq, obs_all):
+        if len(obs_all) != len(masked_seq.masks):
+            raise AssertionError(f"{len(obs_all)} observation frames but {len(masked_seq.masks)} mask frames")
+        self.seq, self.obs_all = masked_seq, obs_all
+        self._k, self._v = None, None
+
+    def __len__(self):
+        return len(self.obs_all)
+
+    def __getitem__(self, k):
+        if self._k != k:
+            self._v = self.seq.prepare_frame(k, [o for o in self.obs_all[k]], device="cpu")
+            self._k = k
+        return self._v
+
+
+def render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=None):
     """Linearize a (centers, orientations) pair with the REAL renderer.
 
     Section 2: the orientations must reach the rasterizer. A debug helper that
@@ -104,4 +170,4 @@ def render_state(truth, mu, Rg, cameras, cfg, build_linearization):
     if Rg is not None:
         kw["R"] = Rg.to(truth.R.dtype)
     s = dataclasses.replace(truth, **kw)
-    return build_linearization(s, cameras, eps_depth=cfg.eps_depth)
+    return build_linearization(s, cameras, eps_depth=cfg.eps_depth, background=background)

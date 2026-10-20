@@ -1755,11 +1755,23 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         def capture_information(prior_block, image_block):
             prior.append(prior_block.detach().cpu())
         vis_seq = getattr(args, "visibility_constraint", None)
-        new_state, _, diag = iekf_frame_step(seed, P, obs, cameras,
+        mseq = getattr(args, "masked_observation", None)
+        new_state, _, diag = iekf_frame_step(seed, P,
+                                             obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev),
+                                             cameras,
                                              dt=args.dt, cfg=bcfg,
                                              partition=partition,
                                              information_observer=capture_information if observer else None,
-                                             visibility=None if vis_seq is None else vis_seq.for_frame(ti))
+                                             visibility=None if vis_seq is None else vis_seq.for_frame(ti),
+                                             observation_model=None if mseq is None else mseq.model)
+        if mseq is not None:
+            ev = [r for r in diag.rows if r.get("event") in ("initial", "accepted", "rejected")]
+            acc = [r for r in ev if r.get("event") == "accepted"]
+            keys = ("energy", "rgb_energy", "alpha_energy", "depth_energy", "prior")
+            mseq.report.append({"processing_index": ti, "frame": fid,
+                                "initial": {k: ev[0].get(k) for k in keys} if ev else None,
+                                "final": {k: (acc[-1] if acc else ev[0]).get(k) for k in keys} if ev else None,
+                                "iterations": len(ev) - 1, "accepted": len(acc)})
         if vis_seq is not None:
             ev = next((r for r in diag.rows if r.get("event") == "visibility"), None)
             if ev is not None:

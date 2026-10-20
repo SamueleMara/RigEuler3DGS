@@ -30,4 +30,12 @@ void applyVJP(int P, int W, int H, const IEKF::CachePointers cache,
               const float* z_alpha, const float* final_Tf, const uint32_t* n_contrib,
               float* out_adjoint, bool debug);
 
+void buildFisher(int P, int W, int H, const IEKF::CachePointers cache,
+                 const uint2* ranges, const uint32_t* point_list,
+                 const float* means3D, const float* viewmatrix, const float* projmatrix,
+                 float tan_fovx, float tan_fovy,
+                 const int* ray_mode, const float* z_obs, float delta_z,
+                 const float* weight_alpha, const float* final_Tf, const uint32_t* n_contrib,
+                 float* out_fisher, bool debug);
+
 }} // namespace CudaRasterizer::IEKFVis

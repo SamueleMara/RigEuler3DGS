@@ -112,6 +112,8 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    from estimator.masked_observation import add_cli as _mask_obs_cli
+    _mask_obs_cli(ap)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--direction", choices=("forward", "backward"),
                     default="forward",
@@ -204,20 +206,39 @@ def main() -> int:
     print(f"  {mu0.shape[0]} Gaussians, {ncam} cameras, {T} frames")
 
     dev = mu0.device
-    ref_obs = [(o[0].to(dev), o[1].to(dev),
-                o[2].to(dev) if o[2] is not None else None)
-               for o in obs_all[0] if o is not None]
-    lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth)
+    # Masked observation mode (estimator/masked_observation.py): the RGB target is
+    # the masked composite on the model's background, the scene is rendered on the
+    # same background, depth counts on the object only, and the model-error map is
+    # estimated from THAT residual at the canonical frame.
+    from estimator.masked_observation import from_args as _masked_from_args
+    from estimator.phase2_shared import (PreparedFrames, effective_precision_masked,
+                                         weighted_energy_masked)
+    mseq = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+    bg = None if mseq is None else mseq.model.background_tensor(dev)
+    prepared = None if mseq is None else PreparedFrames(mseq, obs_all)
+    if mseq is None:
+        ref_obs = [(o[0].to(dev), o[1].to(dev),
+                    o[2].to(dev) if o[2] is not None else None)
+                   for o in obs_all[0] if o is not None]
+    else:
+        ref_obs = [(o.target(bg), o.depth_observed, o.depth_valid)
+                   for o in (ob.to(dev) for ob in prepared[0])]
+    lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth, background=bg)
     model_error = estimate_model_error(lin0, ref_obs, reference_index=0,
                                        beta=1.0, blur=1)
     del lin0
 
     def prec_at(lin, t):
+        if mseq is not None:
+            return effective_precision_masked(lin, prepared[t], cam_ids, cfg, model_error)
         return effective_precision(lin, obs_all[t], cam_ids, cfg, model_error)
 
     def energies(mu, Rg, t):
-        lin = render_state(truth, mu, Rg, cameras, cfg, build_linearization)
-        rows = weighted_energy(lin, obs_all[t], cam_ids, prec_at(lin, t))
+        lin = render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=bg)
+        if mseq is not None:
+            rows = weighted_energy_masked(lin, prepared[t], cam_ids, prec_at(lin, t), mseq.model)
+        else:
+            rows = weighted_energy(lin, obs_all[t], cam_ids, prec_at(lin, t))
         del lin
         return rows
 
@@ -252,6 +273,7 @@ def main() -> int:
         from tools.kpart_pipeline import bootstrap_positions
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
+        ns.masked_observation = mseq
         positions, p1_info = bootstrap_positions(truth, cameras, window, cfg,
                                                  None, ns, verbose=True)
     (p1dir / "centers").mkdir(parents=True, exist_ok=True)
@@ -315,7 +337,7 @@ def main() -> int:
 
     def linearize(st, frame):
         mu, Rg = st.gaussians(frame, mu0, R0)
-        return render_state(truth, mu, Rg, cameras, cfg, build_linearization)
+        return render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=bg)
 
     ctr = {"t": 0}
 
@@ -330,8 +352,17 @@ def main() -> int:
                  for ob in obs_all]
     from estimator.visibility_constraint import from_args as _vis_from_args
     vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
-    res = run_rigid_window(state, mu0, R0, obs_pairs, _lin, precision_fn,
-                           cfg=rcfg, label="rigid", visibility=vis_seq)
+    res = run_rigid_window(state, mu0, R0, obs_pairs if mseq is None else prepared, _lin, precision_fn,
+                           cfg=rcfg, label="rigid", visibility=vis_seq,
+                           observation_model=None if mseq is None else mseq.model)
+    if mseq is not None:
+        _json(out / "phase2_rigid" / "masked_observation.json", {
+            **mseq.model.to_dict(), "mask_root": mseq.mask_root, "cameras": mseq.cameras,
+            "rgb_precision": "1/(rgb_sigma^2 + model-error variance), fixed, no Student-t weight",
+            "rgb_sigma": cfg.rgb_sigma, "coverage": mseq.counts(),
+            "frames": [{"processing_index": k, "energy_before": r.energy_before,
+                        "energy_after": r.energy_after, "iterations": r.iterations,
+                        "accepted": r.accepted} for k, r in enumerate(res["records"])]})
     if vis_seq is not None:
         vrows = [{"processing_index": k, **{kk: vv for kk, vv in (r.observability.get("visibility") or {}).items()
                                             if kk != "iterations"}}

@@ -94,6 +94,8 @@ def parse_args(argv=None):
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    from estimator.masked_observation import add_cli as _mask_obs_cli
+    _mask_obs_cli(ap)
     ap.add_argument("--evaluate-gt", action="store_true",
                     help="after the fits are written, score them against the dataset GT "
                          "(evaluation only, into <out>/evaluation_gt/)")
@@ -249,9 +251,20 @@ def main(argv=None) -> int:
 
     # ---- measurement model: Phase 2's, unchanged -------------------------
     dev = mu0.device
-    ref_obs = [(o[0].to(dev), o[1].to(dev), o[2].to(dev) if o[2] is not None else None)
-               for o in obs_all[0] if o is not None]
-    lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth)
+    # masked observation mode: same composite target / background / foreground depth
+    # and model-error estimate as Phase 2 (estimator/masked_observation.py)
+    from estimator.masked_observation import from_args as _masked_from_args
+    from estimator.phase2_shared import PreparedFrames, effective_precision_masked
+    mseq = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+    bg = None if mseq is None else mseq.model.background_tensor(dev)
+    prepared = None if mseq is None else PreparedFrames(mseq, obs_all)
+    if mseq is None:
+        ref_obs = [(o[0].to(dev), o[1].to(dev), o[2].to(dev) if o[2] is not None else None)
+                   for o in obs_all[0] if o is not None]
+    else:
+        ref_obs = [(o.target(bg), o.depth_observed, o.depth_valid)
+                   for o in (ob.to(dev) for ob in prepared[0])]
+    lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth, background=bg)
     model_error = estimate_model_error(lin0, ref_obs, reference_index=0, beta=1.0, blur=1)
     del lin0
     cam_ids = list(range(ncam))
@@ -278,16 +291,27 @@ def main(argv=None) -> int:
         def lin(st, t, _ctr=ctr):
             _ctr["t"] = t
             mu, Rg = st.gaussians(t, mu0, R0)
-            return render_state(truth, mu, Rg, cameras, cfg, build_linearization)
+            return render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=bg)
 
         def prec(l, _ctr=ctr):
+            if mseq is not None:
+                return effective_precision_masked(l, prepared[_ctr["t"]], cam_ids, cfg, model_error)
             return effective_precision(l, obs_all[_ctr["t"]], cam_ids, cfg, model_error)
 
         print(f"\n  Phase 3 {name}: {args.iters} iterations per frame")
         t0 = time.time()
         from estimator.visibility_constraint import from_args as _vis_from_args
         vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
-        fit = fit_model(state, mu0, obs_pairs, lin, prec, jcfg, label=name, visibility=vis_seq)
+        fit = fit_model(state, mu0, obs_pairs if mseq is None else prepared, lin, prec, jcfg, label=name,
+                        visibility=vis_seq, observation_model=None if mseq is None else mseq.model)
+        if mseq is not None:
+            _json(out / name / "masked_observation.json", {
+                **mseq.model.to_dict(), "mask_root": mseq.mask_root, "cameras": mseq.cameras,
+                "rgb_precision": "1/(rgb_sigma^2 + model-error variance), fixed, no Student-t weight",
+                "rgb_sigma": cfg.rgb_sigma, "coverage": mseq.counts(),
+                "frames": [{"processing_index": k, "energy_before": r.energy_before,
+                            "energy_after": r.energy_after, "iterations": r.iterations,
+                            "accepted": r.accepted} for k, r in enumerate(fit["records"])]})
         if vis_seq is not None:
             vrows = [{"processing_index": k, **{kk: vv for kk, vv in (r.observability.get("visibility") or {}).items()
                                                 if kk != "iterations"}}

@@ -126,6 +126,8 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    from estimator.masked_observation import add_cli as _mask_obs_cli
+    _mask_obs_cli(ap)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
                     help="v2 = section 11-19 coherent-component extraction "
                          "(default); ncut = the superseded two-way normalized "
@@ -269,6 +271,8 @@ def main() -> int:
         cameras = frames_raw[0][1]
         from estimator.visibility_constraint import from_args as _vis_from_args
         ns.visibility_constraint = _vis_from_args(args, source, frames_raw, frame_ids)
+        from estimator.masked_observation import from_args as _masked_from_args
+        ns.masked_observation = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
         print(f"  Phase 1 over {len(window)} frames ...")
@@ -286,6 +290,12 @@ def main() -> int:
                 "policy": vs.policy.to_dict(), "mask_root": getattr(vs, "mask_root", None), "frames": vs.report,
                 "status_counts": {k: sum(1 for r in vs.report if r["status"] == k)
                                   for k in sorted({r["status"] for r in vs.report})}}, indent=1, default=str))
+        if ns.masked_observation is not None:
+            ms = ns.masked_observation
+            (out / "masked_observation.json").write_text(json.dumps({
+                **ms.model.to_dict(), "mask_root": ms.mask_root, "cameras": ms.cameras,
+                "rgb_sigma_fixed": ms.model.rgb_sigma, "coverage": ms.counts(),
+                "frames": ms.report}, indent=1, default=str))
         # Step 5: persist in ORIGINAL CHRONOLOGICAL indexing.
         #
         # `positions` comes back in PROCESSING order, so for a backward run

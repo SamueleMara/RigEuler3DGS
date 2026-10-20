@@ -309,6 +309,37 @@ def group_precond(M_blocks: torch.Tensor, grouped, G, GT) -> Callable:
     return block_jacobi_preconditioner(G_blocks)
 
 
+def measurement_operators(lin: FrameLinearization, prec, alpha_terms=None):
+    """The frame's measurement part of the Gauss-Newton system, in the pose tangent:
+
+        rhs     = H_C^T W r_C + H_D^T W_D r_D  [+ H_A^T K r_A]
+        normal  = v -> H_C^T W H_C v + H_D^T W_D H_D v  [+ H_A^T K H_A v]
+        fisher  = the per-Gaussian 6x6 diagonal blocks of `normal`
+
+    `prec` is [(p_rgb, p_d, r_rgb, r_d)] per camera; `alpha_terms` is [(kappa, r_A)]
+    in the masked expected-quad mode and None otherwise (then this is exactly the
+    original RGB-D operator). One normal operator, one solve."""
+    precisions = [(p_rgb, p_d) for p_rgb, p_d, _, _ in prec]
+    rhs = lin.apply_HT([(p_rgb * r_rgb, p_d * r_d) for p_rgb, p_d, r_rgb, r_d in prec])
+    if alpha_terms is not None:
+        rhs = rhs + lin.apply_HT_alpha([k * r for k, r in alpha_terms])
+
+    def normal(pose: torch.Tensor) -> torch.Tensor:
+        Hv = lin.apply_H(pose)
+        out = lin.apply_HT([(pc * a, pd * d) for (pc, pd), (a, d) in zip(precisions, Hv)])
+        if alpha_terms is not None:
+            dA = lin.apply_H_alpha(pose)
+            out = out + lin.apply_HT_alpha([k * da for (k, _), da in zip(alpha_terms, dA)])
+        return out
+
+    def fisher() -> torch.Tensor:
+        F = lin.build_block_fisher(precisions)
+        if alpha_terms is not None:
+            F = F + lin.build_alpha_fisher([k for k, _ in alpha_terms])
+        return F
+    return rhs, normal, fisher
+
+
 def evaluate_true_map_energy(
     state: GaussianMotionState,
     x_prior: GaussianMotionState,
@@ -318,6 +349,7 @@ def evaluate_true_map_energy(
     cfg: IEKFConfig,
     background: torch.Tensor | None = None,
     visibility=None,
+    observation_model=None,
 ) -> tuple[float, dict, FrameLinearization]:
     """Section 13's J(delta) = prior energy + measurement energy, evaluated on
     the TRUE nonlinear render -- this is what acceptance is judged on. With a
@@ -326,6 +358,16 @@ def evaluate_true_map_energy(
     lin = build_linearization(state, cameras, background=background,
                               eps_depth=cfg.eps_depth,
                               antialiasing=cfg.antialiasing, debug=cfg.debug)
+    if observation_model is not None:
+        # masked RGB on the known background + 1/2 kappa (A - M)^2 + foreground-valid
+        # depth, all on THIS trial render (estimator/masked_observation.py)
+        from .masked_observation import energy_terms, phase1_terms
+        terms = energy_terms(*phase1_terms(lin.views, rgbd_gt, cfg, observation_model))
+        meas = terms["rgb"] + terms["depth"] + terms["alpha"]
+        delta = boxminus(state, x_prior)
+        prior = 0.5 * float((delta * apply_prior(Lambda_prior, delta)).sum())
+        return meas + prior, {"measurement": meas, "prior": prior, "rgb_energy": terms["rgb"],
+                              "depth_energy": terms["depth"], "alpha_energy": terms["alpha"]}, lin
     prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
     if visibility is not None:
         lin.visibility_values = visibility.evaluate(lin)
@@ -353,12 +395,19 @@ def iekf_frame_step(
     partition=None,
     information_observer: Callable | None = None,
     visibility=None,
+    observation_model=None,
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
     ``rgbd_gt`` is a sequence, one entry per camera, of
     ``(rgb [3,H,W], depth [H,W], depth_valid [H,W] bool)``.
     ``dt`` is the REAL inter-frame time in seconds (section 0 rule 11).
+
+    ``observation_model`` (estimator/masked_observation.py): ``rgbd_gt`` is then a
+    sequence of PreparedRGBD, the scene is rendered on the model's background, and
+    the measurement is masked RGB + (expected mode) 1/2 kappa (A - M)^2 + depth on
+    the object only -- in the energy, the RHS, the normal operator, the Fisher
+    preconditioner and the posterior alike.
     """
     cfg = cfg or IEKFConfig()
     if cfg.cache_derivative_basis:
@@ -378,6 +427,15 @@ def iekf_frame_step(
         rgbd_gt = list(rgbd_gt)[:1]
         if visibility is not None:
             raise ValueError("the negative-ray constraint needs the multiview observation set")
+    if observation_model is not None:
+        if visibility is not None:
+            raise ValueError("the masked observation mode and the negative-ray constraint are "
+                             "different measurement models; choose one")
+        if background is not None:
+            raise ValueError("the masked observation mode renders on its own background")
+        if len(cameras) != len(rgbd_gt):
+            raise AssertionError(f"{len(cameras)} cameras but {len(rgbd_gt)} prepared observations")
+        background = observation_model.background_tensor(state_prev_post.mu.device)
     if visibility is not None:
         if not cfg.use_trust_region:
             raise ValueError("the negative-ray constraint is implemented on the trust-region step only")
@@ -419,11 +477,19 @@ def iekf_frame_step(
     Lambda_prior = Lambda_prior.to(P_prev_post.dtype)
     P_prior = P_prior.to(P_prev_post.dtype)
 
+    def _terms(L):
+        """(prec, alpha_terms) at a linearization; alpha_terms is None unless masked."""
+        if observation_model is None:
+            return _object_valid(_precisions(L.views, rgbd_gt, cfg), visibility), None
+        from .masked_observation import phase1_terms
+        return phase1_terms(L.views, rgbd_gt, cfg, observation_model)
+
     # --- 2. The prior is now FIXED for every inner iteration ---------------
     x = x_prior
     lm = float(cfg.lm_initial)
     energy, parts, lin = evaluate_true_map_energy(
-        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
+        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
+        observation_model)
 
     # --- 2b. V2 section 4: the scaled trust region -------------------------
     # The metric is built ONCE per frame and never changes inside the loop, so
@@ -504,7 +570,7 @@ def iekf_frame_step(
     for j in range(int(cfg.max_iters)):
         _bar.to(j)
         # --- 3. Nonlinear render + frozen linearization cache --------------
-        prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
+        prec, alpha_terms = _terms(lin)
         precisions = [(p_rgb, p_d) for p_rgb, p_d, _, _ in prec]
         residuals = [(r_rgb, r_d) for _, _, r_rgb, r_d in prec]
 
@@ -528,14 +594,14 @@ def iekf_frame_step(
                     f"The linearization cache and the operators disagree.")
 
         # --- 5. RHS measurement information (section 22) -------------------
-        weighted = [(p_rgb * r_rgb, p_d * r_d) for p_rgb, p_d, r_rgb, r_d in prec]
-        rhs_pose = lin.apply_HT(weighted)
+        # (+ H_A^T K (M - A), the exact background-expectation term, when masked)
+        rhs_pose, meas_normal, meas_fisher = measurement_operators(lin, prec, alpha_terms)
         rhs = embed_pose_to_full_state(rhs_pose)
         delta_from_prior = boxminus(x, x_prior)
         b = rhs - apply_prior(Lambda_prior, delta_from_prior)
 
         # --- 6. Block Fisher preconditioner (section 16) -------------------
-        fisher_pose = lin.build_block_fisher(precisions)
+        fisher_pose = meas_fisher()
 
         # V2 section 5.1: the SAME Fisher, scaled and eigendecomposed, tells us
         # which pose directions this frame actually measures. It costs one
@@ -561,9 +627,7 @@ def iekf_frame_step(
         # passes, so cross-Gaussian co-visibility coupling is preserved exactly
         # (section 12) without assembling any off-diagonal block.
         def A_mv(v: torch.Tensor) -> torch.Tensor:
-            Hv = lin.apply_H(extract_pose(v))
-            weighted_Hv = [(pc * a, pd * d) for (pc, pd), (a, d) in zip(precisions, Hv)]
-            meas = embed_pose_to_full_state(lin.apply_HT(weighted_Hv))
+            meas = embed_pose_to_full_state(meas_normal(extract_pose(v)))
             return apply_prior(Lambda_prior, v) + meas + lm * v
 
         # --- 7b. V2 section 3: solve in the GROUPED state ------------------
@@ -673,7 +737,8 @@ def iekf_frame_step(
                     step = expand_step(solve_step) if expand_step is not None else solve_step
                     x_try = boxplus(x, step)
                     e_try, parts_try, lin_try = evaluate_true_map_energy(
-                        x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
+                        x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
+                        observation_model)
                     vis_new = visibility.row_values(lin_try.visibility_values)
                     vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
                     if vis_audit["ok"] or n_soc >= 2:
@@ -694,7 +759,8 @@ def iekf_frame_step(
             if visibility is None:
                 x_try = boxplus(x, step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
-                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
+                        observation_model)
             actual = energy_before - e_try
             # Section 4.4's gain ratio. A predicted reduction at round-off is
             # not evidence of anything, so rho is NaN there and adapt_radius
@@ -756,7 +822,8 @@ def iekf_frame_step(
             while alpha >= cfg.alpha_min:
                 x_try = boxplus(x, alpha * step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
-                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility)
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
+                        observation_model)
                 if e_try < energy:
                     x, energy, lin, parts = x_try, e_try, lin_try, parts_try
                     lm = max(cfg.lm_min, lm * cfg.lm_accept_scale)
@@ -849,8 +916,8 @@ def iekf_frame_step(
                  iterations=vis_log)
 
     # --- 11. Approximate posterior marginals, ONCE (section 17) ------------
-    prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
-    fisher_pose = lin.build_block_fisher([(p, d) for p, d, _, _ in prec])
+    prec, alpha_terms = _terms(lin)
+    fisher_pose = measurement_operators(lin, prec, alpha_terms)[2]()
     Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
     # Invert in float64 and project back onto the PSD cone. The measurement
     # Fisher spans ~1e6 between a well-seen and an unseen direction, so the

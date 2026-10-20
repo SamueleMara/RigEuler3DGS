@@ -299,7 +299,91 @@ cd submodules/diff-gaussian-rasterization && python setup_vis.py build_ext --inp
 by any stage. It rendered black-on-white silhouette views and applied a distance-weighted pull
 toward the mask, a measurement model without justification.
 
-### 2.6 GPU memory (8 GB card)
+### 2.6 Masked-RGB observation (`--observation-mode`, opt-in)
+
+Implementation and evidence:
+
+- [docs/MASKED_RGB_FOREGROUND_DEPTH_AUDIT_2026_10_20.md](docs/MASKED_RGB_FOREGROUND_DEPTH_AUDIT_2026_10_20.md)
+- [docs/MASKED_RGB_FOREGROUND_DEPTH_IMPLEMENTATION_2026_10_20.md](docs/MASKED_RGB_FOREGROUND_DEPTH_IMPLEMENTATION_2026_10_20.md)
+
+**Why.** By default the motion stages compare the whole image with the object rendered over black.
+On a real capture the grey, textured background is about 98% of that cost and pulls object Gaussians
+outward.
+
+**What the masked modes compute.** For every frame and camera:
+
+- **RGB:** the recorded object, premultiplied by the whole-object mask and composited on a known
+  artificial background b: `Y = M·I + (1 − M)·b`. The scene is rendered on the same b, and the error
+  is taken over the whole image.
+- **Depth:** the recorded depth only where it is valid and inside the mask. Every other pixel has
+  exactly zero precision, and its stored value is never read.
+- **Expected-quad only:** b is uniform in [0,1]³. The expected quadratic RGB error is evaluated
+  exactly, as one render at b̄ = (½, ½, ½) plus an analytic accumulated-alpha term ½κ(A − M)², with
+  κ = trace(W)/12 (= 1/(4σ²) in Phase 1). No random backgrounds, no extra renders, no QP.
+- **Precision:** the RGB precision W is fixed:
+  - Phase 1: 1/σ_rgb²;
+  - Phase 2/3: 1/(σ² + model-error variance).
+
+  It is not reweighted with Student-t, which the exact expectation needs. Depth keeps its robust
+  precision.
+- **Where the term enters:** the alpha term is in the energy, the right-hand side, the normal
+  operator, the Fisher preconditioner and the posterior of Phase 1, 2 and 3. Each stage uses its own
+  lift: supernodes, rigid SE(3), or the fixed-joint displacement.
+
+| option | default | meaning |
+|---|---|---|
+| `--observation-mode original\|masked-rgb-constant\|masked-rgb-expected-quad` | `original` | `original` is the unchanged full-frame observation |
+| `--rgb-background-distribution uniform01` | `uniform01` | expected-quad only |
+| `--rgb-background-constant R G B` | none | required by `masked-rgb-constant`, refused otherwise |
+| `--mask-source DIR` / driver `--mask-subdir NAME` | `<scene>/mask` | binary masks at native resolution; non-binary, wrong-size, missing or ambiguous files are refused |
+
+**Rules:**
+
+- The masked modes refuse to run together with `--object-mask-constraint`.
+- Static training never receives these options.
+- Each stage writes `masked_observation.json`: the mode, the background, the precision, coverage, and
+  the per-frame energy terms.
+
+**Tests** (real CUDA): `tests/test_masked_rgb_observation.py`, 46 checks. They cover:
+
+- the composite;
+- coverage-correct resizing;
+- invariance to the depth values outside the mask;
+- the exact expectation against an 8-point cubature: energy, gradient and normal;
+- the alpha Jacobian and the new alpha Fisher kernel;
+- all three stage lifts;
+- the dense normal matrix;
+- acceptance on the exact objective;
+- no QP and one render per camera per evaluation;
+- conflicting flags;
+- identifiability;
+- end-to-end Phase 1/2/3 windows.
+
+**Commands:**
+
+```bash
+# all synthetic scenes: copies the static models (exFAT: no links), reruns Phase 1/2/3 in the masked
+# mode into ours_masked_rgb/, reruns Phase 3 on the stable results into ours_nomask/, then the table
+bash scripts/run_object_mask_ab.sh --dry-run          # preview
+bash scripts/run_object_mask_ab.sh                    # --with masked-rgb-expected-quad is the default
+bash scripts/run_object_mask_ab.sh --scenes "fridge_10905"   # one object first
+
+# one scene or root, directly
+bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "phase1 phase2 phase3" \
+  --observation-mode masked-rgb-expected-quad
+
+# benchmark: one tracked frame, original vs masked, timing and leakage (writes only into a NEW --out)
+python tools/benchmark_masked_rgb_observation.py --model "$RES/fridge_10905/static_bidi/initial" \
+  --source "$DATA/fridge_10905" --out "$RES/../benchmark_masked_rgb_$(date +%Y%m%d_%H%M)"
+```
+
+**Not addressed by this mode:**
+
+- Gaussians that no camera constrains, including ones hidden behind the visible surface, still
+  drift with the constant-velocity motion model.
+- A Gaussian that is fully inside a negative region gets a cost but no in-image restoring direction.
+
+### 2.7 GPU memory (8 GB card)
 
 * **Static training** keeps every camera image, depth map and mask on the CPU (`--data_device
   cpu`) and moves only the view being trained.

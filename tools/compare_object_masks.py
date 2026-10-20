@@ -138,7 +138,7 @@ def main(argv=None) -> int:
         w.writeheader()
         w.writerows(rows)
     # summary: per metric, how many runs improve / worsen, and the medians
-    L = [f"# Negative-ray constraint A/B\n", f"baseline (without): `{A}`  \nwith masks: `{B}`  \n"
+    L = [f"# Mask-aware observation A/B (without = original observation)\n", f"baseline (without): `{A}`  \nwith masks: `{B}`  \n"
          f"{len(rows)} scene x direction runs. GT used for scoring only.\n",
          "\n## Summary per metric\n", "| metric | runs | better with masks | worse | median without | median with |",
          "|---|---|---|---|---|---|"]

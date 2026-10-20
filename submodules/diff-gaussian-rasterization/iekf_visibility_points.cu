@@ -130,3 +130,34 @@ IEKFVisApplyHTCUDA(CACHE_ARGS, const torch::Tensor& means3D,
 			adj.data_ptr<float>(), debug);
 	return adj;
 }
+
+torch::Tensor
+IEKFVisBuildFisherCUDA(CACHE_ARGS, const torch::Tensor& means3D,
+                       const torch::Tensor& viewmatrix, const torch::Tensor& projmatrix,
+                       const float tan_fovx, const float tan_fovy,
+                       const int image_height, const int image_width,
+                       const torch::Tensor& ray_mode, const torch::Tensor& z_obs, const float delta_z,
+                       const torch::Tensor& weight_alpha, const torch::Tensor& final_Tf,
+                       const torch::Tensor& n_contrib, const bool debug)
+{
+	const at::cuda::OptionalCUDAGuard guard(device_of(cache_mu_c));
+	const int P = cache_mu_c.size(0);
+	check_mode(ray_mode, z_obs, image_height, image_width);
+	TORCH_CHECK(weight_alpha.is_cuda() && weight_alpha.scalar_type() == torch::kFloat32,
+	            "weight_alpha must be CUDA float32");
+	TORCH_CHECK(weight_alpha.numel() == (int64_t)image_height * image_width && final_Tf.numel() == weight_alpha.numel()
+	            && n_contrib.numel() == weight_alpha.numel(), "weight_alpha / final_Tf / n_contrib must be [H,W]");
+	UNPACK_CACHE()
+	torch::Tensor fisher = torch::zeros({P, 21}, cache_mu_c.options().dtype(torch::kFloat32));
+	if (P > 0 && point_list.numel() > 0)
+		CudaRasterizer::IEKFVis::buildFisher(P, image_width, image_height, cache,
+			reinterpret_cast<const uint2*>(ranges.contiguous().data_ptr<int>()),
+			reinterpret_cast<const uint32_t*>(point_list.contiguous().data_ptr<int>()),
+			means3D.contiguous().data_ptr<float>(), viewmatrix.contiguous().data_ptr<float>(),
+			projmatrix.contiguous().data_ptr<float>(), tan_fovx, tan_fovy,
+			ray_mode.contiguous().data_ptr<int>(), z_obs.contiguous().data_ptr<float>(), delta_z,
+			weight_alpha.contiguous().data_ptr<float>(), final_Tf.contiguous().data_ptr<float>(),
+			reinterpret_cast<const uint32_t*>(n_contrib.contiguous().data_ptr<int>()),
+			fisher.data_ptr<float>(), debug);
+	return fisher;
+}

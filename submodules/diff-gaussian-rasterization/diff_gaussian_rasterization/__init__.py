@@ -660,3 +660,14 @@ def iekf_vis_apply_HT(cache: IEKFLinearizationCache, ray_mode, z_obs, delta_z: f
         cache.tanfovx, cache.tanfovy, cache.image_height, cache.image_width,
         ray_mode.contiguous(), z_obs.contiguous(), float(delta_z),
         z_alpha.contiguous(), final_T_front.contiguous(), n_contrib.contiguous(), cache.debug)
+
+
+def iekf_vis_build_fisher(cache: IEKFLinearizationCache, ray_mode, z_obs, delta_z: float,
+                          weight_alpha, final_T_front, n_contrib):
+    """Per-Gaussian 6x6 alpha Fisher sum_p w_p (dA_p/dtheta_i)(dA_p/dtheta_i)^T, packed [P,21]
+    like iekf_build_fisher (expand with iekf_fisher_to_dense)."""
+    return _vis().iekf_vis_build_fisher(
+        *cache._args(), cache.means3D, cache.viewmatrix, cache.projmatrix,
+        cache.tanfovx, cache.tanfovy, cache.image_height, cache.image_width,
+        ray_mode.contiguous(), z_obs.contiguous(), float(delta_z),
+        weight_alpha.contiguous(), final_T_front.contiguous(), n_contrib.contiguous(), cache.debug)

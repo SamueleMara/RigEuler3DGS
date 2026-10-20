@@ -283,6 +283,99 @@ visVjpCUDA(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Fisher: sum_p w_p (dA_p/dtheta_i)(dA_p/dtheta_i)^T per Gaussian -> [P,21]
+// (upper triangle, the packing of iekf.cu's fisherCUDA). Same reverse walk as
+// the VJP: dA/dalpha_i = g_i T^f_i prod_{j>i}(1 - beta_j), so the alpha row of
+// contributor i is that factor times dalpha_i/dtheta. Only the per-Gaussian
+// diagonal blocks are formed, exactly as for the RGB-D Fisher.
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(BLOCK_X* BLOCK_Y)
+visFisherCUDA(
+	const uint2* __restrict__ ranges, const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float* __restrict__ means3D, const float* __restrict__ mu_c_a,
+	const float* __restrict__ u_a, const float* __restrict__ Jp_a,
+	const float* __restrict__ sigma_a, const float* __restrict__ conic_a,
+	const float* __restrict__ opacity_a, const float* __restrict__ depths,
+	const int* __restrict__ clamp_a,
+	const float* __restrict__ viewmatrix, const float* __restrict__ projmatrix,
+	float focal_x, float focal_y,
+	const int* __restrict__ ray_mode, const float* __restrict__ z_obs, float delta_z,
+	const float* __restrict__ weight_alpha, const float* __restrict__ final_Tf,
+	const uint32_t* __restrict__ n_contrib, float* __restrict__ out_fisher)
+{
+	auto block = cg::this_thread_block();
+	const uint32_t hb = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = {block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y};
+	const uint2 pix = {pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y};
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = {(float)pix.x, (float)pix.y};
+	const bool inside = pix.x < (unsigned)W && pix.y < (unsigned)H;
+	const int mode = inside ? ray_mode[pix_id] : 0;
+	const float wa = (inside && mode > 0) ? weight_alpha[pix_id] : 0.f;
+	const bool active = inside && mode > 0 && wa != 0.f;
+	const float zo = inside ? z_obs[pix_id] : 0.f;
+
+	const uint2 range = ranges[block.group_index().y * hb + block.group_index().x];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	__shared__ int sh_id[BLOCK_SIZE];
+	float R[9]; load_Rcw(viewmatrix, R);
+
+	float Tf = active ? final_Tf[pix_id] : 1.f;
+	float S = 1.f;
+	const uint32_t last_contributor = inside ? n_contrib[pix_id] : 0;
+
+	for (int i = rounds - 1; i >= 0; i--)
+	{
+		block.sync();
+		const int base = i * BLOCK_SIZE;
+		int progress = base + block.thread_rank();
+		if (range.x + progress < range.y) sh_id[block.thread_rank()] = point_list[range.x + progress];
+		block.sync();
+		if (!active) continue;
+		const int count = min(BLOCK_SIZE, (int)(range.y - range.x) - base);
+		for (int j = count - 1; j >= 0; j--)
+		{
+			if ((uint32_t)(base + j + 1) > last_contributor) continue;
+			const int gid = sh_id[j];
+			const float2 cu = {u_a[2 * gid], u_a[2 * gid + 1]};
+			const float3 co = {conic_a[3 * gid], conic_a[3 * gid + 1], conic_a[3 * gid + 2]};
+			float alpha; float2 d; bool cl;
+			if (!evalAlpha(cu.x, cu.y, co.x, co.y, co.z, opacity_a[gid], pixf.x, pixf.y, alpha, d, cl))
+				continue;
+			const float g = gateOf(mode, depths[gid], zo, delta_z);
+			if (g == 0.f) continue;
+			Tf = Tf / (1.f - alpha);
+			if (Tf > 1.f) Tf = 1.f;
+			const float f = Tf * S;                    // dA / dalpha_i
+			if (!cl && f != 0.f)
+			{
+				float3 mu_c, conic, p_orig; float Jp[6], sigma_c[6];
+				loadGaussian(gid, mu_c_a, Jp_a, sigma_a, conic_a, means3D, mu_c, Jp, sigma_c, conic, p_orig);
+				float h[6];
+				for (int k = 0; k < 6; ++k)
+				{
+					const float3 dmu = {k == 0 ? 1.f : 0.f, k == 1 ? 1.f : 0.f, k == 2 ? 1.f : 0.f};
+					const float3 dphi = {k == 3 ? 1.f : 0.f, k == 4 ? 1.f : 0.f, k == 5 ? 1.f : 0.f};
+					float2 du; float3 dQ; float dd;
+					poseTangent(dmu, dphi, mu_c, Jp, sigma_c, conic.x, conic.y, conic.z,
+					            R, projmatrix, p_orig, W, H, focal_x, focal_y, clamp_a[gid], du, dQ, dd);
+					h[k] = f * dAlphaOf(alpha, cl, d, conic.x, conic.y, conic.z, du, dQ);
+				}
+				int t = 0;
+				for (int a = 0; a < 6; ++a)
+					for (int b2 = a; b2 < 6; ++b2, ++t)
+					{
+						const float v = wa * h[a] * h[b2];
+						if (v != 0.f) atomicAdd(&out_fisher[21 * gid + t], v);
+					}
+			}
+			S *= (1.f - alpha);
+		}
+	}
+}
+
 } // anonymous namespace
 
 namespace CudaRasterizer { namespace IEKFVis {
@@ -333,6 +426,25 @@ void applyVJP(int P, int W, int H, const IEKF::CachePointers cache,
 		cache.sigma_c, cache.conic, cache.opacity, cache.depth, cache.clamp_flags,
 		viewmatrix, projmatrix, focal_x, focal_y, ray_mode, z_obs, delta_z, z_alpha, final_Tf,
 		n_contrib, out_adjoint);
+	VIS_SYNC(debug);
+}
+
+void buildFisher(int P, int W, int H, const IEKF::CachePointers cache,
+                 const uint2* ranges, const uint32_t* point_list,
+                 const float* means3D, const float* viewmatrix, const float* projmatrix,
+                 float tan_fovx, float tan_fovy,
+                 const int* ray_mode, const float* z_obs, float delta_z,
+                 const float* weight_alpha, const float* final_Tf, const uint32_t* n_contrib,
+                 float* out_fisher, bool debug)
+{
+	const float focal_y = H / (2.0f * tan_fovy);
+	const float focal_x = W / (2.0f * tan_fovx);
+	dim3 grid((W + BLOCK_X - 1) / BLOCK_X, (H + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	visFisherCUDA<<<grid, block>>>(ranges, point_list, W, H, means3D, cache.mu_c, cache.u, cache.Jp,
+		cache.sigma_c, cache.conic, cache.opacity, cache.depth, cache.clamp_flags,
+		viewmatrix, projmatrix, focal_x, focal_y, ray_mode, z_obs, delta_z, weight_alpha, final_Tf,
+		n_contrib, out_fisher);
 	VIS_SYNC(debug);
 }
 

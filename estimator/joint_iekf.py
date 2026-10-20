@@ -146,9 +146,34 @@ def _to_view_device(ob, view):
                  for t in ob)
 
 
-def _energy(linearize, state, frame, mu0, R0, observation, precision_fn):
+def _masked_terms(lin, observation, prec, model):
+    """Masked observation mode: per camera (pc, pd, kappa, r_C, r_D, r_A) with
+    r_C = Y(b) - C over the whole image, r_D on V_used only, r_A = M - A, and
+    kappa = trace(W Sigma_b) derived from the stage's own fixed RGB precision."""
+    from .masked_observation import residuals
+    if len(observation) != len(lin.views) or len(prec) != len(lin.views):
+        raise AssertionError(f"{len(lin.views)} views, {len(observation)} observations, "
+                             f"{len(prec)} precisions: refusing a silent zip truncation")
+    out = []
+    for v, ob0, (pc, pd) in zip(lin.views, observation, prec):
+        ob = ob0.to(v.rgb.device)
+        r_c, r_d, r_a = residuals(v, ob, model.background_tensor(v.rgb.device))
+        out.append((pc, pd, model.kappa(pc), r_c, r_d, r_a))
+    return out
+
+
+def _energy(linearize, state, frame, mu0, R0, observation, precision_fn,
+            observation_model=None):
     """The true nonlinear MAP energy at the current nominal, via Phase 1."""
     lin = linearize(state, frame)
+    if observation_model is not None:
+        tot = 0.0
+        for pc, pd, kap, r_c, r_d, r_a in _masked_terms(lin, observation, precision_fn(lin),
+                                                         observation_model):
+            tot += float((pc.double() * r_c.double().square()).sum())
+            tot += float((pd.double() * r_d.double().square()).sum())
+            tot += float((kap.double() * r_a.double().square()).sum())
+        return 0.5 * tot, lin
     tot = 0.0
     for v, ob0, prec in zip(lin.views, observation, precision_fn(lin)):
         ob = _to_view_device(ob0, v)
@@ -164,7 +189,8 @@ def _energy(linearize, state, frame, mu0, R0, observation, precision_fn):
 
 def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                precision_fn, prior_information: Tensor,
-               cfg: JointIEKFConfig | None = None, visibility=None) -> FrameRecord:
+               cfg: JointIEKFConfig | None = None, visibility=None,
+               observation_model=None) -> FrameRecord:
     """Section 13: one Phase-2 frame, with Phase-1's solver and acceptance.
 
     `linearize(state, frame) -> FrameLinearization` and
@@ -181,6 +207,10 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     dev = mu0.device
     n = state.dim
     metric = _metric(prior_information, cfg)
+    om = observation_model
+    if om is not None and visibility is not None:
+        raise ValueError("the masked observation mode and the negative-ray constraint are "
+                         "different measurement models; choose one")
     # Negative-ray constraint (opt-in, visibility_constraint.py): object-valid
     # RGB-D only, visible alpha attached to every linearization, the stage's
     # own lift J_g = state.jvp / state.vjp for C = J_A J_g.
@@ -202,7 +232,7 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     delta_from_prior = torch.zeros(n, dtype=torch.float64)
 
     energy, lin = _energy(linearize, state, frame, mu0, R0, observation,
-                          precision_fn)
+                          precision_fn, om)
     energy0 = energy
     accepted_count = 0
     rho_last = float("nan")
@@ -226,7 +256,11 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
         prec = precision_fn(lin)
         # ---- measurement right-hand side: J^T H^T W r --------------------
         weighted = []
-        for v, ob0, (pc, pd) in zip(lin.views, observation, prec):
+        mt = _masked_terms(lin, observation, prec, om) if om is not None else None
+        if mt is not None:
+            # masked RGB, foreground depth and K (M - A) through H_A, one lift
+            weighted = [(pc * r_c, pd * r_d, kap * r_a) for pc, pd, kap, r_c, r_d, r_a in mt]
+        for v, ob0, (pc, pd) in (zip(lin.views, observation, prec) if mt is None else ()):
             ob = _to_view_device(ob0, v)
             if ob is None:
                 weighted.append((torch.zeros_like(v.rgb),
@@ -239,9 +273,14 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
 
         # ---- matrix-free normal operator (section 12) --------------------
         def A_mv(p: Tensor) -> Tensor:
-            tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
-            w = [(pc * dc, pd * dd)
-                 for (pc, pd), (dc, dd) in zip(prec, tang)]
+            if mt is not None:
+                tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0, alpha=True)
+                w = [(pc * dc, pd * dd, kap * da)
+                     for (pc, pd, kap, *_), (dc, dd, da) in zip(mt, tang)]
+            else:
+                tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
+                w = [(pc * dc, pd * dd)
+                     for (pc, pd), (dc, dd) in zip(prec, tang)]
             meas = joint_apply_HT(lin, state, frame, w, mu0, R0).cpu()
             return meas + cfg.prior_weight * (prior_information @ p)
 
@@ -303,7 +342,7 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                 trial = copy.deepcopy(state)
                 trial, _G = apply_correction(trial, frame, step, transport=False)
                 e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
-                                         precision_fn)
+                                         precision_fn, om)
                 vis_new = visibility.row_values(lin_new.visibility_values)
                 vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
                 if vis_audit["ok"] or n_soc >= 2:
@@ -325,7 +364,7 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
             trial = copy.deepcopy(state)
             trial, _G = apply_correction(trial, frame, step, transport=False)
             e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
-                                     precision_fn)
+                                     precision_fn, om)
         actual = energy - e_new
         rho = actual / pred if pred > 0 else float("-inf")
         if vis_audit is not None and not vis_audit["ok"]:
@@ -383,10 +422,15 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
 
     # ---- section 14: the exact 6x6 posterior, by probing the operator ----
     prec = precision_fn(lin)
+    mt = _masked_terms(lin, observation, prec, om) if om is not None else None
 
     def meas_only(p: Tensor) -> Tensor:
-        tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
-        w = [(pc * dc, pd * dd) for (pc, pd), (dc, dd) in zip(prec, tang)]
+        if mt is not None:
+            tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0, alpha=True)
+            w = [(pc * dc, pd * dd, kap * da) for (pc, pd, kap, *_), (dc, dd, da) in zip(mt, tang)]
+        else:
+            tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
+            w = [(pc * dc, pd * dd) for (pc, pd), (dc, dd) in zip(prec, tang)]
         return joint_apply_HT(lin, state, frame, w, mu0, R0).cpu()
 
     # The state is tiny, so applying the matrix-free operator to the six basis
@@ -424,7 +468,7 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
 
 def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
                times=None, cfg: JointIEKFConfig | None = None,
-               label: str = "", visibility=None) -> dict:
+               label: str = "", visibility=None, observation_model=None) -> dict:
     """Sections 6, 13-16: the recursive filter over a whole window.
 
     Predict, update, reset, with the joint covariance carried from frame to
@@ -459,7 +503,7 @@ def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
                 p.qdot[0] = 0.0
             info0 = torch.linalg.inv(state.covariance)
             e0, lin0 = _energy(linearize, state, 0, mu0, R0, observations[0],
-                               precision_fn)
+                               precision_fn, observation_model)
             records.append(FrameRecord(
                 frame=0, iterations=0, accepted=0, energy_before=e0,
                 energy_after=e0, radius=cfg.radius_init,
@@ -489,7 +533,8 @@ def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
 
         rec = frame_step(state, frame, mu0, R0, observations[frame],
                          linearize, precision_fn, prior_info, cfg,
-                         visibility=None if visibility is None else visibility.for_frame(frame))
+                         visibility=None if visibility is None else visibility.for_frame(frame),
+                         observation_model=observation_model)
 
         # section 16: keep the representation continuous before storing
         flips = apply_sign_gauge(state, reference)

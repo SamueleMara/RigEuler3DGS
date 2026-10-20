@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 #
-# A/B of the hard negative-ray constraint (--object-mask-constraint
-# visible-negative-hard) on the synthetic scenes, then the comparison table.
+# A/B of a mask-aware motion observation on the synthetic scenes, then the table.
+#
+#   --with masked-rgb-expected-quad  (default) masked RGB on a known artificial
+#             background with the exact Uniform[0,1] expectation term, depth on the
+#             object only (--observation-mode, estimator/masked_observation.py)
+#   --with masked-rgb-constant       the same with one fixed background (--background R G B)
+#   --with constraint                the hard negative-ray constraint (19 Oct)
 #
 #   without:  <nomask-root>/<scene>/  static models + Phase 1/2 outputs COPIED from the
-#             stable results (<base-root>), Phase 3 run fresh, constraint off
+#             stable results (<base-root>), Phase 3 run fresh, original observation
 #   with:     <masks-root>/<scene>/   the same static models copied, Phase 1, 2 and 3
-#             rerun with the constraint on (same static endpoints, same settings)
-#   table:    tools/compare_object_masks.py -> <masks-root>/../object_masks_ab/
+#             rerun with the chosen mode (same static endpoints, same settings)
+#   table:    tools/compare_object_masks.py -> <masks-root>/../<masks-root name>_ab/
 #
 # Copies, not links: the results drive is exFAT (no symlinks / hard links).
 # Only the files the stages and the comparison read are copied (no checkpoints,
@@ -20,7 +25,7 @@
 #   bash scripts/run_object_mask_ab.sh --scenes "fridge_10905 oven_101917"
 #   bash scripts/run_object_mask_ab.sh --compare-only
 #
-# --mask-boundary-px N / --mask-alpha-epsilon E are forwarded (defaults 2 / 0.05).
+# --mask-boundary-px N / --mask-alpha-epsilon E are forwarded with --with constraint.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -28,7 +33,8 @@ RES="/media/samuelemara/Extreme SSD/Samuele/results_11_10_26"
 BASE="$RES/ours"
 DATA="/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/preparation_8cams/partnet_subset_fixed_render_linear"
 NOMASK="$RES/ours_nomask"
-MASKS="$RES/ours_masks"
+MASKS=""
+WITH="masked-rgb-expected-quad"; BGC=()
 SCENES="USB_100109 stapler_103111 blade_103706 fridge_10905 storage_45135 laptop_10211 oven_101917 scissor_11100 foldchair_102255 washer_103776"
 DRY=0 ; COMPARE_ONLY=0 ; BAND=2 ; EPS=0.05
 while [ $# -gt 0 ]; do
@@ -37,6 +43,8 @@ while [ $# -gt 0 ]; do
     --dataset-root) DATA="${2%/}"; shift 2;;
     --nomask-root) NOMASK="${2%/}"; shift 2;;
     --masks-root) MASKS="${2%/}"; shift 2;;
+    --with) WITH="$2"; shift 2;;
+    --background) BGC=("$2" "$3" "$4"); shift 4;;
     --scenes) SCENES="$2"; shift 2;;
     --mask-boundary-px) BAND="$2"; shift 2;;
     --mask-alpha-epsilon) EPS="$2"; shift 2;;
@@ -46,8 +54,17 @@ while [ $# -gt 0 ]; do
     *) echo "unknown argument: $1" >&2; exit 2;;
   esac
 done
+case "$WITH" in
+  masked-rgb-expected-quad) MODEARGS=(--observation-mode masked-rgb-expected-quad); DEF=ours_masked_rgb;;
+  masked-rgb-constant) [ ${#BGC[@]} -eq 3 ] || { echo "--with masked-rgb-constant needs --background R G B" >&2; exit 2; }
+                       MODEARGS=(--observation-mode masked-rgb-constant --rgb-background-constant "${BGC[@]}"); DEF=ours_masked_rgb_const;;
+  constraint) MODEARGS=(--object-mask-constraint visible-negative-hard --mask-ray-semantics trusted-full-ray
+                        --mask-boundary-px "$BAND" --mask-alpha-epsilon "$EPS"); DEF=ours_masks;;
+  *) echo "unknown --with $WITH" >&2; exit 2;;
+esac
+MASKS=${MASKS:-$RES/$DEF}
 PY=${PY:-/home/samuelemara/miniconda3/envs/rigeuler3dgs/bin/python}
-CMP="$(dirname "$MASKS")/object_masks_ab"
+CMP="$(dirname "$MASKS")/$(basename "$MASKS")_ab"
 DRYFLAG=(); [ "$DRY" = "1" ] && DRYFLAG=(--dry-run)
 
 copy_tree() {   # copy_tree SRC DST [find-args...]: copy matching files, never overwrite
@@ -65,8 +82,8 @@ static_copy() {  # the trained model without its training checkpoint
 
 echo "base (stable, read only): $BASE"
 echo "dataset                 : $DATA"
-echo "without constraint      : $NOMASK"
-echo "with constraint         : $MASKS"
+echo "without (original)      : $NOMASK"
+echo "with ($WITH)$(printf '%*s' $((12 - ${#WITH} > 0 ? 12 - ${#WITH} : 0)) '') : $MASKS"
 echo "scenes                  : $SCENES"
 
 if [ "$COMPARE_ONLY" != "1" ]; then
@@ -88,15 +105,13 @@ if [ "$COMPARE_ONLY" != "1" ]; then
   OK="${OK# }"
   [ -n "$OK" ] || { echo "no scene ready"; exit 1; }
   echo
-  echo "=== 1/2  WITHOUT the constraint: Phase 3 on the stable Phase 1/2 results"
+  echo "=== 1/2  WITHOUT ($WITH off): Phase 3 on the stable Phase 1/2 results"
   bash run_bidirectional_all.sh --input "$DATA" --output "$NOMASK" --scenes "$OK" \
     --stages "phase3" "${DRYFLAG[@]}"
   echo
-  echo "=== 2/2  WITH the constraint: Phase 1, 2 and 3"
+  echo "=== 2/2  WITH $WITH: Phase 1, 2 and 3"
   bash run_bidirectional_all.sh --input "$DATA" --output "$MASKS" --scenes "$OK" \
-    --stages "phase1 phase2 phase3" --object-mask-constraint visible-negative-hard \
-    --mask-ray-semantics trusted-full-ray --mask-boundary-px "$BAND" --mask-alpha-epsilon "$EPS" \
-    "${DRYFLAG[@]}"
+    --stages "phase1 phase2 phase3" "${MODEARGS[@]}" "${DRYFLAG[@]}"
 fi
 
 echo

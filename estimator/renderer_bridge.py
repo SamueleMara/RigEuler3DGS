@@ -121,6 +121,63 @@ class FrameLinearization:
             total = torch.zeros((self.num_gaussians, POSE_DIM, POSE_DIM), device=dev)
         return total
 
+    # -- accumulated alpha A = 1 - T_end: H_A, H_A^T, alpha Fisher -----------
+    # The masked-RGB observation (estimator/masked_observation.py) needs the
+    # derivative of the renderer's own accumulated alpha. It comes from the
+    # visible-alpha kernels (_C_vis) in full-ray mode (g_i = 1 on every pixel),
+    # which walk the same frozen contributor lists, alpha clamp and T_STOP
+    # termination as the RGB-D operators above; the primal A is v.alpha and the
+    # walk stops at v.n_contrib, so no second render or cache is built.
+    def _full_ray(self, v):
+        key = (v.camera.image_height, v.camera.image_width, v.alpha.device)
+        cache = getattr(self, "_full_ray_mode", None)
+        if cache is None or cache[0] != key:
+            mode = torch.ones((key[0], key[1]), dtype=torch.int32, device=key[2])
+            zobs = torch.zeros((key[0], key[1]), dtype=torch.float32, device=key[2])
+            self._full_ray_mode = (key, mode, zobs)
+        return self._full_ray_mode[1], self._full_ray_mode[2]
+
+    def apply_H_alpha(self, pose_delta: torch.Tensor) -> list[torch.Tensor]:
+        """dA [H,W] per camera for a [P,6] pose tangent."""
+        from diff_gaussian_rasterization import iekf_vis_apply_H
+        out = []
+        for v in self.views:
+            mode, zobs = self._full_ray(v)
+            out.append(iekf_vis_apply_H(v.cache, mode, zobs, 0.0, pose_delta.float().contiguous()))
+        return out
+
+    def apply_HT_alpha(self, alpha_adjoints: Sequence[torch.Tensor]) -> torch.Tensor:
+        """H_A^T z_A accumulated over cameras -> [P,6]."""
+        from diff_gaussian_rasterization import iekf_vis_apply_HT
+        if len(alpha_adjoints) != len(self.views):
+            raise AssertionError(f"{len(alpha_adjoints)} alpha adjoints for {len(self.views)} views")
+        total = None
+        for v, za in zip(self.views, alpha_adjoints):
+            mode, zobs = self._full_ray(v)
+            part = iekf_vis_apply_HT(v.cache, mode, zobs, 0.0, za.float().contiguous(),
+                                     v.transmittance, v.n_contrib)
+            total = part if total is None else total + part
+        if total is None:
+            dev = self.views[0].rgb.device if self.views else "cpu"
+            total = torch.zeros((self.num_gaussians, POSE_DIM), device=dev)
+        return total
+
+    def build_alpha_fisher(self, weights: Sequence[torch.Tensor]) -> torch.Tensor:
+        """Per-Gaussian 6x6 sum_p w_p H_A,p,i^T H_A,p,i over cameras -> [P,6,6]."""
+        from diff_gaussian_rasterization import iekf_vis_build_fisher
+        if len(weights) != len(self.views):
+            raise AssertionError(f"{len(weights)} alpha weights for {len(self.views)} views")
+        total = None
+        for v, w in zip(self.views, weights):
+            mode, zobs = self._full_ray(v)
+            dense = iekf_fisher_to_dense(iekf_vis_build_fisher(
+                v.cache, mode, zobs, 0.0, w.float().contiguous(), v.transmittance, v.n_contrib))
+            total = dense if total is None else total + dense
+        if total is None:
+            dev = self.views[0].rgb.device if self.views else "cpu"
+            total = torch.zeros((self.num_gaussians, POSE_DIM, POSE_DIM), device=dev)
+        return total
+
 
 def build_linearization(
     state: GaussianMotionState,

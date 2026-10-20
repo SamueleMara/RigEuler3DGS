@@ -29,8 +29,11 @@ def _renderer_dtype(linearization):
 
 
 def joint_apply_H(linearization, state, frame: int, delta: Tensor,
-                  mu0: Tensor, R0: Tensor | None = None, bases=None):
-    """H_J v = H_G (J_{G,J} v) -> one RGB-D tangent per camera."""
+                  mu0: Tensor, R0: Tensor | None = None, bases=None, alpha: bool = False):
+    """H_J v = H_G (J_{G,J} v) -> one RGB-D tangent per camera.
+
+    alpha=True (masked observation mode) appends the accumulated-alpha tangent
+    H_A J v of the SAME pose perturbation: (dC, dD, dA) per camera."""
     # Stage B's physical models carry their own exact joint map; the generic
     # screw keeps `full_jvp`.  Everything from here down -- the renderer, the
     # measurement model, the solver -- is shared and untouched.
@@ -40,15 +43,25 @@ def joint_apply_H(linearization, state, frame: int, delta: Tensor,
     # series need it; the renderer's cached operators are float32. Casting at
     # this single boundary keeps the precision where it matters without
     # touching the Phase-1 operators.
-    return linearization.apply_H(pose.to(_renderer_dtype(linearization)))
+    pose = pose.to(_renderer_dtype(linearization))
+    out = linearization.apply_H(pose)
+    if alpha:
+        return [(dc, dd, da) for (dc, dd), da in zip(out, linearization.apply_H_alpha(pose))]
+    return out
 
 
 def joint_apply_HT(linearization, state, frame: int, pixel_adjoints,
                    mu0: Tensor, R0: Tensor | None = None, bases=None) -> Tensor:
-    """H_J^T z = J_{G,J}^T (H_G^T z) -> joint error state [6K]."""
+    """H_J^T z = J_{G,J}^T (H_G^T z) -> joint error state [6K].
+
+    Adjoints may be (z_C, z_D) or, in the masked observation mode,
+    (z_C, z_D, z_A): the alpha adjoint is transposed through H_A and lifted by
+    the same J^T."""
     dt = _renderer_dtype(linearization)
-    pose = linearization.apply_HT([(a.to(dt), b.to(dt))
-                                   for a, b in pixel_adjoints])
+    pose = linearization.apply_HT([(z[0].to(dt), z[1].to(dt))
+                                   for z in pixel_adjoints])
+    if pixel_adjoints and len(pixel_adjoints[0]) == 3:
+        pose = pose + linearization.apply_HT_alpha([z[2].to(dt) for z in pixel_adjoints])
     return (state.vjp(frame, pose, mu0, R0) if hasattr(state, "vjp")
             else full_vjp(state, frame, pose, mu0, R0, bases))
 

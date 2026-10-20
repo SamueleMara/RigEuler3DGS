@@ -26,9 +26,18 @@ IEKFVisApplyHTCUDA(const torch::Tensor&, const torch::Tensor&, const torch::Tens
                    const int, const int, const torch::Tensor&, const torch::Tensor&, const float,
                    const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const bool);
 
+torch::Tensor
+IEKFVisBuildFisherCUDA(const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                       const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                       const torch::Tensor&, const torch::Tensor&, const torch::Tensor&,
+                       const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const float, const float,
+                       const int, const int, const torch::Tensor&, const torch::Tensor&, const float,
+                       const torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const bool);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("iekf_visible_alpha", &IEKFVisibleAlphaCUDA);
   m.def("iekf_vis_apply_H", &IEKFVisApplyHCUDA);
   m.def("iekf_vis_apply_HT", &IEKFVisApplyHTCUDA);
+  m.def("iekf_vis_build_fisher", &IEKFVisBuildFisherCUDA);
 }
