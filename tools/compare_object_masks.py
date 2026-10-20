@@ -151,7 +151,9 @@ def main(argv=None) -> int:
         sgn = 1 if better == "high" else -1
         up = sum(1 for x, y in pairs if sgn * (y - x) > 1e-9)
         dn = sum(1 for x, y in pairs if sgn * (y - x) < -1e-9)
-        med = lambda v: sorted(v)[len(v) // 2]
+        def med(v):   # true median: the mean of the middle two for an even count
+            v = sorted(v)
+            return v[len(v) // 2] if len(v) % 2 else 0.5 * (v[len(v) // 2 - 1] + v[len(v) // 2])
         L.append(f"| {label} | {len(pairs)} | {up} | {dn} | {fmt(med([x for x, _ in pairs]), k)} | "
                  f"{fmt(med([y for _, y in pairs]), k)} |")
     for title, keys in (("Phase 2 joint (GT-type hypothesis)", ["p2_axis_deg", "p2_line_m", "p2_gamma"]),
