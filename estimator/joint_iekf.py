@@ -44,6 +44,17 @@ class JointIEKFConfig:
     prior_weight: float = 1.0
     psd_floor: float = 1e-12
     verbose: bool = False
+    # "map" (default, every Phase 2 / Phase 3 runner): steps are solved AND accepted on
+    # E_total = E_meas + E_prior, chart-mode prior information transported as
+    # G^-T Lam G^-1 (e_new = G e_old). "pre_repair_legacy": the pre-2026-10-21 frame
+    # step exactly -- acceptance on E_meas alone and the old G^-1 Lam G^-T transport --
+    # kept ONLY for the legacy joint-identification diagnostic estimator/prismatic_null.py
+    # (not in the active pipeline; the repair spec does not change joint identification).
+    acceptance: str = "map"
+
+    def __post_init__(self):
+        if self.acceptance not in ("map", "pre_repair_legacy"):
+            raise ValueError(f"acceptance must be 'map' or 'pre_repair_legacy', got {self.acceptance!r}")
 
 
 @dataclass
@@ -146,63 +157,165 @@ def _to_view_device(ob, view):
                  for t in ob)
 
 
-def _masked_terms(lin, observation, prec, model):
-    """Masked observation mode: per camera (pc, pd, kappa, r_C, r_D, r_A) with
-    r_C = Y(b) - C over the whole image, r_D on V_used only, r_A = M - A, and
-    kappa = trace(W Sigma_b) derived from the stage's own fixed RGB precision."""
-    from .masked_observation import residuals
-    if len(observation) != len(lin.views) or len(prec) != len(lin.views):
-        raise AssertionError(f"{len(lin.views)} views, {len(observation)} observations, "
-                             f"{len(prec)} precisions: refusing a silent zip truncation")
+def _camera_terms(lin, observation, precision_fn, model=None):
+    """The frame's per-camera `CameraTerms` at a linearization.
+
+    `precision_fn(lin)` either returns CameraTerms itself (the production runners:
+    estimator/phase2_shared.py, robust Student-t NLL objective with the same sigma
+    as the GN weights), or the legacy per-camera (p_rgb, p_depth) tuples; those are
+    taken as a FIXED quadratic precision supplied by the caller, with residuals
+    from `observation` (masked: Y(b) - C, r_D on V_used, r_A = M - A)."""
+    from .observation_terms import CameraTerms
+    res = precision_fn(lin)
+    if len(res) != len(lin.views):
+        raise AssertionError(f"{len(lin.views)} views but {len(res)} precision entries: "
+                             "refusing a silent zip truncation")
+    if res and isinstance(res[0], CameraTerms):
+        return res
+    if len(observation) != len(lin.views):
+        raise AssertionError(f"{len(lin.views)} views but {len(observation)} observations: "
+                             "refusing a silent zip truncation")
     out = []
-    for v, ob0, (pc, pd) in zip(lin.views, observation, prec):
-        ob = ob0.to(v.rgb.device)
-        r_c, r_d, r_a = residuals(v, ob, model.background_tensor(v.rgb.device))
-        out.append((pc, pd, model.kappa(pc), r_c, r_d, r_a))
+    for v, ob0, (pc, pd) in zip(lin.views, observation, res):
+        kap = r_a = None
+        if model is not None:
+            from .masked_observation import residuals
+            ob = ob0.to(v.rgb.device)
+            r_c, r_d, r_a_ = residuals(v, ob, model.background_tensor(v.rgb.device))
+            if model.alpha_term:
+                kap, r_a = model.kappa(pc), r_a_
+        else:
+            ob = _to_view_device(ob0, v)
+            if ob is None:
+                r_c, r_d = torch.zeros_like(v.rgb), torch.zeros_like(v.depth)
+            else:
+                r_c = ob[0] - v.rgb
+                r_d = ob[1] - v.depth
+        r_c = torch.where(pc > 0, r_c, torch.zeros_like(r_c)) if pc.dim() == r_c.dim() else r_c
+        r_d = torch.where(pd > 0, r_d, torch.zeros_like(r_d))
+        e_c = 0.5 * float((pc.double() * r_c.double().square()).sum())
+        e_d = 0.5 * float((pd.double() * r_d.double().square()).sum())
+        e_a = 0.0 if kap is None else 0.5 * float((kap.double() * r_a.double().square()).sum())
+        n = int((pd > 0).sum())
+        out.append(CameraTerms(pc, pd, r_c, r_d, kap, r_a, e_c, e_d, e_a, n, n, 0))
     return out
 
 
 def _energy(linearize, state, frame, mu0, R0, observation, precision_fn,
             observation_model=None):
-    """The true nonlinear MAP energy at the current nominal, via Phase 1."""
+    """The measurement part of the frame objective at `state`, on the TRUE
+    nonlinear render. Returns (energy, lin); the per-camera terms and the split
+    are attached to `lin` (`frame_terms`, `energy_parts`) so the solve at this
+    linearization uses exactly the terms the energy was computed from."""
+    from .observation_terms import summarize
     lin = linearize(state, frame)
-    if observation_model is not None:
-        tot = 0.0
-        for pc, pd, kap, r_c, r_d, r_a in _masked_terms(lin, observation, precision_fn(lin),
-                                                         observation_model):
-            tot += float((pc.double() * r_c.double().square()).sum())
-            tot += float((pd.double() * r_d.double().square()).sum())
-            tot += float((kap.double() * r_a.double().square()).sum())
-        return 0.5 * tot, lin
-    tot = 0.0
-    for v, ob0, prec in zip(lin.views, observation, precision_fn(lin)):
-        ob = _to_view_device(ob0, v)
-        if ob is None:
-            continue
-        rgb_r = (ob[0] - v.rgb).double()
-        d_r = (ob[1] - v.depth).double()
-        pc, pd = prec
-        tot += float((pc.double() * rgb_r * rgb_r).sum())
-        tot += float((pd.double() * d_r * d_r).sum())
-    return 0.5 * tot, lin
+    terms = _camera_terms(lin, observation, precision_fn, observation_model)
+    lin.frame_terms = terms
+    sm = summarize(terms)
+    lin.energy_parts = sm
+    return sm["rgb"] + sm["depth"] + sm["alpha"], lin
+
+
+class _FramePrior:
+    """E_prior(x) = w/2 e(x)^T Lambda_minus e(x) for one frame (P0-2).
+
+    x_minus (the predicted nominal) and Lambda_minus are snapshotted ONCE, after
+    the process prediction and before any correction, and never re-applied.
+
+    exact   the state defines `prior_error(frame, x_minus)` = x boxminus x_minus
+            in its own tangent convention (rigid: left SE(3) log + twist
+            difference; displacement: (q, qdot) difference). J = d e(x boxplus d)/dd
+            comes from `prior_jacobian` when the state has it, else from a central
+            difference through the state's OWN retraction (n <= 12, no rendering).
+            E_prior depends on the physical state only, so it is invariant to the
+            tangent chart the solver happens to be in.
+    chart   a state without `prior_error`: the previous first-order bookkeeping
+            (tracked offset delta, transported by the reset Jacobian G), now also
+            used for acceptance, so the solved and the accepted objective agree.
+    """
+
+    FD_STEP = 1e-6
+
+    def __init__(self, state, frame, Lambda_minus, weight):
+        import copy
+        self.frame = int(frame)
+        self.w = float(weight)
+        self.Lam = 0.5 * (Lambda_minus.double() + Lambda_minus.double().T)
+        self.exact = hasattr(state, "prior_error")
+        self.x_minus = copy.deepcopy(state) if self.exact else None
+        self.delta = torch.zeros(state.dim, dtype=torch.float64)
+
+    def error(self, x, step=None) -> Tensor:
+        if self.exact:
+            return x.prior_error(self.frame, self.x_minus).double().reshape(-1)
+        return self.delta + (0.0 if step is None else torch.as_tensor(step).double().reshape(-1))
+
+    def jacobian(self, x) -> Tensor:
+        n = x.dim
+        if not self.exact:
+            return torch.eye(n, dtype=torch.float64)
+        if hasattr(x, "prior_jacobian"):
+            return x.prior_jacobian(self.frame, self.x_minus).double()
+        import copy
+        from .joint_process import apply_correction
+        J = torch.zeros((n, n), dtype=torch.float64)
+        h = self.FD_STEP
+        for k in range(n):
+            d = torch.zeros(n, dtype=torch.float64)
+            d[k] = h
+            xp = apply_correction(copy.deepcopy(x), self.frame, d, transport=False)[0]
+            xm = apply_correction(copy.deepcopy(x), self.frame, -d, transport=False)[0]
+            J[:, k] = (self.error(xp) - self.error(xm)) / (2.0 * h)
+        return J
+
+    def energy(self, x, step=None) -> float:
+        e = self.error(x, step)
+        return 0.5 * self.w * float(e @ (self.Lam @ e))
+
+    def gradient_parts(self, x):
+        """(w J^T Lam e, w J^T Lam J) at the iterate x."""
+        e, J = self.error(x), self.jacobian(x)
+        return self.w * (J.T @ (self.Lam @ e)), self.w * (J.T @ self.Lam @ J)
+
+    def accepted(self, step, G, legacy_transport=False):
+        """Chart bookkeeping after an accepted step (no-op in the exact mode).
+
+        e_new = G e_old, so E = 1/2 e_old^T Lam e_old = 1/2 e_new^T G^-T Lam G^-1 e_new.
+        `legacy_transport` reproduces the pre-2026-10-21 G^-1 Lam G^-T (wrong unless G
+        is orthogonal), for the pre_repair_legacy acceptance only."""
+        if self.exact:
+            return
+        self.delta = G @ (self.delta + torch.as_tensor(step).double().reshape(-1))
+        if abs(float(torch.det(G))) > 1e-12:
+            if legacy_transport:
+                self.Lam = torch.linalg.solve(G, torch.linalg.solve(G, self.Lam).T).T
+            else:
+                Gi = torch.linalg.inv(G)
+                self.Lam = Gi.T @ self.Lam @ Gi
 
 
 def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                precision_fn, prior_information: Tensor,
                cfg: JointIEKFConfig | None = None, visibility=None,
                observation_model=None) -> FrameRecord:
-    """Section 13: one Phase-2 frame, with Phase-1's solver and acceptance.
+    """Section 13: one Phase-2/3 frame, solved and accepted on ONE objective.
 
-    `linearize(state, frame) -> FrameLinearization` and
-    `precision_fn(lin) -> [(p_rgb, p_depth)]` are the caller's bindings to the
-    EXISTING Phase-1 renderer cache and measurement precision; this function
-    never builds either itself.
+        E_total(x) = E_meas(x) + w/2 e(x)^T Lambda_minus e(x)
 
-    `prior_information` is the predicted information at this frame. The prior
-    is frozen for all nonlinear iterations (section 13 step 2) and the
-    correction is measured from it, so relinearizing does not quietly reuse
-    the prior more than once.
+    E_meas is the measurement part of the frame (RGB, robust valid depth NLL and,
+    in the expected-quad mode, the alpha term) on the true render; the prior is
+    the predicted nominal x_minus with information Lambda_minus, snapshotted once.
+    The GN model at the iterate x is
+        b = J_meas^T W r - w J^T Lam e(x),   A = J_meas^T W J_meas + w J^T Lam J,
+    the predicted decrease is b^T s - s^T A s / 2 for exactly the trial step, and
+    the actual decrease is E_total(x) - E_total(x boxplus s) -- the same terms.
+    (Before 2026-10-21 the solve used the prior but acceptance did not.)
+
+    `linearize(state, frame)` and `precision_fn(lin)` are the caller's bindings
+    to the renderer cache and the measurement model (see `_camera_terms`).
     """
+    import copy
+    from .joint_process import apply_correction
     cfg = cfg or JointIEKFConfig()
     dev = mu0.device
     n = state.dim
@@ -229,14 +342,19 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     tr = TrustRegionConfig(radius_init=cfg.radius_init,
                            max_pcg_iters=cfg.max_cg_iters)
     radius = cfg.radius_init
-    delta_from_prior = torch.zeros(n, dtype=torch.float64)
+    prior = _FramePrior(state, frame, prior_information, cfg.prior_weight)
 
-    energy, lin = _energy(linearize, state, frame, mu0, R0, observation,
-                          precision_fn, om)
+    meas, lin = _energy(linearize, state, frame, mu0, R0, observation, precision_fn, om)
+    e_prior = prior.energy(state)
+    energy = meas + e_prior
     energy0 = energy
+    legacy = cfg.acceptance == "pre_repair_legacy"
+    meas0 = meas_cur = meas
+    parts0 = {**lin.energy_parts, "prior": e_prior, "total": energy}
     accepted_count = 0
     rho_last = float("nan")
     it = 0
+    history = []
     vis_ref = vis_cur = vis_last = None
     vis_log = []
     if visibility is not None:
@@ -247,58 +365,47 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
         vis_ref = visibility.row_values(lin.visibility_values)
         vis_cur = vis_ref
 
+    def _weighted(terms):
+        return [((t.p_rgb * t.r_rgb, t.p_d * t.r_d, t.kappa * t.r_a) if t.kappa is not None
+                 else (t.p_rgb * t.r_rgb, t.p_d * t.r_d)) for t in terms]
+
+    def _meas_normal(L, st, terms):
+        alpha = any(t.kappa is not None for t in terms)
+
+        def op(p: Tensor) -> Tensor:
+            tang = joint_apply_H(L, st, frame, p.to(dev), mu0, R0, alpha=alpha)
+            if alpha:
+                w = [(t.p_rgb * dc, t.p_d * dd, (t.kappa if t.kappa is not None else torch.zeros_like(da)) * da)
+                     for t, (dc, dd, da) in zip(terms, tang)]
+            else:
+                w = [(t.p_rgb * dc, t.p_d * dd) for t, (dc, dd) in zip(terms, tang)]
+            return joint_apply_HT(L, st, frame, w, mu0, R0).cpu()
+        return op
+
     # Each iteration re-renders the whole scene, so at full scale this is
     # seconds per step. It also breaks early, hence absolute positioning.
     from utils.progress import ibar
     _bar = ibar(int(cfg.max_iters), f"solve f{frame:03d}")
     for it in range(1, int(cfg.max_iters) + 1):
         _bar.to(it - 1)
-        prec = precision_fn(lin)
-        # ---- measurement right-hand side: J^T H^T W r --------------------
-        weighted = []
-        mt = _masked_terms(lin, observation, prec, om) if om is not None else None
-        if mt is not None:
-            # masked RGB, foreground depth and K (M - A) through H_A, one lift
-            weighted = [(pc * r_c, pd * r_d, kap * r_a) for pc, pd, kap, r_c, r_d, r_a in mt]
-        for v, ob0, (pc, pd) in (zip(lin.views, observation, prec) if mt is None else ()):
-            ob = _to_view_device(ob0, v)
-            if ob is None:
-                weighted.append((torch.zeros_like(v.rgb),
-                                 torch.zeros_like(v.depth)))
-                continue
-            weighted.append((pc * (ob[0] - v.rgb), pd * (ob[1] - v.depth)))
-        rhs_meas = joint_apply_HT(lin, state, frame, weighted, mu0, R0).cpu()
-        b = rhs_meas - cfg.prior_weight * (prior_information
-                                           @ delta_from_prior)
+        terms = lin.frame_terms
+        # ---- right-hand side: J_meas^T W r - w J^T Lam e ----------------
+        rhs_meas = joint_apply_HT(lin, state, frame, _weighted(terms), mu0, R0).cpu()
+        g_prior, N_prior = prior.gradient_parts(state)
+        b = rhs_meas - g_prior
+        meas_op = _meas_normal(lin, state, terms)
 
         # ---- matrix-free normal operator (section 12) --------------------
-        def A_mv(p: Tensor) -> Tensor:
-            if mt is not None:
-                tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0, alpha=True)
-                w = [(pc * dc, pd * dd, kap * da)
-                     for (pc, pd, kap, *_), (dc, dd, da) in zip(mt, tang)]
-            else:
-                tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
-                w = [(pc * dc, pd * dd)
-                     for (pc, pd), (dc, dd) in zip(prec, tang)]
-            meas = joint_apply_HT(lin, state, frame, w, mu0, R0).cpu()
-            return meas + cfg.prior_weight * (prior_information @ p)
+        def A_mv(p: Tensor, _m=meas_op, _N=N_prior) -> Tensor:
+            return _m(p) + _N @ p.double()
 
-        # Section 14: for K=1 the operator is 6x6, so probing it with the
-        # basis vectors gives it EXACTLY -- no pixel Jacobian is built, just
-        # six applications of the matrix-free operator. Its inverse is then
-        # used as the CG preconditioner.
-        #
-        # This is not an optimisation. Steihaug-CG starts along `b`, whose
-        # qdot component is exactly zero (section 7: the image has no qdot
-        # derivative), and the coupling that should carry information into
-        # qdot only appears after the residual has been multiplied by A. With
-        # the image information on q four orders of magnitude larger than the
-        # prior, CG met its forcing tolerance in one or two iterations and
-        # qdot never moved: measured on real data it stayed at 7e-06 while q
-        # advanced 0.018 per frame, even though the posterior variance of qdot
-        # was correctly falling. Preconditioning by the exact inverse makes
-        # the first direction already the right one.
+        # Section 14: for K=1 the operator is small, so probing it with the
+        # basis vectors gives it EXACTLY; its inverse is the CG preconditioner.
+        # Steihaug-CG starts along b, whose qdot component is exactly zero (no
+        # image qdot derivative), and the coupling that carries information into
+        # qdot only appears after multiplication by A -- with the image
+        # information on q orders of magnitude above the prior, unpreconditioned
+        # CG met its tolerance before qdot moved.
         eye = torch.eye(n, dtype=torch.float64)
         A_dense = torch.stack([A_mv(eye[:, k]) for k in range(n)], dim=1)
         A_dense = 0.5 * (A_dense + A_dense.T)
@@ -316,10 +423,9 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                           max_iters=cfg.max_cg_iters)
         step = res.step
         if not torch.isfinite(step).all() or float(step.norm()) == 0.0:
+            history.append({"iteration": it, "stop": "zero_or_nonfinite_step", "radius": radius})
             break
 
-        import copy
-        from .joint_process import apply_correction
         vis_audit = vis_info = None
         if visibility is not None:
             # constrained correction (projection of the trust-region step onto
@@ -341,7 +447,7 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                 vis_last = (lin, A_mv, b, _lift, _liftT, M_inv)
                 trial = copy.deepcopy(state)
                 trial, _G = apply_correction(trial, frame, step, transport=False)
-                e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
+                m_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
                                          precision_fn, om)
                 vis_new = visibility.row_values(lin_new.visibility_values)
                 vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
@@ -356,43 +462,50 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                 n_soc += 1
             vis_info["second_order_corrections"] = n_soc
 
-        # ---- predicted reduction from the SAME quadratic model ----------
+        # ---- predicted reduction from the SAME quadratic MAP model -------
         pred = float((b * step).sum() - 0.5 * (step * A_mv(step)).sum())
 
-        # ---- trial retraction, rerender, Phase-1 acceptance -------------
+        # ---- trial retraction, rerender, acceptance on E_total ----------
         if visibility is None:
             trial = copy.deepcopy(state)
             trial, _G = apply_correction(trial, frame, step, transport=False)
-            e_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
+            m_new, lin_new = _energy(linearize, trial, frame, mu0, R0, observation,
                                      precision_fn, om)
-        actual = energy - e_new
+        p_new = prior.energy(trial, step)
+        e_new = m_new + p_new
+        actual = (meas_cur - m_new) if legacy else (energy - e_new)
         rho = actual / pred if pred > 0 else float("-inf")
         if vis_audit is not None and not vis_audit["ok"]:
             rho = float("nan")              # nonlinear audit failed: reject and shrink
         rho_last = rho
+        radius_before = radius
         radius, accept = adapt_radius(radius, rho, res.boundary_hit, actual, tr)
         took = False
-        if accept and math.isfinite(e_new) and e_new < energy:
+        if accept and math.isfinite(e_new) and ((m_new < meas_cur) if legacy else (e_new < energy)):
             took = True
-            # the accepted step is applied to the REAL state, with the
-            # covariance carried across the basis change (section 15)
+            # the accepted step is applied to the REAL state
             state, G = apply_correction(state, frame, step, transport=False)
-            delta_from_prior = G @ (delta_from_prior + step)
-            prior_information = (torch.linalg.solve(
-                G, torch.linalg.solve(G, prior_information).T).T
-                if abs(float(torch.det(G))) > 1e-12 else prior_information)
+            prior.accepted(step, G, legacy_transport=legacy)
             energy, lin = e_new, lin_new
+            meas_cur = m_new
             accepted_count += 1
             if visibility is not None:
                 vis_cur = vis_new
+        tp = lin_new.energy_parts
+        history.append({"iteration": it, "measurement_rgb": tp["rgb"], "measurement_alpha": tp["alpha"],
+                        "measurement_depth": tp["depth"], "prior_energy": p_new, "total_energy": e_new,
+                        "predicted_decrease": pred, "actual_decrease": actual, "rho": rho,
+                        "accepted": took, "radius_before": radius_before, "radius": radius,
+                        "depth_used": tp["depth_used"], "depth_gated_by_alpha": tp["depth_gated_by_alpha"],
+                        "prior_mode": "exact_manifold" if prior.exact else "chart_offset"})
         if visibility is not None:
             vis_log.append({"iteration": it, "accepted": took,
                             **(vis_info or {}), "audit": vis_audit})
         _bar.note(f"rho {rho:+.3f} E {energy:.4e} "
-                  f"{'accept' if accept else 'reject'}")
+                  f"{'accept' if took else 'reject'}")
         if cfg.verbose:
             print(f"      it {it}: rho {rho:+.3f} radius {radius:.3e} "
-                  f"energy {energy:.6e} {'accept' if accept else 'reject'}")
+                  f"energy {energy:.6e} {'accept' if took else 'reject'}")
         if radius <= tr.radius_min:
             break
 
@@ -420,26 +533,17 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                        "posterior_note": "unconstrained information inverse; truncated by active inequalities",
                        "iterations": vis_log}
 
-    # ---- section 14: the exact 6x6 posterior, by probing the operator ----
-    prec = precision_fn(lin)
-    mt = _masked_terms(lin, observation, prec, om) if om is not None else None
-
-    def meas_only(p: Tensor) -> Tensor:
-        if mt is not None:
-            tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0, alpha=True)
-            w = [(pc * dc, pd * dd, kap * da) for (pc, pd, kap, *_), (dc, dd, da) in zip(mt, tang)]
-        else:
-            tang = joint_apply_H(lin, state, frame, p.to(dev), mu0, R0)
-            w = [(pc * dc, pd * dd) for (pc, pd), (dc, dd) in zip(prec, tang)]
-        return joint_apply_HT(lin, state, frame, w, mu0, R0).cpu()
-
-    # The state is tiny, so applying the matrix-free operator to the six basis
-    # vectors gives the EXACT measurement information -- no pixel Jacobian is
-    # ever materialised (section 14).
-    H_info = torch.stack([meas_only(torch.eye(n, dtype=torch.float64)[:, k])
+    # ---- section 14: the posterior at the ACCEPTED state -----------------
+    # measurement information by probing the operator at the final
+    # linearization, plus the prior information pulled back to the tangent of
+    # the accepted state (w J^T Lambda_minus J): the same tangent the next
+    # frame's prediction propagates.
+    meas_final = _meas_normal(lin, state, lin.frame_terms)
+    H_info = torch.stack([meas_final(torch.eye(n, dtype=torch.float64)[:, k])
                           for k in range(n)], dim=1)
     H_info = 0.5 * (H_info + H_info.T)
-    info = prior_information + H_info
+    _, N_prior = prior.gradient_parts(state)
+    info = N_prior + H_info
     info = 0.5 * (info + info.T)
     evals = torch.linalg.eigvalsh(info)
     if float(evals.min()) <= cfg.psd_floor:
@@ -449,9 +553,11 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
     post = 0.5 * (post + post.T)
 
     p0 = state.parts[0]
+    final_parts = {**lin.energy_parts, "prior": prior.energy(state), "total": energy}
     return FrameRecord(
         frame=frame, iterations=it, accepted=accepted_count,
-        energy_before=energy0, energy_after=energy, radius=radius,
+        energy_before=meas0 if legacy else energy0, energy_after=meas_cur if legacy else energy,
+        radius=radius,
         rho_last=rho_last, information=info, posterior=post,
         q=float(p0.q[frame]), qdot=float(p0.qdot[frame]), sign_flipped=False,
         observability={"measurement_information_eigenvalues":
@@ -463,6 +569,9 @@ def frame_step(state, frame: int, mu0: Tensor, R0, observation, linearize,
                                           slice(2, 6)),
                                   getattr(state, "geometry_slice",
                                           slice(2, 6))]).tolist(),
+                       "objective": {"initial": parts0, "final": final_parts, "acceptance": cfg.acceptance,
+                                     "prior_mode": "exact_manifold" if prior.exact else "chart_offset"},
+                       "iterations": history,
                        **({"visibility": vis_summary} if vis_summary is not None else {})})
 
 

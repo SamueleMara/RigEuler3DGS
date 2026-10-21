@@ -65,7 +65,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as td:
         try:
             p3.main(["--scene", SCENE, "--direction", "forward", "--model", str(td), "--source", str(td),
-                     "--phase2-dir", str(p2), "--out", str(Path(td) / "o")])
+                     "--phase2-dir", str(p2), "--out", str(Path(td) / "o"),
+                     # the default masked mode would stop first at the mask preflight
+                     # (no masks in the temp dir); this check is about the direction
+                     "--observation-mode", "original"])
             check("[3] a backward support with --direction forward is refused", False)
         except SystemExit as e:
             check("[3] a backward support with --direction forward is refused",

@@ -93,6 +93,15 @@ class DisplacementOnlyState:
         """q and qdot are plain scalars: no basis moves, G = I."""
         return torch.eye(DISPLACEMENT_DIM, dtype=torch.float64)
 
+    def prior_error(self, frame: int, prior_state) -> Tensor:
+        """e = (q - q_minus, qdot - qdot_minus) at `frame`: exact, the retraction is additive."""
+        p, m = self.parts[0], prior_state.parts[0]
+        return torch.stack([p.q[frame] - m.q[frame], p.qdot[frame] - m.qdot[frame]]).double()
+
+    def prior_jacobian(self, frame: int, prior_state) -> Tensor:
+        """d e(x boxplus delta) / d delta = I for the additive (q, qdot) retraction."""
+        return torch.eye(DISPLACEMENT_DIM, dtype=torch.float64)
+
 
 def geometry_snapshot(part) -> dict:
     """Every geometry tensor of a P or R part, for an exact before/after check."""

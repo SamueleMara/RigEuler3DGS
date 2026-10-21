@@ -162,7 +162,12 @@ def run_prismatic_null_sequence(state, mu0, R0, observations, linearize,
     """
     from .joint_iekf import JointIEKFConfig, run_window
 
-    cfg = cfg or JointIEKFConfig()
+    import dataclasses
+    # Legacy joint-identification diagnostic: its score test and the section-19
+    # stationarity audit are calibrated on the pre-2026-10-21 acceptance rule, so
+    # the null fit keeps the pre-repair frame step explicitly (the Phase 2/3 runners
+    # accept on the MAP; see JointIEKFConfig.acceptance).
+    cfg = dataclasses.replace(cfg or JointIEKFConfig(), acceptance="pre_repair_legacy")
     for p in state.parts:
         project_to_prismatic(p)
 

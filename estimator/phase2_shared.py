@@ -89,6 +89,42 @@ def weighted_energy(lin, obs_all, cam_ids, precisions):
     return rows
 
 
+def measurement_terms(lin, obs_frame, cam_ids, cfg, model_error=None, model=None):
+    """Per-camera `CameraTerms` (estimator/observation_terms.py) of Phase 2/3.
+
+    ONE sigma per sample, sigma_eff^2 = sigma_sensor^2 + sigma_model^2 (the
+    model-error map is estimated once per run and is fixed), used in the IRLS
+    weight, the GN precision AND the robust objective (Student-t NLL), so the
+    solved and the accepted objective are the same function (P1-1).
+
+      model None    original mode: Student-t RGB (cfg.robust_measurement) on every
+                    pixel, Student-t depth on V_orig AND the alpha gate
+      model given   masked modes: fixed-quadratic RGB on Y(b) - C over the whole
+                    image, robust depth on V_orig AND M, alpha term in expected-quad
+    `obs_frame` is indexed by ABSOLUTE camera id, `lin.views` by position in cam_ids.
+    """
+    from .observation_terms import CameraTerms, camera_terms
+    if model is not None:
+        from .masked_observation import phase1_camera_terms
+        return phase1_camera_terms(lin.views, [obs_frame[c] for c in cam_ids], cfg, model,
+                                   model_error=model_error, cam_ids=cam_ids)
+    out = []
+    for j, c in enumerate(cam_ids):
+        v = lin.views[j]
+        ob = obs_frame[c]
+        if ob is None:
+            z3, z = torch.zeros_like(v.rgb), torch.zeros_like(v.depth)
+            out.append(CameraTerms(z3, z, z3, z, None, None, 0.0, 0.0, 0.0, 0, 0, 0))
+            continue
+        rgb = ob[0].to(v.rgb.device)
+        d = ob[1].to(v.depth.device)
+        valid = (ob[2].to(v.depth.device) if len(ob) > 2 and ob[2] is not None else d > 0)
+        out.append(camera_terms(v, rgb, d, valid, cfg, rgb_robust=bool(cfg.robust_measurement),
+                                rgb_model_var=None if model_error is None else model_error.rgb_var[c],
+                                depth_model_var=None if model_error is None else model_error.depth_var[c]))
+    return out
+
+
 def effective_precision_masked(lin, prepared_all, cam_ids, cfg, model_error=None):
     """The masked observation mode's (W_rgb, W_depth) per camera, for a camera subset.
 

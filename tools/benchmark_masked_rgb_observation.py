@@ -11,7 +11,10 @@ bootstrap_positions -> estimator.sparse_iekf.iekf_frame_step) on frames 0..1
   * peak GPU memory;
   * the energy terms (original: RGB + depth; masked: RGB, alpha, depth -- different
     objectives, never compared as numbers);
-  * background leakage of the tracked state: rendered alpha on mask = 0 pixels;
+  * background leakage of the tracked state -- its centres AND orientations, never
+    the canonical rotations -- with estimator/mask_diagnostics.py, the same
+    GT-free definition the pipeline stages write (alpha on mask = 0 pixels on a
+    fixed evaluation background, foreground coverage, valid-depth counts);
   * the state change: |mu_1 - mu_0| statistics.
 Nothing is written outside --out (a NEW directory); GT is not read.
 
@@ -81,6 +84,10 @@ def run_mode(mode, args, scene_cache):
                T.wrap(rb.FrameLinearization, "build_block_fisher", "RGB-D Fisher"),
                T.wrap(rb.FrameLinearization, "build_alpha_fisher", "alpha Fisher"),
                T.wrap(si, "evaluate_true_map_energy", "nonlinear evaluations (incl. their renders)"),
+               T.wrap(si, "steihaug_cg", "matrix-free CG solves (incl. their JVP/VJP)"),
+               T.wrap(si, "approximate_posterior_information", "posterior information"),
+               T.wrap(si, "invert_blocks", "PSD block inversions"),
+               T.wrap(si, "project_psd", "PSD projections"),
                T.wrap(mo.MaskedSequence, "prepare_frame", "mask/precision preparation")]
     torch.cuda.reset_peak_memory_stats()
     window = [(ob, fid) for (ob, _s, _d), fid in zip(frames_raw, frame_ids["frames"])]
@@ -88,7 +95,7 @@ def run_mode(mode, args, scene_cache):
     rows = {}
 
     def observer(ti, state, *_):
-        rows[ti] = state.mu.detach().clone()
+        rows[ti] = (state.mu.detach().clone(), state.R.detach().clone())
     try:
         positions, _info = bootstrap_positions(truth, frames_raw[0][1], window, cfg, None, ns,
                                                verbose=False, observer=observer)
@@ -97,27 +104,27 @@ def run_mode(mode, args, scene_cache):
             setattr(owner, name, f)
     wall = time.perf_counter() - t0
     peak = torch.cuda.max_memory_allocated() / 2 ** 20
-    mu1 = positions[1].to(truth.mu.device)
+    mu1, R1 = (t.to(truth.mu.device) for t in rows[1])
+    if not torch.equal(mu1, positions[1].to(mu1.device)):
+        raise AssertionError("observer state and returned positions disagree for frame 1")
     dx = (mu1 - truth.mu).norm(dim=1)
-    # background leakage of the tracked state on mask = 0 pixels (masks are an input
-    # measurement; loaded here for the report only)
-    import dataclasses
+    # background leakage of the tracked state (centres AND orientations); masks
+    # are an input measurement, loaded here for the report only
+    from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
     from estimator.renderer_bridge import build_linearization
-    st1 = dataclasses.replace(truth, mu=mu1.to(truth.mu.dtype))
-    L = build_linearization(st1, frames_raw[0][1])
-    cams = list(frame_ids.get("cameras"))[:len(L.views)]
-    orig1 = int(frame_ids["frames"][1].get("original_frame_index", frame_ids["frames"][1]["dataset_frame_index"]))
-    root = Path(args.mask_source) if args.mask_source else Path(args.source) / "mask"
-    masks = mo.load_object_masks(root, cams, [orig1], L.views[0].alpha.shape[0], L.views[0].alpha.shape[1])[0]
-    leak = sum(float(v.alpha[~m.to(v.alpha.device)].sum()) for v, m in zip(L.views, masks))
-    neg = sum(int((~m).sum()) for m in masks)
+    mfn, mroot, why = masks_for_run(ns, Path(args.source), frames_raw, frame_ids, ns.masked_observation)
+    md = MaskDiagnostics("phase1 benchmark", mfn, mroot, frames_raw[0][1], cfg, truth, build_linearization,
+                         reason=why)
+    md.frame(1, frame_ids["frames"][1], mu1, R1, frames_raw[1][0])
+    leak = md.report()
+    rot_change = float((R1 - truth.R).flatten(1).norm(dim=1).max())
     report = None if ns.masked_observation is None else ns.masked_observation.report
     return {"mode": mode, "wall_time_s_tracked_frame": wall, "data_loading_s (shared)": t_load,
             "mask_loading_s": t_masks, "gpu_peak_MiB": peak,
             "breakdown_s": T.t, "calls": T.n,
             "energy_terms": report[-1] if report else "original mode: see the IEKF diag (RGB + depth only)",
-            "background_leakage": {"alpha_sum_on_negative_pixels": leak, "negative_pixels": neg,
-                                   "mean_alpha_on_negative_pixels": leak / max(neg, 1)},
+            "background_leakage": leak,
+            "max_rotation_change_frobenius": rot_change,
             "state_change_vs_canonical_m": {"mean": float(dx.mean()), "median": float(dx.median()),
                                             "p99": float(dx.quantile(0.99)) if dx.numel() < 2 ** 24 else None,
                                             "max": float(dx.max())}}
@@ -155,8 +162,9 @@ def main(argv=None) -> int:
     for mode in [m.strip() for m in args.modes.split(",") if m.strip()]:
         print(f"== {mode}")
         r = run_mode(mode, args, (truth, cams_all, frames_raw, frame_ids, cfg, t_load))
-        print(json.dumps({k: r[k] for k in ("wall_time_s_tracked_frame", "gpu_peak_MiB", "background_leakage",
-                                            "state_change_vs_canonical_m")}, indent=1))
+        print(json.dumps({**{k: r[k] for k in ("wall_time_s_tracked_frame", "gpu_peak_MiB",
+                                               "state_change_vs_canonical_m")},
+                          "leakage": r["background_leakage"].get("mean_over_frames")}, indent=1))
         results.append(r)
         torch.cuda.empty_cache()
     payload = {"scene": Path(args.source).name, "model": args.model, "cameras": ncam,

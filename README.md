@@ -136,7 +136,7 @@ The scene names used in the original dataset are: `USB_100109 stapler_103111 bla
 | **Phase 1 CLI** `run_motion_coherence_support.py` | `--source "$SRC"`, `--model "$OUT/static_bidi/initial"` (F) or `--model "$OUT/static_bidi/final"` (B) | `--out "$BIDI/forward"` or `.../backward` | No scene folder added to `--out` |
 | **Phase 2 CLI** `run_rigid_se3_pipeline.py` | `--source "$SRC"`, `--model ...`, plus saved support/centers | `--out "$BIDI/forward_rigid"` or `.../backward_rigid` | No scene folder added |
 | **Phase 3 CLI** `run_joint_phase3.py` | `--source "$SRC"`, `--model ...`, `--phase2-dir ...` | `--out "$BIDI/forward_joint"` or `.../backward_joint` | No scene folder added |
-| **A/B of two roots** `scripts/run_object_mask_ab.sh` | `--dataset-root "$DATA"`, `--base-root "$RES/ours"` | `--nomask-root`, `--masks-root` (defaults under `$RES`) | `/<scene>` per scene; table in `<masks-root>_ab/` |
+| **Fair A/B** `scripts/run_object_mask_ab.sh` | `--dataset-root "$DATA"`, `--static-root "$RES/ours"` (static models, read only) | `--original-root`, `--masked-root` (default `$RES/ours_fairab_original`, `$RES/ours_fairab_masked`) | `/<scene>` per scene; table in `<masked-root>_vs_original/` |
 
 The driver accepts `--input`/`--output` (or `-i`/`-o`), plus `--scenes`, `--stages`, `--frames`,
 `--cameras`, `--dry-run` and `--help`. The environment variables `SRC_ROOT`, `OUT_ROOT`, `SCENES`,
@@ -267,17 +267,10 @@ bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "phase1 phase2 
   --object-mask-constraint visible-negative-hard --mask-ray-semantics trusted-full-ray
 ```
 
-**A/B on the synthetic scenes**, at the same static endpoints:
-
-* without the constraint: the Phase 1/2 results under `ours/` are copied, never linked, because the
-  drive is exFAT; only Phase 3 is rerun;
-* with the constraint: Phase 1/2/3 are rerun.
-
-The table goes to `$RES/object_masks_ab/`:
-
-```bash
-bash scripts/run_object_mask_ab.sh            # --dry-run to preview, --compare-only to redo the table
-```
+The hard constraint is a measurement model of the **original** observation: since 2026-10-21 it
+needs `--observation-mode original` explicitly (the default masked mode refuses it). The A/B script
+now compares original vs masked observation (section 2.6); a hard-constraint A/B is run by hand with
+two driver calls into two new roots.
 
 **Tests** (real CUDA renderer):
 
@@ -296,14 +289,21 @@ cd submodules/diff-gaussian-rasterization && python setup_vis.py build_ext --inp
 ```
 
 
-### 2.6 Masked-RGB observation (`--observation-mode`, opt-in)
+### 2.6 Masked-RGB observation (`--observation-mode`, the DEFAULT since 2026-10-21)
 
 Implementation and evidence:
 
 - [docs/MASKED_RGB_FOREGROUND_DEPTH_AUDIT_2026_10_20.md](docs/MASKED_RGB_FOREGROUND_DEPTH_AUDIT_2026_10_20.md)
 - [docs/MASKED_RGB_FOREGROUND_DEPTH_IMPLEMENTATION_2026_10_20.md](docs/MASKED_RGB_FOREGROUND_DEPTH_IMPLEMENTATION_2026_10_20.md)
 
-**Why.** By default the motion stages compare the whole image with the object rendered over black.
+**Default.** Every motion entry point (driver, Phase 1/2/3 runners) uses `masked-rgb-expected-quad`
+unless `--observation-mode original` is passed explicitly; the masks are checked BEFORE any model
+load, training or output deletion and a scene without complete binary masks is refused (driver:
+`SKIPPED(masks not ready)`), never silently run in the original mode. `masked-rgb-constant` is an
+ablation. Static training is unaffected. Repair report:
+[docs/MASKED_IEKF_DEFAULT_REPAIR_REPORT_2026_10_21.md](docs/MASKED_IEKF_DEFAULT_REPAIR_REPORT_2026_10_21.md).
+
+**Why.** The original mode compares the whole image with the object rendered over black.
 On a real capture the grey, textured background is about 98% of that cost and pulls object Gaussians
 outward.
 
@@ -329,14 +329,25 @@ outward.
 
 | option | default | meaning |
 |---|---|---|
-| `--observation-mode original\|masked-rgb-constant\|masked-rgb-expected-quad` | `original` | `original` is the unchanged full-frame observation |
+| `--observation-mode original\|masked-rgb-constant\|masked-rgb-expected-quad` | `masked-rgb-expected-quad` | `original` is the full-frame observation, an explicit control |
 | `--rgb-background-distribution uniform01` | `uniform01` | expected-quad only |
 | `--rgb-background-constant R G B` | none | required by `masked-rgb-constant`, refused otherwise |
 | `--mask-source DIR` / driver `--mask-subdir NAME` | `<scene>/mask` | binary masks at native resolution; non-binary, wrong-size, missing or ambiguous files are refused |
 
 **Rules:**
 
-- The masked modes refuse to run together with `--object-mask-constraint`.
+- The masked modes refuse to run together with `--object-mask-constraint` (hard QP: explicit
+  `--observation-mode original` only).
+- Depth is a measurement only where it is valid, finite and > 0 (positive camera Z); masks remove
+  depth, they never overwrite its value.
+- Every stage writes `stage_manifest.json` (`tools/stage_signature.py`): the driver reuses a stage
+  only if it is complete with an identical signature (code, scene, direction, static PLY / cfg_args
+  hashes, observation mode, mask content hash, source listing, config, upstream stage) and REFUSES a
+  legacy or differently configured output (`FORCE=1` overwrites). Use new output roots after
+  changing anything.
+- Each stage also writes `mask_diagnostics.json` (GT-free background leakage of the tracked centres
+  AND orientations, same definition in every mode), `stage_resources.json` (wall time, peak GPU),
+  Phase 1 `phase1_frames.json` (covariance, stop reasons) and Phase 2/3 `model_error_audit.json`.
 - Static training never receives these options.
 - Each stage writes `masked_observation.json`: the mode, the background, the precision, coverage, and
   the per-frame energy terms.
@@ -356,18 +367,20 @@ outward.
 - identifiability;
 - end-to-end Phase 1/2/3 windows.
 
+**Tests:** `tests/test_masked_default_repair.py` (73 checks) covers the 2026-10-21 repairs.
+
 **Commands:**
 
 ```bash
-# all synthetic scenes: copies the static models (exFAT: no links), reruns Phase 1/2/3 in the masked
-# mode into ours_masked_rgb/, reruns Phase 3 on the stable results into ours_nomask/, then the table
+# FAIR A/B: the same static models copied (verified sha256) into two NEW roots, then FRESH
+# Phase 1/2/3 in BOTH arms (explicit --observation-mode original vs masked), then the table with a
+# manifest diff (only the observation block may differ) and GT-free leakage diagnostics
 bash scripts/run_object_mask_ab.sh --dry-run          # preview
-bash scripts/run_object_mask_ab.sh                    # --with masked-rgb-expected-quad is the default
 bash scripts/run_object_mask_ab.sh --scenes "fridge_10905"   # one object first
+bash scripts/run_object_mask_ab.sh                    # all ten synthetic scenes
 
-# one scene or root, directly
-bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES" --stages "phase1 phase2 phase3" \
-  --observation-mode masked-rgb-expected-quad
+# one scene or root, directly (masked-rgb-expected-quad is the default)
+bash run_bidirectional_all.sh -i "$SCENE_DIR" -o "$RES_NEW" --stages "phase1 phase2 phase3"
 
 # benchmark: one tracked frame, original vs masked, timing and leakage (writes only into a NEW --out)
 python tools/benchmark_masked_rgb_observation.py --model "$RES/fridge_10905/static_bidi/initial" \
@@ -650,10 +663,12 @@ are missing (section 2.4).
 | Phase 2 + joint | `<dir>_rigid/phase2_rigid/`, `<dir>_rigid/joint_reduction/` | `<dir>_rigid/joint_reduction/gt_evaluation.json` |
 | Phase 3 | `<dir>_joint/<type>/trajectory.csv`, `summary.json` | `<dir>_joint/evaluation_gt/phase3_gt_evaluation.json` (`--evaluate-gt`) |
 
-A/B of two results roots (e.g. original vs masked observation), GT used for scoring only:
+Fair A/B of two results roots (original vs masked observation; both must be fresh runs with complete
+stage manifests), GT used for scoring only; and the machine-readable stage report:
 
 ```bash
-$PY tools/compare_object_masks.py --baseline "$RES_A" --masks "$RES_B" --out "$RES_B"_ab
+$PY tools/compare_object_masks.py --original "$RES_A" --masked "$RES_B" --out "$RES_B"_vs_original
+$PY tools/repair_report.py --root "$RES_A" --root "$RES_B" --out "$RES_B"_vs_original/stage_report.json
 ```
 
 ## 7. Tests

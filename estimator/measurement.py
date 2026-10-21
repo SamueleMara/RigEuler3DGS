@@ -292,6 +292,49 @@ def student_t_weight(whitened: torch.Tensor, nu: float) -> torch.Tensor:
     return (nu_f + 1.0) / (nu_f + whitened.square())
 
 
+def student_t_nll(whitened: torch.Tensor, nu: float) -> torch.Tensor:
+    """The per-sample robust objective whose derivative IS the IRLS score.
+
+        rho(z) = (nu + 1)/2 * log1p(z^2 / nu)      (nu finite)
+        rho(z) = z^2 / 2                            (nu = inf)
+
+    d rho / d r = w(z) r / sigma^2 with w = student_t_weight(z, nu), so
+    Gauss-Newton with IRLS precision w/sigma^2 is the local model of THIS
+    function. Summing 0.5 * w(z) z^2 with weights re-evaluated at every trial
+    state is not a fixed objective; this is.
+    """
+    nu_f = float(nu)
+    if math.isnan(nu_f) or nu_f <= 0.0:
+        raise ValueError(f"student-t degrees of freedom must be positive, got {nu}")
+    z2 = whitened.square()
+    if math.isinf(nu_f):
+        return 0.5 * z2
+    return 0.5 * (nu_f + 1.0) * torch.log1p(z2 / nu_f)
+
+
+def robust_term(residual: torch.Tensor, sigma: torch.Tensor, valid: torch.Tensor,
+                robust: bool, nu: float) -> tuple[torch.Tensor, float]:
+    """(GN precision, objective) for one channel with a FIXED per-sample sigma.
+
+    precision = valid * w(z) / sigma^2 (w = 1 when not robust) -- the IRLS local
+    model; objective = sum over valid samples of student_t_nll(z, nu) when
+    robust, 0.5 z^2 otherwise. Invalid samples are excluded by indexing before
+    any arithmetic, so a NaN / inf / garbage value stored there can never reach
+    the objective, the precision or the gradient. float64 accumulation.
+    """
+    v = valid.bool() & torch.isfinite(residual) & torch.isfinite(sigma) & (sigma > 0)
+    zero = torch.zeros((), dtype=residual.dtype, device=residual.device)
+    one = torch.ones((), dtype=residual.dtype, device=residual.device)
+    r = torch.where(v, residual, zero)
+    s = torch.where(v, sigma.to(residual.dtype), one)
+    z = r / s
+    w = student_t_weight(z, nu) if robust else torch.ones_like(z)
+    prec = torch.where(v, w / (s * s), zero)
+    rho = student_t_nll(z, nu if robust else float("inf"))
+    energy = float(torch.where(v, rho, zero).sum(dtype=torch.float64))
+    return prec, energy
+
+
 def depth_validity(
     depth_gt: torch.Tensor,
     *,

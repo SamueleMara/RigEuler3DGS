@@ -40,16 +40,22 @@
 #                --mask-depth-noise-m (required for known-nonobject-depth),
 #                --mask-boundary-px (2), --mask-alpha-epsilon (0.05),
 #                --mask-subdir NAME (masks read from <scene>/NAME; default mask)
-# --observation-mode original|masked-rgb-constant|masked-rgb-expected-quad
-#                (default original = the unchanged full-frame observation).
-#                masked-rgb-*: Phase 1/2/3 observe the masked object RGB composited
-#                on a known artificial background (rendered on the same one) and
-#                depth on the object only (estimator/masked_observation.py);
-#                expected-quad adds the exact Uniform[0,1]-background expectation
-#                term. With --rgb-background-constant R G B (constant mode) or
-#                --rgb-background-distribution uniform01 (expected mode, default),
-#                and --mask-subdir. Never combined with --object-mask-constraint;
-#                static training receives none of these switches.
+# --observation-mode masked-rgb-expected-quad|masked-rgb-constant|original
+#                DEFAULT masked-rgb-expected-quad: Phase 1/2/3 observe the masked
+#                object RGB composited on a known artificial background (rendered on
+#                the same one), with the exact Uniform[0,1]^3-background expectation
+#                term, and depth on the object only (estimator/masked_observation.py).
+#                The masks (<scene>/mask, or --mask-subdir NAME) are checked before
+#                any training or output deletion; missing masks stop the scene, never
+#                a silent fallback. masked-rgb-constant needs --rgb-background-constant
+#                R G B; original is the explicit unmasked control (and the only mode
+#                the hard --object-mask-constraint runs with). Static training
+#                receives none of these switches.
+# Stage reuse is signature-checked (tools/stage_signature.py): a stage output is
+# reused only when its stage_manifest.json is complete and matches the requested
+# code / endpoint / observation / masks / frames / cameras / settings / upstream.
+# Output of another configuration, or legacy output without a manifest, is never
+# reused or deleted: use a new --output root, or FORCE=1 to overwrite.
 # --dry-run      print the commands only
 #
 # The same settings can be given as environment variables (SRC_ROOT, OUT_ROOT,
@@ -124,10 +130,11 @@ if [ "$VIS_MODE" != "off" ]; then
            --mask-boundary-px "${VIS_BAND:-2}" --mask-alpha-epsilon "${VIS_EPS:-0.05}")
   [ -n "${VIS_DNOISE:-}" ] && VISARGS+=(--mask-depth-noise-m "$VIS_DNOISE")
 fi
-OBS_MODE=${OBS_MODE:-original}
+OBS_MODE=${OBS_MODE:-masked-rgb-expected-quad}     # motion default since 2026-10-21
 OBSARGS=()
 case "$OBS_MODE" in
-  original) [ ${#OBS_BG[@]} -eq 0 ] && [ -z "${OBS_DIST:-}" ] || { echo "--rgb-background-* needs a masked --observation-mode" >&2; exit 2; };;
+  original) [ ${#OBS_BG[@]} -eq 0 ] && [ -z "${OBS_DIST:-}" ] || { echo "--rgb-background-* needs a masked --observation-mode" >&2; exit 2; }
+    OBSARGS=(--observation-mode original);;     # explicit: the runners' default is the masked mode
   masked-rgb-constant)
     [ ${#OBS_BG[@]} -eq 3 ] || { echo "masked-rgb-constant needs --rgb-background-constant R G B" >&2; exit 2; }
     OBSARGS=(--observation-mode "$OBS_MODE" --rgb-background-constant "${OBS_BG[@]}");;
@@ -137,9 +144,10 @@ case "$OBS_MODE" in
   *) echo "unknown --observation-mode $OBS_MODE" >&2; exit 2;;
 esac
 if [ "$OBS_MODE" != "original" ] && [ "$VIS_MODE" != "off" ]; then
-  echo "--observation-mode $OBS_MODE and --object-mask-constraint $VIS_MODE are different measurement models; choose one" >&2
+  echo "--object-mask-constraint $VIS_MODE needs --observation-mode original (the default masked-rgb-expected-quad and the hard constraint are different measurement models)" >&2
   exit 2
 fi
+OBS_DIST_RES=""; [ "$OBS_MODE" = "masked-rgb-expected-quad" ] && OBS_DIST_RES=${OBS_DIST:-uniform01}
 # fewer "reserved but unallocated" failures on the shared 8 GB card
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 # FORCE=1 retrains/reruns even when the output exists. The final endpoint
@@ -249,7 +257,11 @@ echo "scenes     : $SCENES"
 echo "output root: $OUT_ROOT   (each scene -> $OUT_ROOT/<scene>/)"
 echo "stages     : $STAGES"
 [ "$VIS_MODE" != "off" ] && echo "mask constraint: ${VISARGS[*]}"
-[ "$OBS_MODE" != "original" ] && echo "observation: ${OBSARGS[*]} (masks <scene>/${VIS_SUBDIR:-mask})"
+if [ "$OBS_MODE" != "original" ]; then
+  echo "observation: ${OBSARGS[*]} (masks <scene>/${VIS_SUBDIR:-mask}); hard QP: off"
+else
+  echo "observation: original (explicit control, no masks${VIS_MODE:+; hard QP: $VIS_MODE})"
+fi
 [ "$DRY" = "1" ] || mkdir -p "$OUT_ROOT"
 
 has_stage() { case " $STAGES " in *" $1 "*) return 0;; *) return 1;; esac; }
@@ -307,6 +319,40 @@ run() {
   done
 }
 
+# ---- experiment signatures (tools/stage_signature.py) -----------------------
+# A stage is reused only when its stage_manifest.json says "complete", its
+# signature (code, endpoint PLY hash, observation mode, masks, source frames and
+# cameras, settings, upstream stage) equals the requested one, and its outputs
+# still validate. Legacy output without a manifest, or a different signature,
+# is never reused and never deleted: the scene stops there unless FORCE=1.
+SIGDIR=$(mktemp -d "${TMPDIR:-/tmp}/rigeuler_sig.XXXXXX")
+trap 'rm -rf "$SIGDIR"' EXIT
+stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
+  "$PY" tools/stage_signature.py compute --stage "$1" --direction "$2" --scene "$S" \
+    --source "$SRC" --model "$3" --frames "$NF" --cameras "$NC" --iterations "$ITERS" \
+    --observation-mode "$OBS_MODE" ${OBS_DIST_RES:+--rgb-background-distribution "$OBS_DIST_RES"} \
+    ${OBS_BG[0]:+--rgb-background-constant "${OBS_BG[*]}"} --object-mask-constraint "$VIS_MODE" \
+    --mask-options "${VISARGS[*]}" --mask-source "$SRC/${VIS_SUBDIR:-mask}" ${4:+--upstream "$4"} \
+    --config "BOOT=$BOOT" "IEKF_SN=$IEKF_SN" "KNN=$KNN" "SNCOUNT=$SNCOUNT" "FOLDS=$FOLDS" \
+             "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" > "$5"
+}
+# decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
+decide() {
+  local msg rc
+  msg=$("$PY" tools/stage_signature.py check --dir "$1" --signature "$2"); rc=$?
+  case $rc in
+    0)  DECISION=reuse;  echo "  [$3] reusing: ${msg#*: }";;
+    10) DECISION=run;;
+    11) DECISION=run;    echo "  [$3] ${msg#*: }";;
+    *)  if [ "$FORCE" = "1" ]; then DECISION=run; echo "  [$3] FORCE=1, overwriting: $msg"
+        else DECISION=refuse; echo "  !! [$3] $msg"; fi;;
+  esac
+}
+manifest() {    # manifest STAGE_DIR SIGFILE STATUS
+  [ "$DRY" = "1" ] && return 0
+  "$PY" tools/stage_signature.py write --dir "$1" --signature "$2" --status "$3"
+}
+
 STATUS=()
 T_ALL=$(date +%s)
 
@@ -336,6 +382,17 @@ for S in $SCENES; do
     echo "  note: $NF of $NF_ALL frames; the backward run is anchored at the LAST frame and will refuse a shorter window"
   fi
   echo "  input OK: $NF_ALL frames x $NC_ALL cameras  (using $NF x $NC)"
+  if [ "$OBS_MODE" != "original" ] || [ "$VIS_MODE" != "off" ]; then
+    # masks are checked BEFORE any training or output deletion; no fallback
+    MCHK=$("$PY" tools/check_masks.py --source "$SRC" --mask-source "$SRC/${VIS_SUBDIR:-mask}" \
+           --cameras "$NC" --frames "$NF" 2>&1); MRC=$?
+    if [ $MRC -ne 0 ]; then
+      echo "  !! $MCHK" | head -6
+      echo "  !! observation mode $OBS_MODE needs the masks -- skipping (pass --observation-mode original explicitly to run without them)"
+      STATUS+=("$S SKIPPED(masks not ready)"); continue
+    fi
+    echo "  $MCHK"
+  fi
 
   # ---- static 30k, both endpoints ------------------------------------
   if has_stage static; then
@@ -371,16 +428,22 @@ for S in $SCENES; do
     fi
   done
 
+  declare -A DEC1=() DEC2=()       # per-direction decisions, for the dry-run narration
   # ---- Phase 1 + coherence, both directions ---------------------------
   if has_stage phase1; then
     for DIR in forward backward; do
       [ "$DIR" = forward ] && END=initial || END=final
       P1="$BIDI/$DIR"
-      if [ "$FORCE" != "1" ] && [ -f "$P1/predicted_support.json" ]; then
-        echo "  [phase1/$DIR] present, reusing"
-      else
+      SIG1="$SIGDIR/${S}_phase1_${DIR}.json"
+      stage_sig phase1 "$DIR" "$OUT/static_bidi/$END" "" "$SIG1"
+      decide "$P1" "$SIG1" "phase1/$DIR"
+      DEC1[$DIR]=$DECISION
+      if [ "$DECISION" = refuse ]; then
+        STATUS+=("$S REFUSED(phase1/$DIR, see message)")
+      elif [ "$DECISION" = run ]; then
         echo "  [phase1/$DIR] from static_bidi/$END  $(date +%T)"
         [ "$DRY" = "1" ] || { rm -rf "$P1"; mkdir -p "$P1"; }   # never touch disk in a dry run
+        manifest "$P1" "$SIG1" running
         run "$LOGS/${S}_phase1_${DIR}.log" \
           "$PY" tools/run_motion_coherence_support.py \
             --scene "$S" --direction "$DIR" \
@@ -393,7 +456,10 @@ for S in $SCENES; do
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! phase1/$DIR failed rc=$RC"
           tail -5 "$LOGS/${S}_phase1_${DIR}.log"
+          manifest "$P1" "$SIG1" failed
           STATUS+=("$S FAILED(phase1/$DIR)")
+        elif ! manifest "$P1" "$SIG1" complete; then
+          STATUS+=("$S FAILED(phase1/$DIR outputs invalid)")
         fi
       fi
     done
@@ -405,15 +471,25 @@ for S in $SCENES; do
       [ "$DIR" = forward ] && END=initial || END=final
       P1="$BIDI/$DIR"
       P2="$BIDI/${DIR}_rigid"
-      if [ ! -f "$P1/predicted_support.json" ]; then
-        echo "  [phase2/$DIR] no support from phase1 -- skipping"
-        STATUS+=("$S SKIPPED(phase2/$DIR, no support)"); continue
+      SIG1="$SIGDIR/${S}_phase1_${DIR}.json"
+      [ -f "$SIG1" ] || stage_sig phase1 "$DIR" "$OUT/static_bidi/$END" "" "$SIG1"
+      if ! "$PY" tools/stage_signature.py check --dir "$P1" --signature "$SIG1" > /dev/null; then
+        if [ "$DRY" = "1" ] && [ "${DEC1[$DIR]:-}" = run ]; then
+          echo "  [phase2/$DIR] (dry run) would follow the phase1/$DIR run above"
+        else
+          echo "  [phase2/$DIR] no COMPLETE phase1/$DIR with the requested signature -- skipping"
+          STATUS+=("$S SKIPPED(phase2/$DIR, no matching phase1)"); continue
+        fi
       fi
-      if [ "$FORCE" != "1" ] && [ -f "$P2/phase2_rigid/poses.npy" ]; then
-        echo "  [phase2/$DIR] present, reusing"; continue
-      fi
+      SIG2="$SIGDIR/${S}_phase2_${DIR}.json"
+      stage_sig phase2 "$DIR" "$OUT/static_bidi/$END" "$P1" "$SIG2"
+      decide "$P2" "$SIG2" "phase2/$DIR"
+      DEC2[$DIR]=$DECISION
+      [ "$DECISION" = reuse ] && continue
+      if [ "$DECISION" = refuse ]; then STATUS+=("$S REFUSED(phase2/$DIR, see message)"); continue; fi
       echo "  [phase2/$DIR]  $(date +%T)"
       [ "$DRY" = "1" ] || { rm -rf "$P2"; mkdir -p "$P2"; }   # never touch disk in a dry run
+      manifest "$P2" "$SIG2" running
       run "$LOGS/${S}_phase2_${DIR}.log" \
         "$PY" tools/run_rigid_se3_pipeline.py \
           --scene "$S" --direction "$DIR" \
@@ -427,7 +503,10 @@ for S in $SCENES; do
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
         echo "    !! phase2/$DIR failed rc=$RC"
         tail -5 "$LOGS/${S}_phase2_${DIR}.log"
+        manifest "$P2" "$SIG2" failed
         STATUS+=("$S FAILED(phase2/$DIR)")
+      elif ! manifest "$P2" "$SIG2" complete; then
+        STATUS+=("$S FAILED(phase2/$DIR outputs invalid)")
       fi
     done
   fi
@@ -440,15 +519,25 @@ for S in $SCENES; do
       [ "$DIR" = forward ] && END=initial || END=final
       P2="$BIDI/${DIR}_rigid"
       P3="$BIDI/${DIR}_joint"
-      if [ ! -f "$P2/support_coherence/support.json" ] || [ ! -d "$P2/joint_reduction" ]; then
-        echo "  [phase3/$DIR] no Phase-2 joint identification -- skipping"
-        STATUS+=("$S SKIPPED(phase3/$DIR, no phase2)"); continue
+      P1="$BIDI/$DIR"
+      SIG2="$SIGDIR/${S}_phase2_${DIR}.json"
+      [ -f "$SIG2" ] || stage_sig phase2 "$DIR" "$OUT/static_bidi/$END" "$P1" "$SIG2"
+      if ! "$PY" tools/stage_signature.py check --dir "$P2" --signature "$SIG2" > /dev/null; then
+        if [ "$DRY" = "1" ] && [ "${DEC2[$DIR]:-}" = run ]; then
+          echo "  [phase3/$DIR] (dry run) would follow the phase2/$DIR run above"
+        else
+          echo "  [phase3/$DIR] no COMPLETE phase2/$DIR with the requested signature -- skipping"
+          STATUS+=("$S SKIPPED(phase3/$DIR, no matching phase2)"); continue
+        fi
       fi
-      if [ "$FORCE" != "1" ] && [ -f "$P3/summary.json" ]; then
-        echo "  [phase3/$DIR] present, reusing"; continue
-      fi
+      SIG3="$SIGDIR/${S}_phase3_${DIR}.json"
+      stage_sig phase3 "$DIR" "$OUT/static_bidi/$END" "$P2" "$SIG3"
+      decide "$P3" "$SIG3" "phase3/$DIR"
+      [ "$DECISION" = reuse ] && continue
+      if [ "$DECISION" = refuse ]; then STATUS+=("$S REFUSED(phase3/$DIR, see message)"); continue; fi
       echo "  [phase3/$DIR]  $(date +%T)"
       [ "$DRY" = "1" ] || { rm -rf "$P3"; mkdir -p "$P3"; }   # never touch disk in a dry run
+      manifest "$P3" "$SIG3" running
       run "$LOGS/${S}_phase3_${DIR}.log" \
         "$PY" tools/run_joint_phase3.py \
           --scene "$S" --direction "$DIR" \
@@ -460,7 +549,10 @@ for S in $SCENES; do
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
         echo "    !! phase3/$DIR failed rc=$RC"
         tail -5 "$LOGS/${S}_phase3_${DIR}.log"
+        manifest "$P3" "$SIG3" failed
         STATUS+=("$S FAILED(phase3/$DIR)")
+      elif ! manifest "$P3" "$SIG3" complete; then
+        STATUS+=("$S FAILED(phase3/$DIR outputs invalid)")
       fi
     done
   fi

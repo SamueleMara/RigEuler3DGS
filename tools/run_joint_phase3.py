@@ -208,6 +208,8 @@ def main(argv=None) -> int:
     out.mkdir(parents=True, exist_ok=True)
     p2 = Path(args.phase2_dir)
     model, source = Path(args.model), Path(args.source)
+    from estimator.masked_observation import preflight as _obs_preflight
+    _obs_preflight(args, source)            # masks ready? before any model load / GPU work
 
     # ---- the frozen Phase-2 support, and that it is this direction's -----
     sup = json.loads((p2 / "support_coherence" / "support.json").read_text())
@@ -254,8 +256,10 @@ def main(argv=None) -> int:
     # masked observation mode: same composite target / background / foreground depth
     # and model-error estimate as Phase 2 (estimator/masked_observation.py)
     from estimator.masked_observation import from_args as _masked_from_args
-    from estimator.phase2_shared import PreparedFrames, effective_precision_masked
+    from estimator.phase2_shared import PreparedFrames, effective_precision_masked, measurement_terms
     mseq = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+    from estimator.masked_observation import observation_manifest
+    _json(out / "observation_mode.json", observation_manifest(args, mseq, cfg))
     bg = None if mseq is None else mseq.model.background_tensor(dev)
     prepared = None if mseq is None else PreparedFrames(mseq, obs_all)
     if mseq is None:
@@ -266,6 +270,9 @@ def main(argv=None) -> int:
                    for o in (ob.to(dev) for ob in prepared[0])]
     lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth, background=bg)
     model_error = estimate_model_error(lin0, ref_obs, reference_index=0, beta=1.0, blur=1)
+    from estimator.model_error import model_error_audit
+    _json(out / "model_error_audit.json", model_error_audit(
+        lin0, model_error, cfg.rgb_sigma, masks=None if mseq is None else mseq.masks[0]))
     del lin0
     cam_ids = list(range(ncam))
     obs_pairs = [[(o[0], o[1]) if o is not None else None for o in ob] for ob in obs_all]
@@ -294,9 +301,12 @@ def main(argv=None) -> int:
             return render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=bg)
 
         def prec(l, _ctr=ctr):
-            if mseq is not None:
-                return effective_precision_masked(l, prepared[_ctr["t"]], cam_ids, cfg, model_error)
-            return effective_precision(l, obs_all[_ctr["t"]], cam_ids, cfg, model_error)
+            # CameraTerms (phase2_shared.measurement_terms): same policy as Phase 2;
+            # the opt-in hard negative-ray mode keeps its legacy precision tuples
+            if getattr(args, "object_mask_constraint", "off") != "off":
+                return effective_precision(l, obs_all[_ctr["t"]], cam_ids, cfg, model_error)
+            return measurement_terms(l, prepared[_ctr["t"]] if mseq is not None else obs_all[_ctr["t"]],
+                                     cam_ids, cfg, model_error, None if mseq is None else mseq.model)
 
         print(f"\n  Phase 3 {name}: {args.iters} iterations per frame")
         t0 = time.time()
@@ -318,6 +328,11 @@ def main(argv=None) -> int:
                      for k, r in enumerate(fit["records"]) if r.observability.get("visibility")]
             _json(out / name / "visibility_constraint.json", {"policy": vis_seq.policy.to_dict(), "mask_root": getattr(vis_seq, "mask_root", None), "frames": vrows})
         recs = fit["records"]
+        _json(out / name / "map_objective.json", {"frames": [
+            {"processing_index": k, "frame": r.frame, "energy_before": r.energy_before,
+             "energy_after": r.energy_after, "accepted": r.accepted, "iterations_run": r.iterations,
+             "objective": r.observability.get("objective"), "iterations": r.observability.get("iterations")}
+            for k, r in enumerate(recs)]})
         p = state.parts[0]
         q = (p.s if name == "prismatic" else p.theta).tolist()
         qd = (p.sdot if name == "prismatic" else p.thetadot).tolist()
@@ -347,6 +362,16 @@ def main(argv=None) -> int:
             "posterior_sd_q_last": float(recs[-1].posterior[0, 0]) ** 0.5,
             "seconds": round(time.time() - t0, 1), **init["notes"].get(name, {})}
         _json(d / "geometry.json", summary_h[name])
+        # GT-free mask diagnostics of the fitted displacement (evaluation only)
+        from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
+        _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, mseq)
+        mdiag = MaskDiagnostics(f"phase3/{name}", _mfn, _mroot, cameras, cfg, truth, build_linearization,
+                                reason=_mwhy)
+        if mdiag.available:
+            for t in range(T):
+                mu_t, R_t = state.gaussians(t, mu0, R0)
+                mdiag.frame(t, orig_frames[t], mu_t, R_t, obs_all[t])
+        _json(d / "mask_diagnostics.json", mdiag.report())
         print(f"    {name}: energy {summary_h[name]['energy_total_before']:.4e} -> {e_tot:.4e}, "
               f"range {summary_h[name]['coordinate_range']:.4f}, "
               f"{summary_h[name]['frames_with_accepted_steps']}/{T} frames moved")
@@ -372,6 +397,8 @@ def main(argv=None) -> int:
         "gt_used_in_inference": False,
         "runtime_s": round(time.time() - t_start, 1)}
     _json(out / "summary.json", summary)
+    from estimator.mask_diagnostics import resources
+    _json(out / "stage_resources.json", {"stage": "phase3", **resources(time.time() - t_start)})
     print(f"\n  wrote {out / 'summary.json'}  ({summary['runtime_s'] / 60:.1f} min)")
     if args.evaluate_gt:
         r = evaluate_gt(out, source, orig_frames, fits)

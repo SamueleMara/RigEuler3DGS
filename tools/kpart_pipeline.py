@@ -1697,6 +1697,29 @@ def _export_gaussian_frames(dbg, writer, args, verbose=True):
 
 
 @torch.no_grad()
+def covariance_report(P: torch.Tensor) -> dict:
+    """Health of a [N,12,12] block posterior: PSD, spectrum, variances.
+
+    The Phase-1 posterior is a per-Gaussian block (marginal) approximation --
+    `approximate_posterior_information` -- so cross-Gaussian correlations are
+    not represented; this reports what IS represented. Computed on the CPU:
+    the batched CUDA eigensolver asks for a ~15 GiB workspace at N ~ 27k."""
+    Pd = P.detach().to("cpu", torch.float64)
+    finite = torch.isfinite(Pd).all(dim=(1, 2))
+    Pf = Pd[finite]
+    out = {"blocks": int(P.shape[0]), "nonfinite_blocks": int((~finite).sum())}
+    if Pf.numel():
+        ev = torch.linalg.eigvalsh(0.5 * (Pf + Pf.transpose(1, 2)))
+        mn, mx = ev[:, 0], ev[:, -1]
+        cond = mx / mn.clamp_min(1e-300)
+        dg = torch.diagonal(Pf, dim1=1, dim2=2)
+        out.update({"min_eigenvalue": float(mn.min()), "psd": bool((mn >= -1e-10 * mx.abs()).all()),
+                    "condition_median": float(cond.median()), "condition_max": float(cond.max()),
+                    "mean_position_var": float(dg[:, :3].mean()), "mean_rotation_var": float(dg[:, 3:6].mean()),
+                    "mean_velocity_var": float(dg[:, 6:9].mean()), "mean_angular_velocity_var": float(dg[:, 9:].mean())})
+    return out
+
+
 def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                         verbose=True, observer=None):
     """Section 25 Phase 1: multiview motion evidence for EVERY frame.
@@ -1731,6 +1754,22 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
     positions, per_frame = [], []
     state = truth
     t0 = time.perf_counter()
+    # Recursive covariance (P0-3). P0 is the documented initial block prior,
+    # built ONCE at the canonical frame; every later frame starts from the
+    # previous frame's returned posterior. iekf_frame_step predicts it itself
+    # (process_predict, F, Q, covariance_predict), so nothing is predicted here.
+    # --phase1-covariance-reset restores the old per-frame re-initialisation as
+    # an explicit, non-default diagnostic.
+    P0 = torch.zeros((n, 12, 12), device=dev, dtype=truth.mu.dtype)
+    P0[:, range(12), range(12)] = torch.tensor(
+        [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
+        dtype=truth.mu.dtype)
+    reset_cov = bool(getattr(args, "phase1_covariance_reset", False))
+    P_post = None
+    # GT-free mask diagnostics (estimator/mask_diagnostics.py): the tracked
+    # centres AND orientations are re-rendered; evaluation only.
+    mdiag = getattr(args, "mask_diagnostics", None)
+    rotations = []
     # Driven by hand rather than wrapped, so the bar can carry the number
     # that says whether Phase 1 is actually finding motion.
     from utils.progress import ibar
@@ -1739,24 +1778,28 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         _fb.to(ti)
         if ti == 0:
             positions.append(truth.mu.clone())
+            rotations.append(truth.R.detach().float().cpu())
             per_frame.append({"frame": fid, "mean_displacement": 0.0,
                               "note": "frame 0 defines the canonical state"})
+            if mdiag is not None:
+                mdiag.frame(ti, fid, truth.mu, truth.R, obs)
             if observer is not None:
                 observer(ti, truth)
             continue
         if obs and obs[0][0].device.type != dev.type:
             obs = [(a.to(dev), b.to(dev), c.to(dev)) for a, b, c in obs]
-        P = torch.zeros((n, 12, 12), device=dev, dtype=truth.mu.dtype)
-        P[:, range(12), range(12)] = torch.tensor(
-            [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
-            dtype=truth.mu.dtype)
+        if P_post is None or reset_cov:
+            P, prior_source = P0.clone(), ("P0 (canonical initialisation)" if P_post is None
+                                           else "P0 (explicit --phase1-covariance-reset)")
+        else:
+            P, prior_source = P_post, "previous frame posterior"
         seed = state if ti > 1 else truth
         prior = []
         def capture_information(prior_block, image_block):
             prior.append(prior_block.detach().cpu())
         vis_seq = getattr(args, "visibility_constraint", None)
         mseq = getattr(args, "masked_observation", None)
-        new_state, _, diag = iekf_frame_step(seed, P,
+        new_state, P_new, diag = iekf_frame_step(seed, P,
                                              obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev),
                                              cameras,
                                              dt=args.dt, cfg=bcfg,
@@ -1789,13 +1832,22 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                                               "new_violations": (it.get("audit") or {}).get("new_violations")}
                                            for it in ev.get("iterations", [])]})
         state = new_state
+        cov_report = covariance_report(P_new)
+        cov_report["prior_source"] = prior_source
+        stop = next((r for r in diag.rows if r.get("event") == "stop"), None)
+        P_post = P_new
         if observer is not None:
             observer(ti, state, prior[0])
         positions.append(state.mu.clone())
+        rotations.append(state.R.detach().float().cpu())
+        if mdiag is not None:
+            mdiag.frame(ti, fid, state.mu, state.R, obs)
         d = state.mu - truth.mu
         per_frame.append({"frame": fid,
                           "mean_displacement": float(d.norm(dim=1).mean()),
-                          "max_displacement": float(d.norm(dim=1).max())})
+                          "max_displacement": float(d.norm(dim=1).max()),
+                          "covariance": cov_report,
+                          "stop_reason": stop.get("reason") if stop else None})
         # `fid` is a per-frame provenance dict, not an index -- the bar gets
         # the loop counter.
         _fb.note(f"mean |dx| {per_frame[-1]['mean_displacement']:.5f}")
@@ -1808,5 +1860,6 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                      "model, no P/R hypothesis, no GT"),
             "frames": len(frames), "runtime_s": time.perf_counter() - t0,
             "per_frame": per_frame,
-            "warm_started": True}
+            "warm_started": True,
+            "rotations": rotations}
     return positions, info

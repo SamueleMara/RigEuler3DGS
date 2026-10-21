@@ -174,6 +174,23 @@ class RigidState:
     def retract_in_place(self, delta, frame):
         self.parts[0] = self.parts[0].retract(delta, frame)
 
+    def prior_error(self, frame: int, prior_state) -> Tensor:
+        """e = x boxminus x_minus in THIS state's error coordinates (the inverse of
+        `retract`): the left pose error tau = Log(T T_minus^-1), so that
+        Exp(tau) T_minus = T, and the world-frame twist difference xi - xi_minus.
+        Exact (no first-order chart bookkeeping), so the prior energy is a
+        function of the physical state alone."""
+        p, m = self.parts[0], prior_state.parts[0]
+        R, t = p.R[frame], p.p[frame]
+        Rm, tm = m.R[frame], m.p[frame]
+        dR = R @ Rm.T
+        tau = se3_log(dR.reshape(1, 3, 3), (t - dR @ tm).reshape(1, 3))[0]
+        xi = torch.cat([p.v[frame] - m.v[frame], p.omega[frame] - m.omega[frame]])
+        out = torch.zeros(RIGID_ERROR_DIM, dtype=torch.float64)
+        out[TAU] = tau
+        out[XI] = xi
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Section 16: initialization from the Phase-1 coherent trajectories

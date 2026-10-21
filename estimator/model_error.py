@@ -159,3 +159,47 @@ def motion_excess_map(linearization, obs, model_error: ModelErrorMap,
             ((e_d - m_d).clamp_min(0.0)[d_valid].sum()
              / e_d[d_valid].sum().clamp_min(EPS))) if bool(d_valid.any()) else None,
     }
+
+
+@torch.no_grad()
+def model_error_audit(linearization, model_error: ModelErrorMap, rgb_sigma: float, masks=None,
+                      leak_alpha: float = 0.05) -> dict:
+    """P1-2: does the canonical model-error map down-weight correctable evidence?
+
+    The map is v_rgb = beta (Y - C0)^2 at the canonical frame, so W = 1/(sigma^2 + v_rgb)
+    and (expected-quad) kappa = trace(W)/12. On a background pixel (M = 0) where the
+    canonical model leaks opacity (A0 > leak_alpha) the residual is exactly that
+    leakage, and the map LOWERS both W and kappa there -- the evidence the alpha term
+    exists to remove. This reports, per camera and region, the ratio of W to the pure
+    sensor weight 1/sigma^2 so the confound is measured, not assumed. Diagnostic only:
+    it changes nothing.
+    """
+    s2 = float(rgb_sigma) ** 2
+    rows = []
+    for c, v in enumerate(linearization.views):
+        var = model_error.rgb_var[c].to(v.rgb.device)
+        ratio = (s2 / (s2 + var)).mean(0)                      # W / W_sensor, channel mean
+        A0 = v.alpha
+        reg = {}
+        if masks is not None:
+            M = masks[c].to(A0.device).bool()
+            sel = {"foreground": M, "background": ~M, "background_leaking": (~M) & (A0 > leak_alpha)}
+        else:
+            sel = {"all": torch.ones_like(A0, dtype=torch.bool), "leaking": A0 > leak_alpha}
+        for name, m in sel.items():
+            n = int(m.sum())
+            reg[name] = {"pixels": n,
+                         "W_over_sensor_mean": float(ratio[m].mean()) if n else None,
+                         "W_over_sensor_min": float(ratio[m].min()) if n else None,
+                         "alpha0_mean": float(A0[m].mean()) if n else None}
+        rows.append({"camera": c, **reg})
+    out = {"rgb_sigma": float(rgb_sigma), "leak_alpha_threshold_for_reporting": leak_alpha,
+           "per_camera": rows,
+           "note": ("W_over_sensor < 1 on background_leaking pixels means the canonical model-error "
+                    "map down-weights the opacity-leakage evidence (and kappa with it). The policy "
+                    "is NOT changed: separating irreducible appearance error from correctable "
+                    "opacity error needs observations the canonical frame alone does not provide.")}
+    bl = [r.get("background_leaking", {}).get("W_over_sensor_mean") for r in rows]
+    bl = [x for x in bl if x is not None]
+    out["background_leaking_W_over_sensor_mean"] = (sum(bl) / len(bl)) if bl else None
+    return out

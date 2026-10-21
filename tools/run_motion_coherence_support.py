@@ -78,6 +78,7 @@ def _write_phase1_direction_debug(out, frame_ids, ctx, scene, num_positions,
 
 
 def main() -> int:
+    t_start = time.time()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -126,6 +127,9 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    ap.add_argument("--phase1-covariance-reset", action="store_true",
+                    help="DIAGNOSTIC: re-initialise the Phase-1 covariance every frame instead of "
+                         "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
@@ -165,6 +169,8 @@ def main() -> int:
                 source = source or str(rec["source"])
                 break
     out = Path(args.out or f"output/motion_coherence_{args.scene}")
+    from estimator.masked_observation import preflight as _obs_preflight
+    _obs_preflight(args, source)            # masks ready? before any model load / GPU work
     (out / "numerical").mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     print(f"=== MOTION COHERENCE: {args.scene} ===")
@@ -253,6 +259,8 @@ def main() -> int:
             window_length=0, all_cameras=False, dt=1.0 / 30.0,
             max_gaussians=args.max_gaussians, no_model_error=False,
             model_error_beta=1.0, model_error_blur=1)
+
+        ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
         frames_raw, frame_ids = dataset_rgbd_frames(
             cams_all[:ncam], cfg, ns, truth, Path(source),
             direction=args.direction)
@@ -273,6 +281,14 @@ def main() -> int:
         ns.visibility_constraint = _vis_from_args(args, source, frames_raw, frame_ids)
         from estimator.masked_observation import from_args as _masked_from_args
         ns.masked_observation = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+        from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
+        from estimator.renderer_bridge import build_linearization as _build_lin
+        _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, ns.masked_observation)
+        ns.mask_diagnostics = MaskDiagnostics("phase1", _mfn, _mroot, cameras, cfg, truth, _build_lin,
+                                              reason=_mwhy)
+        from estimator.masked_observation import observation_manifest
+        (out / "observation_mode.json").write_text(json.dumps(
+            observation_manifest(args, ns.masked_observation, cfg), indent=1, default=str))
         window = [(ob, fid) for (ob, _s, _d), fid
                   in zip(frames_raw, frame_ids["frames"])]
         print(f"  Phase 1 over {len(window)} frames ...")
@@ -319,6 +335,17 @@ def main() -> int:
             original = order[processing_index]
             np.save(cdir / f"centers_frame_{original:04d}.npy",
                     torch.as_tensor(p).double().cpu().numpy())
+            # the tracked orientations, so debug renders and leakage diagnostics
+            # never pair tracked centres with canonical rotations
+            np.save(cdir / f"rotations_frame_{original:04d}.npy",
+                    _info["rotations"][processing_index].numpy().astype(np.float32))
+        from estimator.mask_diagnostics import resources as _resources
+        (out / "mask_diagnostics.json").write_text(json.dumps(
+            ns.mask_diagnostics.report(), indent=1, default=str))
+        (out / "phase1_frames.json").write_text(json.dumps(
+            {k: v for k, v in _info.items() if k != "rotations"}, indent=1, default=str))
+        (out / "stage_resources.json").write_text(json.dumps(
+            {"stage": "phase1 (IEKF window)", **_resources(time.time() - t_start)}, indent=1))
 
         # Section 4. Renaming the files did NOT reorder the trajectory that
         # coherence consumes. Three objects, never interchangeable:

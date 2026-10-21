@@ -206,9 +206,16 @@ def inflate_weak_covariance(posterior: torch.Tensor, report: ObservabilityReport
     """Section 5.2: 'inflate posterior uncertainty rather than inventing motion'.
 
     Along a weak eigenvector the measurement said nothing, so the posterior
-    variance in that direction must not be smaller than the prior's. Rebuilding
-    the block as U diag(sigma^2) U^T with the weak entries raised to the prior
-    floor does exactly that, and leaves the strong directions untouched.
+    variance in that direction must not be smaller than the prior's. The block
+    is raised by the PSD update U diag(max(floor - var, 0)) U^T on the weak
+    entries only, so every correlation of the posterior is kept.
+
+    (Before 2026-10-21 the block was REBUILT as U diag(raised) U^T, which drops
+    the off-diagonal of U^T P U -- every pose-pose correlation not aligned with
+    the Fisher eigenbasis -- while the caller keeps the pose-velocity cross
+    terms; the 12x12 block then went indefinite and project_psd distorted it.
+    With the recursive Phase-1 covariance that distortion is carried to the next
+    frame: a zero-information frame returned F P F^T + Q off by 32%.)
     """
     U = report.eigenvectors
     P = posterior.double()
@@ -223,7 +230,7 @@ def inflate_weak_covariance(posterior: torch.Tensor, report: ObservabilityReport
     weak = report.weak_mask
     raised = torch.where(weak & (var < floor), floor, var)
     n_raised = int((weak & (var < floor)).sum())
-    out = torch.einsum("bik,bk,bjk->bij", U, raised, U)
+    out = P + torch.einsum("bik,bk,bjk->bij", U, raised - var, U)
     out = 0.5 * (out + out.transpose(1, 2))
     return out.to(posterior.dtype), {
         "weak_directions_inflated": n_raised,

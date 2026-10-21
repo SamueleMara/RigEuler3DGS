@@ -112,6 +112,9 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    ap.add_argument("--phase1-covariance-reset", action="store_true",
+                    help="DIAGNOSTIC: re-initialise the Phase-1 covariance every frame instead of "
+                         "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
     ap.add_argument("--seed", type=int, default=0)
@@ -131,6 +134,8 @@ def main() -> int:
             "pipeline implements the section 44 production path only.")
 
     model, source = args.model, args.source
+    from estimator.masked_observation import preflight as _obs_preflight
+    _obs_preflight(args, source)            # masks ready? before any model load / GPU work
     if model is None or source is None:
         from tools.run_all_datasets import discover
         for rec in discover(REPO):
@@ -184,6 +189,7 @@ def main() -> int:
         window_length=0, all_cameras=False, dt=1.0 / 30.0,
         max_gaussians=args.max_gaussians, no_model_error=False,
         model_error_beta=1.0, model_error_blur=1)
+    ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
     frames_raw, frame_ids = dataset_rgbd_frames(
         cams_all[:ncam], cfg, ns, truth, Path(source),
         direction=args.direction)
@@ -214,6 +220,8 @@ def main() -> int:
     from estimator.phase2_shared import (PreparedFrames, effective_precision_masked,
                                          weighted_energy_masked)
     mseq = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+    from estimator.masked_observation import observation_manifest
+    _json(out / "phase2_rigid" / "observation_mode.json", observation_manifest(args, mseq, cfg))
     bg = None if mseq is None else mseq.model.background_tensor(dev)
     prepared = None if mseq is None else PreparedFrames(mseq, obs_all)
     if mseq is None:
@@ -226,19 +234,29 @@ def main() -> int:
     lin0 = build_linearization(truth, cameras, eps_depth=cfg.eps_depth, background=bg)
     model_error = estimate_model_error(lin0, ref_obs, reference_index=0,
                                        beta=1.0, blur=1)
+    from estimator.model_error import model_error_audit
+    _json(out / "phase2_rigid" / "model_error_audit.json", model_error_audit(
+        lin0, model_error, cfg.rgb_sigma, masks=None if mseq is None else mseq.masks[0]))
     del lin0
 
+    from estimator.phase2_shared import measurement_terms
+    legacy_hard_constraint = getattr(args, "object_mask_constraint", "off") != "off"
+
     def prec_at(lin, t):
-        if mseq is not None:
-            return effective_precision_masked(lin, prepared[t], cam_ids, cfg, model_error)
-        return effective_precision(lin, obs_all[t], cam_ids, cfg, model_error)
+        # CameraTerms: GN precision and the robust objective from ONE sigma_eff
+        # (estimator/phase2_shared.measurement_terms). The opt-in hard negative-ray
+        # mode keeps its legacy fixed-precision tuples.
+        if legacy_hard_constraint:
+            return effective_precision(lin, obs_all[t], cam_ids, cfg, model_error)
+        return measurement_terms(lin, prepared[t] if mseq is not None else obs_all[t], cam_ids, cfg,
+                                 model_error, None if mseq is None else mseq.model)
 
     def energies(mu, Rg, t):
         lin = render_state(truth, mu, Rg, cameras, cfg, build_linearization, background=bg)
-        if mseq is not None:
-            rows = weighted_energy_masked(lin, prepared[t], cam_ids, prec_at(lin, t), mseq.model)
-        else:
-            rows = weighted_energy(lin, obs_all[t], cam_ids, prec_at(lin, t))
+        terms = measurement_terms(lin, prepared[t] if mseq is not None else obs_all[t], cam_ids, cfg,
+                                  model_error, None if mseq is None else mseq.model)
+        rows = [{"camera": c, "rgb": tm.e_rgb, "depth": tm.e_d, "alpha": tm.e_a, "total": tm.energy}
+                for c, tm in zip(cam_ids, terms)]
         del lin
         return rows
 
@@ -254,6 +272,9 @@ def main() -> int:
         if len(files) < T:
             raise SystemExit(f"{d} has {len(files)} center frames, need {T}")
         positions = [torch.from_numpy(np.load(f)).double() for f in files]
+        rfiles = [f.with_name(f.name.replace("centers_", "rotations_")) for f in files]
+        p1_rot = ([torch.from_numpy(np.load(f)).double() for f in rfiles]
+                  if all(f.is_file() for f in rfiles) else None)
         # The centers are stored by ORIGINAL frame index, so sorted() gives
         # chronological order. The rigid solve walks in PROCESSING order --
         # for a backward run that is 59..0, which is what lets it warm start
@@ -263,6 +284,7 @@ def main() -> int:
         # order.
         if ctx.is_backward:
             positions = list(positions)[::-1]
+            p1_rot = None if p1_rot is None else p1_rot[::-1]
         if positions[0].shape[0] != mu0.shape[0]:
             raise SystemExit(
                 f"{d} holds {positions[0].shape[0]} Gaussians but this run "
@@ -276,12 +298,13 @@ def main() -> int:
         ns.masked_observation = mseq
         positions, p1_info = bootstrap_positions(truth, cameras, window, cfg,
                                                  None, ns, verbose=True)
+        p1_rot = [r.double() for r in p1_info["rotations"]]
     (p1dir / "centers").mkdir(parents=True, exist_ok=True)
     for t, p in pbar(list(enumerate(positions)), "phase1 centers", total=T):
         np.save(p1dir / "centers" / f"centers_frame_{t:04d}.npy",
                 torch.as_tensor(p).double().cpu().numpy())
     _json(p1dir / "phase1_info.json",
-          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v)})
+          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v) and k != "rotations"})
 
     # =====================================================================
     # 2. COHERENCE MOVING_RIGID SUPPORT (sections 1, 2)
@@ -371,6 +394,13 @@ def main() -> int:
               {"policy": vis_seq.policy.to_dict(), "mask_root": getattr(vis_seq, "mask_root", None), "frames": vrows})
     part = res["part"]
     recs = res["records"]
+    # the per-frame MAP history (P0-2): accepted / rejected trials, the RGB / alpha /
+    # depth / prior split, predicted vs actual decrease (tools/repair_report.py)
+    _json(out / "phase2_rigid" / "map_objective.json", {"frames": [
+        {"processing_index": k, "frame": r.frame, "energy_before": r.energy_before,
+         "energy_after": r.energy_after, "accepted": r.accepted, "iterations_run": r.iterations,
+         "objective": r.observability.get("objective"), "iterations": r.observability.get("iterations")}
+        for k, r in enumerate(recs)]})
 
     p2 = out / "phase2_rigid"
     p2.mkdir(parents=True, exist_ok=True)
@@ -511,7 +541,8 @@ def main() -> int:
         renders = _render_camera(args, truth, cameras, cfg, obs_all, mu0, R0,
                                  part, kabsch_R, kabsch_p, positions, members,
                                  p2 / "renders", build_linearization,
-                                 render_state)
+                                 render_state, background=bg, prepared=prepared,
+                                 phase1_rotations=p1_rot)
     a = write_rigid_phase2_3d(
         html / "rigid_phase2_debug.html", mu0.cpu(), members.cpu(), positions,
         part, kabsch_R, kabsch_p, cameras,
@@ -530,6 +561,18 @@ def main() -> int:
     if renders:
         d = write_render_html(html / "rigid_renders.html", renders,
                               title=f"{args.scene} - camera {renders['camera']}")
+
+    # GT-free mask diagnostics of the final rigid state (evaluation only)
+    from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run, resources
+    from estimator.rigid_part_se3 import state_to_gaussians as _s2g
+    _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, mseq)
+    mdiag = MaskDiagnostics("phase2", _mfn, _mroot, cameras, cfg, truth, build_linearization, reason=_mwhy)
+    if mdiag.available:
+        for t in pbar(range(T), "mask diagnostics", total=T):
+            mu_t, R_t = _s2g(part, t, mu0, R0)
+            mdiag.frame(t, frame_ids["frames"][t], mu_t, R_t, obs_all[t])
+    _json(p2 / "mask_diagnostics.json", mdiag.report())
+    _json(p2 / "stage_resources.json", {"stage": "phase2", **resources(time.perf_counter() - t_start)})
 
     summary = {
         "scene": args.scene, "model": str(model), "source": str(source),
@@ -714,7 +757,8 @@ def _write_reduction(root: Path, red: dict, T: int):
 
 def _render_camera(args, truth, cameras, cfg, obs_all, mu0, R0, part,
                    kabsch_R, kabsch_p, positions, members, outdir,
-                   build_linearization, render_state):
+                   build_linearization, render_state, background=None, prepared=None,
+                   phase1_rotations=None):
     """Section 22: GT / Phase1 / Kabsch / Phase2 on one camera, every frame."""
     import imageio.v2 as imageio
     from estimator.rigid_part_se3 import state_to_gaussians
@@ -742,7 +786,9 @@ def _render_camera(args, truth, cameras, cfg, obs_all, mu0, R0, part,
         layers = {}
         # Phase 1 free motion
         mu_p1 = torch.as_tensor(positions[t]).double().to(mu0.device)
-        layers["phase1"] = (mu_p1, R0)
+        # tracked orientations when Phase 1 saved them (older outputs: canonical)
+        layers["phase1"] = (mu_p1, R0 if phase1_rotations is None
+                            else phase1_rotations[t].to(R0.device, R0.dtype))
         # Phase-1 Kabsch rigid
         mu_k = mu0.clone()
         Rg_k = R0.clone()
@@ -753,12 +799,17 @@ def _render_camera(args, truth, cameras, cfg, obs_all, mu0, R0, part,
         # rigid Phase 2
         layers["phase2"] = state_to_gaussians(part, t, mu0, R0)
         ob = obs_all[t][c]
+        if ob is not None and prepared is not None:
+            # masked mode: the observation the filter actually fits, Y(b) on the
+            # same background the layers are rendered on (equivalent composites)
+            pr = prepared[t][c]
+            ob = (pr.target(background.cpu()), pr.depth_observed, pr.depth_valid)
         if ob is not None:
             imageio.imwrite(outdir / f"gt_rgb_{t:04d}.png", _u8(ob[0]))
             imageio.imwrite(outdir / f"gt_depth_{t:04d}.png", _depth_u8(ob[1]))
         for name, (mu, Rg) in layers.items():
             lin = render_state(truth, mu, Rg, [cameras[c]], cfg,
-                               build_linearization)
+                               build_linearization, background=background)
             v = lin.views[0]
             imageio.imwrite(outdir / f"{name}_rgb_{t:04d}.png", _u8(v.rgb))
             imageio.imwrite(outdir / f"{name}_depth_{t:04d}.png",

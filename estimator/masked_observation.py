@@ -40,6 +40,7 @@ import numpy as np
 import torch
 
 MODES = ("original", "masked-rgb-constant", "masked-rgb-expected-quad")
+DEFAULT_MODE = "masked-rgb-expected-quad"      # the motion pipeline's default (2026-10-21)
 DISTRIBUTIONS = ("uniform01",)
 UNIFORM01_MEAN = 0.5
 UNIFORM01_VAR = 1.0 / 12.0
@@ -113,7 +114,8 @@ class PreparedRGBD:
 
 def prepare(rgb: torch.Tensor, depth: torch.Tensor, depth_valid: torch.Tensor, mask: torch.Tensor,
             camera: str = "", original_frame: int = -1) -> PreparedRGBD:
-    """P = M I, V_used = V_orig AND M AND finite(depth). Binary mask, matching sizes."""
+    """P = M I, V_used = V_orig AND M AND finite(depth) AND depth > 0 (positive camera Z
+    only: zero / negative / NaN are never a measurement). Binary mask, matching sizes."""
     if rgb.dim() != 3 or rgb.shape[0] != 3:
         raise ValueError(f"{camera} frame {original_frame}: rgb must be [3,H,W], got {tuple(rgb.shape)}")
     H, W = rgb.shape[1], rgb.shape[2]
@@ -127,7 +129,8 @@ def prepare(rgb: torch.Tensor, depth: torch.Tensor, depth_valid: torch.Tensor, m
     dev = rgb.device
     M = mask.to(dev)
     Mf = M.to(rgb.dtype)
-    valid = depth_valid.to(dev).bool() & M & torch.isfinite(depth.to(dev))
+    d = depth.to(dev)
+    valid = depth_valid.to(dev).bool() & M & torch.isfinite(d) & (d > 0)
     return PreparedRGBD(rgb * Mf[None], Mf, depth.to(dev), valid, camera, int(original_frame))
 
 
@@ -237,22 +240,48 @@ def depth_precision(view, ob: PreparedRGBD, r_d: torch.Tensor, cfg):
     return p_d, valid
 
 
-def phase1_terms(views, prepared, cfg, model: MaskedObservationModel):
-    """Per camera ((p_rgb, p_d, r_rgb, r_d), (kappa, r_A)). W_rgb = I / rgb_sigma^2 (fixed)."""
+def phase1_camera_terms(views, prepared, cfg, model: MaskedObservationModel, model_error=None,
+                        cam_ids=None):
+    """Per camera `CameraTerms` (estimator/observation_terms.py) of the masked modes:
+
+        RGB    fixed quadratic on Y(b) - C(x; b) over the whole image,
+               W = 1/(sigma_rgb^2 [+ fixed model-error variance])
+        depth  robust (Student-t NLL) on V_orig AND M, with the pre-existing alpha gate
+        alpha  1/2 kappa (M - A)^2, kappa = trace(W)/12   (expected-quad only)
+    """
+    from .observation_terms import camera_terms
     if len(views) != len(prepared):
         raise AssertionError(f"{len(views)} views but {len(prepared)} prepared observations")
-    sigma = float(model.rgb_sigma if model.rgb_sigma is not None else cfg.rgb_sigma)
-    out, alpha = [], []
-    for v, ob in zip(views, prepared):
+    if model.rgb_sigma is not None and abs(float(model.rgb_sigma) - float(cfg.rgb_sigma)) > 0:
+        raise AssertionError(f"observation model sigma {model.rgb_sigma} != IEKF rgb_sigma {cfg.rgb_sigma}")
+    out = []
+    for j, (v, ob) in enumerate(zip(views, prepared)):
         if not isinstance(ob, PreparedRGBD):
             raise TypeError("the masked observation mode needs PreparedRGBD observations")
-        b = model.background_tensor(v.rgb.device)
-        r_rgb, r_d, r_a = residuals(v, ob, b)
-        p_rgb = (torch.full_like(r_rgb, 1.0 / (sigma * sigma)) if cfg.use_rgb else torch.zeros_like(r_rgb))
-        p_d, _ = depth_precision(v, ob, r_d, cfg)
-        out.append((p_rgb, p_d, r_rgb, r_d))
-        alpha.append((model.kappa(p_rgb), r_a))
-    return out, alpha
+        ob = ob.to(v.rgb.device)
+        c = j if cam_ids is None else cam_ids[j]
+        mv_rgb = None if model_error is None else model_error.rgb_var[c]
+        mv_d = None if model_error is None else model_error.depth_var[c]
+        out.append(camera_terms(v, ob.target(model.background_tensor(v.rgb.device)), ob.depth_observed,
+                                ob.depth_valid, cfg, rgb_robust=False, rgb_model_var=mv_rgb,
+                                depth_model_var=mv_d, coverage=ob.object_coverage,
+                                kappa_fn=model.kappa if model.alpha_term else None))
+    return out
+
+
+def phase1_terms(views, prepared, cfg, model: MaskedObservationModel):
+    """Per camera ((p_rgb, p_d, r_rgb, r_d), (kappa, r_A)) -- the solver's view of
+    phase1_camera_terms (kappa is zero in the constant mode)."""
+    terms = phase1_camera_terms(views, prepared, cfg, model)
+    alpha = [(t.kappa if t.kappa is not None else torch.zeros_like(t.r_d),
+              t.r_a if t.r_a is not None else torch.zeros_like(t.r_d)) for t in terms]
+    return [t.as_prec4() for t in terms], alpha
+
+
+def phase1_energy(views, prepared, cfg, model: MaskedObservationModel) -> dict:
+    """The masked objective's measurement part (RGB, robust depth NLL, alpha) and depth coverage."""
+    from .observation_terms import summarize
+    return summarize(phase1_camera_terms(views, prepared, cfg, model))
 
 
 def energy_terms(prec, alpha) -> dict:
@@ -269,9 +298,11 @@ def energy_terms(prec, alpha) -> dict:
 # CLI
 # ---------------------------------------------------------------------------
 def add_cli(ap) -> None:
-    ap.add_argument("--observation-mode", choices=MODES, default="original",
-                    help="original (default, unchanged) | masked-rgb-constant | masked-rgb-expected-quad "
-                         "(masked RGB composited on a known artificial background, depth on the object only)")
+    ap.add_argument("--observation-mode", choices=MODES, default=DEFAULT_MODE,
+                    help="masked-rgb-expected-quad (DEFAULT: masked object RGB on a Uniform[0,1]^3 "
+                         "background, exact expected quadratic cost, depth on the object only; needs "
+                         "<source>/mask) | masked-rgb-constant (ablation, needs --rgb-background-constant) "
+                         "| original (explicit control: full-frame RGB-D, no masks)")
     ap.add_argument("--rgb-background-constant", type=float, nargs=3, default=None, metavar=("R", "G", "B"),
                     help="the known background colour of masked-rgb-constant (required there, refused elsewhere)")
     ap.add_argument("--rgb-background-distribution", choices=DISTRIBUTIONS, default=None,
@@ -280,7 +311,7 @@ def add_cli(ap) -> None:
 
 
 def model_from_args(args, cfg=None) -> MaskedObservationModel | None:
-    mode = getattr(args, "observation_mode", "original")
+    mode = getattr(args, "observation_mode", DEFAULT_MODE)
     const = getattr(args, "rgb_background_constant", None)
     dist = getattr(args, "rgb_background_distribution", None)
     if mode == "original":
@@ -301,6 +332,63 @@ def model_from_args(args, cfg=None) -> MaskedObservationModel | None:
     if const is not None:
         raise SystemExit("--rgb-background-constant is for masked-rgb-constant")
     return MaskedObservationModel(mode, (UNIFORM01_MEAN,) * 3, dist or "uniform01", sigma)
+
+
+def preflight(args, source) -> None:
+    """Fail BEFORE any model load / GPU work when the requested observation mode
+    needs masks that are missing, ambiguous, mis-sized or non-binary (P0-1).
+    The explicit original mode needs no masks and is never blocked here."""
+    mode = getattr(args, "observation_mode", DEFAULT_MODE)
+    if mode == "original":
+        return
+    if getattr(args, "object_mask_constraint", "off") != "off":
+        raise SystemExit(f"--observation-mode {mode} and --object-mask-constraint "
+                         f"{args.object_mask_constraint} are different measurement models; pass "
+                         "--observation-mode original explicitly to use the hard constraint")
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+    from check_masks import check
+    src = Path(source)
+    root = Path(args.mask_source) if getattr(args, "mask_source", None) else src / "mask"
+    if not root.is_dir():
+        raise SystemExit(f"observation mode {mode}: mask root {root} does not exist. The default "
+                         "masked-rgb-expected-quad mode needs whole-object masks; pass "
+                         "--observation-mode original explicitly to run the unmasked control.")
+    cams = getattr(args, "cameras", None)
+    problems, info = check(src, root, int(cams) if isinstance(cams, int) or str(cams).isdigit() else None,
+                           int(args.frames) if getattr(args, "frames", None) else None)
+    if problems:
+        raise SystemExit(f"observation mode {mode}: masks not ready under {root} "
+                         f"({len(problems)} problem(s)), e.g. " + "; ".join(problems[:4]))
+
+
+def observation_manifest(args, seq=None, cfg=None) -> dict:
+    """What every stage writes next to its outputs: the effective observation model."""
+    mode = getattr(args, "observation_mode", DEFAULT_MODE)
+    hard = getattr(args, "object_mask_constraint", "off")
+    out = {"observation_mode": mode, "default_mode": DEFAULT_MODE,
+           "hard_negative_ray_qp": hard if hard != "off" else "off",
+           "rgb_sigma": None if cfg is None else float(cfg.rgb_sigma)}
+    if seq is None:
+        out.update({"masks": None,
+                    "rgb": "full-frame recorded RGB vs the object rendered on black (original control)",
+                    "rgb_precision": "Student-t IRLS (GN) / Student-t NLL (objective), one sigma",
+                    "depth_valid": "V_orig AND alpha > min_alpha_for_depth"})
+        return out
+    m = seq.model
+    out.update({"background_distribution": m.distribution, "render_background_bbar": list(m.background),
+                "background_covariance": (f"{m.background_variance:.10g} * I3" if m.alpha_term else None),
+                "rgb": "Y(b) = M I + (1 - M) b over the whole image, rendered on the same b",
+                "rgb_precision": "fixed quadratic W (no residual reweighting); kappa = trace(W)/12"
+                                 if m.alpha_term else "fixed quadratic W (no residual reweighting)",
+                "alpha_term": m.alpha_term,
+                "depth_valid": "V_orig AND M AND finite(D), then the pre-existing alpha > min_alpha_for_depth gate",
+                "depth_objective": "Student-t NLL on used samples (IRLS score in the GN system)",
+                "masks": {"root": seq.mask_root, "cameras": seq.cameras,
+                          "original_frames": seq.original_frames, **seq.counts()},
+                "note": ("the artificial background is a designed contrast cost; the information it "
+                         "adds is conditional on that objective, not a calibrated sensor covariance")})
+    return out
 
 
 def from_args(args, source, frames_raw, frame_ids, cfg=None) -> MaskedSequence | None:

@@ -232,7 +232,32 @@ def _object_valid(prec, visibility):
     return out
 
 
+def _frame_terms(views, rgbd_gt, cfg: IEKFConfig, visibility=None, observation_model=None):
+    """Per-camera `CameraTerms` (estimator/observation_terms.py): the precisions
+    the solver uses AND the objective acceptance is judged on, from the same
+    residual, sigma and validity. Original mode: Student-t on RGB (when
+    cfg.robust_measurement) and depth; masked modes: estimator/masked_observation.py.
+    With a negative-ray constraint (visibility) RGB-D is restricted to M = 1."""
+    if observation_model is not None:
+        from .masked_observation import phase1_camera_terms
+        return phase1_camera_terms(views, rgbd_gt, cfg, observation_model)
+    from .observation_terms import camera_terms
+    out = []
+    for k, (view, (rgb_gt, depth_gt, depth_valid)) in enumerate(zip(views, rgbd_gt, strict=True)):
+        M = None if visibility is None else visibility.masks[k].to(view.rgb.device).bool()
+        out.append(camera_terms(view, rgb_gt, depth_gt,
+                                depth_valid if M is None else (depth_valid.bool() & M), cfg,
+                                rgb_robust=cfg.robust_measurement, rgb_valid=M))
+    return out
+
+
 def _precisions(views, rgbd_gt, cfg: IEKFConfig):
+    """Per-camera (RGB precision, depth precision, RGB residual, depth residual):
+    the solver's view of `_frame_terms` (original mode)."""
+    return [t.as_prec4() for t in _frame_terms(views, rgbd_gt, cfg)]
+
+
+def _precisions_legacy(views, rgbd_gt, cfg: IEKFConfig):
     """Per-camera (RGB precision, depth precision, RGB residual, depth residual).
 
     Sections 6 and 13.1. RGB and depth are built separately because they are
@@ -309,6 +334,25 @@ def group_precond(M_blocks: torch.Tensor, grouped, G, GT) -> Callable:
     return block_jacobi_preconditioner(G_blocks)
 
 
+def convergence_decision(energy_before: float, energy_after: float, step_norm: float,
+                         cfg: IEKFConfig) -> tuple[bool, dict]:
+    """Section 14's two-part stopping rule after an ACCEPTED step.
+
+        rel_decrease = (E_before - E_after) / max(|E_before|, 1)
+        stop  <=>  rel_decrease < rel_energy_tol  AND  step_norm < step_norm_tol
+
+    E_before is the objective at the iterate the step started from and E_after
+    the accepted trial's objective, both evaluated before the state is replaced.
+    The scale max(|E|, 1) is the one the gain ratio's significance floor already
+    uses. step_norm is the trust region's scaled norm (units of the prior sigmas
+    of ScalingMetric) on the trust-region path, the Euclidean norm on the LM path.
+    """
+    rel = (float(energy_before) - float(energy_after)) / max(abs(float(energy_before)), 1.0)
+    stop = rel < float(cfg.rel_energy_tol) and float(step_norm) < float(cfg.step_norm_tol)
+    return stop, {"rel_decrease": rel, "step_norm": float(step_norm),
+                  "rel_energy_tol": float(cfg.rel_energy_tol), "step_norm_tol": float(cfg.step_norm_tol)}
+
+
 def measurement_operators(lin: FrameLinearization, prec, alpha_terms=None):
     """The frame's measurement part of the Gauss-Newton system, in the pose tangent:
 
@@ -358,26 +402,23 @@ def evaluate_true_map_energy(
     lin = build_linearization(state, cameras, background=background,
                               eps_depth=cfg.eps_depth,
                               antialiasing=cfg.antialiasing, debug=cfg.debug)
-    if observation_model is not None:
-        # masked RGB on the known background + 1/2 kappa (A - M)^2 + foreground-valid
-        # depth, all on THIS trial render (estimator/masked_observation.py)
-        from .masked_observation import energy_terms, phase1_terms
-        terms = energy_terms(*phase1_terms(lin.views, rgbd_gt, cfg, observation_model))
-        meas = terms["rgb"] + terms["depth"] + terms["alpha"]
-        delta = boxminus(state, x_prior)
-        prior = 0.5 * float((delta * apply_prior(Lambda_prior, delta)).sum())
-        return meas + prior, {"measurement": meas, "prior": prior, "rgb_energy": terms["rgb"],
-                              "depth_energy": terms["depth"], "alpha_energy": terms["alpha"]}, lin
-    prec = _object_valid(_precisions(lin.views, rgbd_gt, cfg), visibility)
+    # ONE set of per-camera terms per linearization: the trial's objective here,
+    # and -- when the trial is accepted -- the next iteration's GN system, read
+    # from the same cache (`lin.frame_terms`)
+    from .observation_terms import summarize
+    terms = _frame_terms(lin.views, rgbd_gt, cfg, visibility, observation_model)
+    lin.frame_terms = terms
     if visibility is not None:
         lin.visibility_values = visibility.evaluate(lin)
-    meas = 0.0
-    for p_rgb, p_d, r_rgb, r_d in prec:
-        meas += float(measurement_energy(r_rgb, p_rgb))
-        meas += float(measurement_energy(r_d, p_d))
+    sm = summarize(terms)
+    meas = sm["rgb"] + sm["depth"] + sm["alpha"]
     delta = boxminus(state, x_prior)
     prior = 0.5 * float((delta * apply_prior(Lambda_prior, delta)).sum())
-    return meas + prior, {"measurement": meas, "prior": prior}, lin
+    return meas + prior, {"measurement": meas, "prior": prior, "rgb_energy": sm["rgb"],
+                          "depth_energy": sm["depth"], "alpha_energy": sm["alpha"],
+                          "depth_observed_valid": sm["depth_observed_valid"],
+                          "depth_used": sm["depth_used"],
+                          "depth_gated_by_alpha": sm["depth_gated_by_alpha"]}, lin
 
 
 def iekf_frame_step(
@@ -478,11 +519,16 @@ def iekf_frame_step(
     P_prior = P_prior.to(P_prev_post.dtype)
 
     def _terms(L):
-        """(prec, alpha_terms) at a linearization; alpha_terms is None unless masked."""
-        if observation_model is None:
-            return _object_valid(_precisions(L.views, rgbd_gt, cfg), visibility), None
-        from .masked_observation import phase1_terms
-        return phase1_terms(L.views, rgbd_gt, cfg, observation_model)
+        """(prec, alpha_terms) at a linearization -- read from the same CameraTerms the
+        objective was evaluated with; alpha_terms is None unless expected-quad."""
+        terms = getattr(L, "frame_terms", None)
+        if terms is None:
+            terms = _frame_terms(L.views, rgbd_gt, cfg, visibility, observation_model)
+            L.frame_terms = terms
+        prec = [t.as_prec4() for t in terms]
+        if observation_model is not None and observation_model.alpha_term:
+            return prec, [(t.kappa, t.r_a) for t in terms]
+        return prec, None
 
     # --- 2. The prior is now FIXED for every inner iteration ---------------
     x = x_prior
@@ -870,18 +916,32 @@ def iekf_frame_step(
                   f"{'accept' if accepted else 'reject'}")
 
         # --- 10. Convergence (section 14: BOTH criteria) -------------------
+        # energy_before: objective at the start of this iteration; energy: the
+        # accepted trial's objective (assigned above). The old test compared the
+        # trial with itself after the assignment and was always zero.
         if accepted:
-            rel = abs(trial_energy - energy) / max(abs(energy), 1e-30)
-            if rel < cfg.rel_energy_tol and float(step.norm()) < cfg.step_norm_tol:
+            stop, cinfo = convergence_decision(
+                energy_before, energy,
+                sres.step_norm_scaled if cfg.use_trust_region else float(step.norm()), cfg)
+            if stop:
+                stop_reason = "converged"
+                diag.add(iteration=j, event="stop", reason=stop_reason, **cinfo)
                 break
         elif cfg.use_trust_region:
             # Section 4.4: a radius driven to its floor means no step of any
             # length helps -- that is the converged/stalled signal here, the
             # way lm >= lm_max is for the LM path.
             if radius <= tr_cfg.radius_min * 1.0000001:
+                stop_reason = "trust_radius_floor"
+                diag.add(iteration=j, event="stop", reason=stop_reason, radius=radius)
                 break
         elif lm >= cfg.lm_max:
+            stop_reason = "lm_max"
+            diag.add(iteration=j, event="stop", reason=stop_reason, lm=lm)
             break
+    else:
+        stop_reason = "iteration_budget"
+        diag.add(iteration=int(cfg.max_iters) - 1, event="stop", reason=stop_reason)
 
     _bar.close()
     if visibility is not None:

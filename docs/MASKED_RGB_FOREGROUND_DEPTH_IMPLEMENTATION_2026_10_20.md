@@ -1,5 +1,10 @@
 # Masked RGB and foreground-valid depth in the IEKFs: implementation (2026-10-20)
 
+> **Update 2026-10-21.** `masked-rgb-expected-quad` is now the DEFAULT of every motion entry point
+> (`original` must be passed explicitly), and Phase 2/3 MAP acceptance, the Phase 1 covariance
+> recursion, the Phase 1 convergence test, depth validity and stage reuse were repaired. See
+> [MASKED_IEKF_DEFAULT_REPAIR_REPORT_2026_10_21.md](MASKED_IEKF_DEFAULT_REPAIR_REPORT_2026_10_21.md).
+
 Specification: `CODEX_IMPLEMENT_EXACT_MASKED_RGB_VALID_DEPTH_IEKF_2026-10-20.md`.
 Audit: `docs/MASKED_RGB_FOREGROUND_DEPTH_AUDIT_2026_10_20.md`.
 Parent commit: `d2343f7`.
@@ -79,7 +84,7 @@ conditional on this objective, not a calibrated sensor posterior.
 | `tools/kpart_pipeline.py` | Phase 1 bootstrap prepares each frame and calls the masked IEKF; per-frame energy terms are reported |
 | `tools/run_motion_coherence_support.py`, `tools/run_rigid_se3_pipeline.py`, `tools/run_joint_phase3.py` | CLI; masked targets, background and model error; `masked_observation.json` |
 | `run_bidirectional_all.sh` | `--observation-mode`, `--rgb-background-constant`, `--rgb-background-distribution` → Phase 1/2/3 only, with the per-scene `--mask-source`. Combining with `--object-mask-constraint` exits 2. Static training gets none of these switches (checked with dry runs) |
-| `scripts/run_object_mask_ab.sh`, `tools/compare_object_masks.py` | `--with masked-rgb-expected-quad` (default) / `masked-rgb-constant` / `constraint` |
+| `scripts/run_object_mask_ab.sh`, `tools/compare_object_masks.py` | superseded 2026-10-21: fair A/B, `--mode masked-rgb-expected-quad` (default) / `masked-rgb-constant` vs an explicit `original` arm, both fresh Phase 1/2/3 |
 | `tools/benchmark_masked_rgb_observation.py` | NEW: benchmark L |
 | `tests/test_masked_rgb_observation.py` | NEW: 46 checks |
 
