@@ -136,7 +136,7 @@ The scene names used in the original dataset are: `USB_100109 stapler_103111 bla
 | **Phase 1 CLI** `run_motion_coherence_support.py` | `--source "$SRC"`, `--model "$OUT/static_bidi/initial"` (F) or `--model "$OUT/static_bidi/final"` (B) | `--out "$BIDI/forward"` or `.../backward` | No scene folder added to `--out` |
 | **Phase 2 CLI** `run_rigid_se3_pipeline.py` | `--source "$SRC"`, `--model ...`, plus saved support/centers | `--out "$BIDI/forward_rigid"` or `.../backward_rigid` | No scene folder added |
 | **Phase 3 CLI** `run_joint_phase3.py` | `--source "$SRC"`, `--model ...`, `--phase2-dir ...` | `--out "$BIDI/forward_joint"` or `.../backward_joint` | No scene folder added |
-| **Optional endpoint diagnostic** `run_fb_endpoint_correspondence_all.sh` | `--dataset-root "$DATA"` or one scene folder | `--results-root "$RES"` | Uses each scene's result tree; diagnostic tag determines subdirectory |
+| **A/B of two roots** `scripts/run_object_mask_ab.sh` | `--dataset-root "$DATA"`, `--base-root "$RES/ours"` | `--nomask-root`, `--masks-root` (defaults under `$RES`) | `/<scene>` per scene; table in `<masks-root>_ab/` |
 
 The driver accepts `--input`/`--output` (or `-i`/`-o`), plus `--scenes`, `--stages`, `--frames`,
 `--cameras`, `--dry-run` and `--help`. The environment variables `SRC_ROOT`, `OUT_ROOT`, `SCENES`,
@@ -295,9 +295,6 @@ bash scripts/run_object_mask_ab.sh            # --dry-run to preview, --compare-
 cd submodules/diff-gaussian-rasterization && python setup_vis.py build_ext --inplace --build-temp build_vis
 ```
 
-**Withdrawn.** The earlier `--object-masks` prototype (`estimator/silhouette.py`) is no longer used
-by any stage. It rendered black-on-white silhouette views and applied a distance-weighted pull
-toward the mask, a measurement model without justification.
 
 ### 2.6 Masked-RGB observation (`--observation-mode`, opt-in)
 
@@ -642,35 +639,47 @@ at frame T, and the runner refuses it.
 
 ## 6. Evaluation (GT is never read during inference)
 
+Every stage writes its prediction to disk first and only then scores it against GT. GT comes
+from the dataset's `pointcloud/` and `metadata/` files and the `gt_part`/`gt_dynamic` labels that
+static training attaches to every Gaussian. Without GT the stages still run and only the scores
+are missing (section 2.4).
+
+| Stage | Prediction (GT-free) | GT score |
+|---|---|---|
+| Phase 1 + support | `<dir>/predicted_support.json` | `<dir>/evaluation/confusion_matrix.json`, `gt_coherence.json`, `optimized_3dgs_gt.json` (`estimator/motion_coherence_eval.py`, `estimator/optimized_gt.py`) |
+| Phase 2 + joint | `<dir>_rigid/phase2_rigid/`, `<dir>_rigid/joint_reduction/` | `<dir>_rigid/joint_reduction/gt_evaluation.json` |
+| Phase 3 | `<dir>_joint/<type>/trajectory.csv`, `summary.json` | `<dir>_joint/evaluation_gt/phase3_gt_evaluation.json` (`--evaluate-gt`) |
+
+A/B of two results roots (e.g. original vs masked observation), GT used for scoring only:
+
 ```bash
-# Uses the SAME input and output roots configured in Section 2.1.
-# Optional endpoint correspondence diagnosis + post-run GT evaluation (all scenes):
-bash scripts/run_fb_endpoint_correspondence_all.sh \
-    --dataset-root "$DATA" --results-root "$RES" \
-    --tag endpoint_eval_v4 --estimated-joints auto \
-    --evaluate-gt --execute --gpu-memory-fraction 0.2
+$PY tools/compare_object_masks.py --baseline "$RES_A" --masks "$RES_B" --out "$RES_B"_ab
 ```
-
-This auxiliary script uses `--dataset-root` and `--results-root`.
-
-* `--dataset-root` may also be **one scene folder**, for example `--dataset-root "$DATA/fridge_10905"`;
-  only that scene is diagnosed.
-* Its outputs appear under `$RES/<scene>/endpoint_correspondence/<tag>/` and in the batch summary
-  directory, not under `$BIDI`.
-
-Phase 2 writes its own `joint_reduction/gt_evaluation.json` after fitting. The GT scores per run
-(support precision and recall, axis and line error, coordinate and pose error) are in
-`<scene>/endpoint_correspondence/<tag>/evaluation_gt/`.
 
 ## 7. Tests
 
+The complete stage-by-stage code map with file:line references is in
+[docs/PIPELINE_CODE_MAP.md](docs/PIPELINE_CODE_MAP.md).
+
+All on the real CUDA renderer where relevant; each prints `N checks passed`.
+
 ```bash
-$PY tests/test_rigid_se3_phase2.py              # Phase 2: Jacobians, adjoint, transport, CUDA renderer
-$PY tests/test_iekf_process_covariance.py       # Phase 1: left-SO(3) process Jacobians, Q
-$PY tests/test_motion_coherence_support.py      # support
-$PY tests/test_phase2_parallel_pr.py            # P/R joint models (Phase 3 kinematics, FD)
-$PY tests/test_joint_phase3_runner.py           # Phase 3: init, refusals, fixed joint (H = q-column, geometry bitwise)
-$PY tests/test_fb_covariance_transport.py       # endpoint transport and ownership
+# static training
+$PY tests/test_carving_depth_object_only.py tests/test_object_mask_transparency_carving.py
+# renderer operators (RGB-D JVP/VJP/Fisher, background term, visible / accumulated alpha)
+$PY tests/test_unified_cuda_renderer_jvp_vjp.py; $PY tests/test_iekf_cuda_operators.py
+$PY tests/test_background_compositing_audit.py; $PY tests/test_visible_alpha_operators.py
+# Phase 1 IEKF (state, process, PCG, trust region, grouped solve, end to end)
+$PY tests/test_iekf_manifold_state.py; $PY tests/test_iekf_process_covariance.py
+$PY tests/test_iekf_pcg_measurement.py; $PY tests/test_v2_trust_region_and_lines.py
+$PY tests/test_v2_grouped_solve.py; $PY tests/test_iekf_end_to_end.py
+# masked observation / hard constraint
+$PY tests/test_masked_rgb_observation.py; $PY tests/test_constrained_qp.py
+$PY tests/test_visibility_constrained_iekf_phase1.py; $PY tests/test_visibility_constrained_iekf_phase23.py
+# support (coherence) and frame order
+$PY tests/test_motion_coherence_support.py; $PY tests/test_bidirectional_sequence_direction.py
+# Phase 2 (rigid SE(3), joint) and Phase 3 (fixed joint, displacement)
+$PY tests/test_rigid_se3_phase2.py; $PY tests/test_phase2_parallel_pr.py; $PY tests/test_joint_phase3_runner.py
 ```
 
 ## 8. Known limitations

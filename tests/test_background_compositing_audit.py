@@ -81,8 +81,8 @@ def main(argv=None) -> int:
         print("NOT_RUN: CUDA unavailable")
         return 0
     from diff_gaussian_rasterization import iekf_apply_H, iekf_apply_HT, iekf_build_fisher, iekf_fisher_to_dense
-    from tests.test_fb_pixel_overlap_core import cams_pair
-    cam = cams_pair()[0]
+    from tests.test_unified_cuda_renderer_jvp_vjp import make_cameras
+    cam = make_cameras(n_cam=16, H=48, W=64, radius=2.0)[0]      # the same camera the overlap suite used
     st = scene()
     P = st.mu.shape[0]
     g = torch.Generator(device="cuda").manual_seed(3)
