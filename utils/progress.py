@@ -12,6 +12,11 @@ plain iterator and costs nothing.
 
 Set `RIGEULER_PROGRESS=0` to disable, or `=stderr` to send bars to stderr
 instead (useful when the caller is already teeing stderr somewhere).
+
+Heartbeat: when `RIGEULER_HEARTBEAT=<path>` is set (run_bidirectional_all.sh
+does it per stage), every progress event -- a bar step, a note, a stage line,
+an item of a wrapped loop -- touches that file, with or without a terminal.
+The driver's watchdog reads its age to tell a slow stage from a hung one.
 """
 
 from __future__ import annotations
@@ -21,6 +26,31 @@ import sys
 
 _TTY = None
 _TTY_TRIED = False
+_HB_LAST = 0.0
+
+
+def beat() -> None:
+    """Touch $RIGEULER_HEARTBEAT (at most every 2 s). Never raises."""
+    global _HB_LAST
+    path = os.environ.get("RIGEULER_HEARTBEAT")
+    if not path:
+        return
+    import time
+    now = time.time()
+    if now - _HB_LAST < 2.0:
+        return
+    _HB_LAST = now
+    try:
+        with open(path, "a"):
+            os.utime(path, None)
+    except Exception:          # noqa: BLE001
+        pass
+
+
+def _beating(seq):
+    for item in seq:
+        beat()
+        yield item
 
 
 def _tty():
@@ -55,19 +85,21 @@ def pbar(iterable, desc: str, total: int | None = None, min_items: int = 4,
     n = total if total is not None else len(seq)
     stream = progress_stream()
     if stream is None or n is None or n < min_items:
-        return seq
+        return _beating(seq) if os.environ.get("RIGEULER_HEARTBEAT") else seq
     try:
         from tqdm import tqdm
     except Exception:          # noqa: BLE001
         return seq
-    return tqdm(seq, desc=desc, total=n, leave=leave, dynamic_ncols=True,
-                file=stream, mininterval=0.4, ascii=False,
-                bar_format="  {desc:<28} {percentage:3.0f}%|{bar}| "
-                           "{n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+    bar = tqdm(seq, desc=desc, total=n, leave=leave, dynamic_ncols=True,
+               file=stream, mininterval=0.4, ascii=False,
+               bar_format="  {desc:<28} {percentage:3.0f}%|{bar}| "
+                          "{n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+    return _beating(bar) if os.environ.get("RIGEULER_HEARTBEAT") else bar
 
 
 def stage(desc: str):
     """A one-line note on the terminal for a stage with no natural loop."""
+    beat()
     stream = progress_stream()
     if stream is None:
         return
@@ -96,9 +128,9 @@ class _NullBar:
 
     __slots__ = ()
 
-    def to(self, n): pass
-    def update(self, n=1): pass
-    def note(self, text): pass
+    def to(self, n): beat()
+    def update(self, n=1): beat()
+    def note(self, text): beat()
     def close(self): pass
 
     def __enter__(self):
@@ -116,6 +148,7 @@ class _Bar:
 
     def to(self, n):
         """Absolute position. Survives `continue` and `break`."""
+        beat()
         try:
             self._t.n = int(n)
             self._t.refresh()
@@ -123,6 +156,7 @@ class _Bar:
             pass
 
     def update(self, n=1):
+        beat()
         try:
             self._t.update(n)
         except Exception:      # noqa: BLE001
@@ -135,6 +169,7 @@ class _Bar:
         caller passing a repr instead of a number wraps every redraw across
         several lines and destroys the display for every other bar.
         """
+        beat()
         try:
             t = str(text)
             self._t.set_postfix_str(

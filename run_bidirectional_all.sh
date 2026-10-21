@@ -266,11 +266,45 @@ static_ready() {
   head -c 400 "$ply" 2>/dev/null | grep -qi "^ply" || return 1
   return 0
 }
+# Watchdog. Python stages touch $RIGEULER_HEARTBEAT on every progress event
+# (utils/progress.py). A stage whose heartbeat is older than STALL_MIN minutes
+# is hung (seen on long runs: the process waits forever on its own GPU work
+# while the GPU is idle), so it is killed and retried ONCE; a second hang is a
+# failure and the batch moves on. Armed only after the first beat, so stages
+# that never report progress (static training) are never touched.
+# STALL_MIN=0 turns it off.
+STALL_MIN=${STALL_MIN:-20}
+CHILD=""
+trap '[ -n "$CHILD" ] && kill "$CHILD" 2>/dev/null; exit 130' INT TERM
 run() {
   local log="$1"; shift
   if [ "$DRY" = "1" ]; then printf '  + %s\n' "$*"; return 0; fi
   mkdir -p "$(dirname "$log")"
-  "$@" > "$log" 2>&1
+  local hb="$log.heartbeat" attempt rc stalled age
+  for attempt in 1 2; do
+    rm -f "$hb"; stalled=0
+    RIGEULER_HEARTBEAT="$hb" "$@" > "$log" 2>&1 &
+    CHILD=$!
+    while kill -0 "$CHILD" 2>/dev/null; do
+      sleep "${STALL_POLL:-20}"
+      if [ "$STALL_MIN" -gt 0 ] && [ -f "$hb" ] && [ "$stalled" = 0 ]; then
+        age=$(( $(date +%s) - $(stat -c %Y "$hb" 2>/dev/null || date +%s) ))
+        if [ "$age" -gt "${STALL_SEC:-$(( STALL_MIN * 60 ))}" ]; then
+          echo "    !! no progress for ${age} s (limit ${STALL_SEC:-$(( STALL_MIN * 60 ))} s, attempt $attempt): killing pid $CHILD  $(date +%T)"
+          kill "$CHILD" 2>/dev/null; sleep 10; kill -9 "$CHILD" 2>/dev/null; stalled=1
+        fi
+      fi
+    done
+    wait "$CHILD"; rc=$?
+    CHILD=""
+    rm -f "$hb"
+    if [ "$stalled" = 1 ]; then
+      cp "$log" "$log.hung$attempt" 2>/dev/null
+      if [ "$attempt" = 1 ]; then echo "    retrying the stage once  $(date +%T)"; continue; fi
+      return 124
+    fi
+    return $rc
+  done
 }
 
 STATUS=()
