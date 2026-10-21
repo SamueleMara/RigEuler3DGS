@@ -182,8 +182,13 @@ for(const [grp,ids] of Object.entries(by)){{
 
 
 def write_support_3d(path, res, node_xyz, traj=None, gt_node=None,
-                     title="Motion coherence support", max_edges=6000) -> Path:
-    """Sections 30-33: the partition in 3D, with graph edges and a slider."""
+                     title="Motion coherence support", max_edges=6000,
+                     frame_ids=None) -> Path:
+    """Sections 30-33: the partition in 3D, with graph edges and a slider.
+
+    traj: [T, num_nodes, 3] node (supernode-centroid) positions in ORIGINAL
+    chronological order, row i = node i of `res`; frame_ids labels the slider
+    with the original frame numbers (default 0..T-1)."""
     X = torch.as_tensor(node_xyz).double().cpu()
     lab = res["labels"]
     # Section 22: when the v2 extractor ran, the page shows its THREE classes
@@ -199,8 +204,12 @@ def write_support_3d(path, res, node_xyz, traj=None, gt_node=None,
     frames = []
     if traj is not None:
         Tn = torch.as_tensor(traj).double().cpu()
+        if Tn.dim() != 3 or Tn.shape[1] != X.shape[0]:
+            raise ValueError(f"traj {tuple(Tn.shape)} does not match {X.shape[0]} nodes")
         frames = [Tn[t].numpy().round(5).reshape(-1).tolist()
                   for t in range(Tn.shape[0])]
+    fids = (list(range(len(frames))) if frame_ids is None
+            else [int(f) for f in frame_ids])
     payload = {
         "xyz": X.numpy().round(5).reshape(-1).tolist(),
         "labels": lab.tolist(),
@@ -214,10 +223,27 @@ def write_support_3d(path, res, node_xyz, traj=None, gt_node=None,
         "C_out": [None if v != v else round(float(v), 6)
                   for v in res["ambiguity"]["C_out"].tolist()],
         "frames": frames,
+        "frame_ids": fids,
         "gt": (gt_node.tolist() if gt_node is not None else []),
         "components": [{k: v for k, v in c.items() if k != "per_frame"}
                        for c in res.get("components", [])],
     }
+    return write_support_page(path, payload, title)
+
+
+def read_support_payload(path) -> dict:
+    """The data embedded in an existing motion_coherence_support_3d.html."""
+    s = Path(path).read_text()
+    i = s.index("const D=") + len("const D=")
+    j = s.index("\n", i)
+    return json.loads(s[i:j].rstrip().rstrip(";"))
+
+
+def write_support_page(path, payload: dict, title: str) -> Path:
+    """Render the support page from its payload (also used to repair old pages)."""
+    payload = dict(payload)
+    payload.setdefault("frames", [])
+    payload.setdefault("frame_ids", list(range(len(payload["frames"]))))
     html = """<!doctype html><html><head><meta charset="utf-8">
 <title>__TITLE__</title><style>
  body{margin:0;background:#0e1116;color:#e6edf3;overflow:hidden;
@@ -235,8 +261,9 @@ def write_support_3d(path, res, node_xyz, traj=None, gt_node=None,
  input[type=range]{flex:1} .note{color:#8b949e;font-size:11px}
 </style></head><body><div id="app">
 <div id="view"><canvas id="c"></canvas>
- <div id="bar"><input type="range" id="sl" min="0" max="0" value="0">
- <span id="fn">frame 0</span></div></div>
+ <div id="bar"><button id="play">play</button>
+ <input type="range" id="sl" min="0" max="0" value="0">
+ <span id="fn">canonical</span></div></div>
 <div id="side"><h1>__TITLE__</h1>
 <div id="status" class="note"></div>
 <h2>Show</h2><div id="tg"></div>
@@ -324,23 +351,33 @@ document.getElementById('comp').innerHTML=D.components.map((c,k)=>
  (+c.E_identity).toExponential(3)+'</span></div>'+
  '<div class="row"><span>&nbsp;&nbsp;gain</span><span>'+
  (+c.gain).toExponential(3)+'</span></div>').join('');
-const sl=document.getElementById('sl');
+const sl=document.getElementById('sl'),fn=document.getElementById('fn'),
+ pb=document.getElementById('play');
+// node trajectories in ORIGINAL chronological order; every drawn object moves
+// with them (all three node classes and both edge sets)
+const pairsS=D.edges.filter(([a,b])=>D.labels[a]===D.labels[b]),
+ pairsX=D.edges.filter(([a,b])=>D.labels[a]!==D.labels[b]);
+function goto(t){const f=D.frames[t];fn.textContent='frame '+D.frame_ids[t]+
+  ' ('+(t+1)+'/'+D.frames.length+')';
+ [['dynamic',idxDyn],['static',idxSta],['ambiguous',idxAmb]].forEach(([k,ids])=>{
+  const a=OB[k].geometry.attributes.position.array;
+  ids.forEach((i,n)=>{a[n*3]=f[i*3];a[n*3+1]=f[i*3+1];a[n*3+2]=f[i*3+2];});
+  OB[k].geometry.attributes.position.needsUpdate=true;});
+ const upd=(o,pairs)=>{const a=o.geometry.attributes.position.array;let n=0;
+  pairs.forEach(([x,y])=>{a[n++]=f[x*3];a[n++]=f[x*3+1];a[n++]=f[x*3+2];
+   a[n++]=f[y*3];a[n++]=f[y*3+1];a[n++]=f[y*3+2];});
+  o.geometry.attributes.position.needsUpdate=true;};
+ upd(OB.edges_same,pairsS);upd(OB.edges_cross,pairsX);}
 if(D.frames.length){sl.max=D.frames.length-1;
- sl.addEventListener('input',e=>{const t=+e.target.value;
-  document.getElementById('fn').textContent='frame '+t;
-  const f=D.frames[t];
-  [['dynamic',idxDyn],['static',idxSta]].forEach(([k,ids])=>{
-   const a=OB[k].geometry.attributes.position.array;
-   ids.forEach((i,n)=>{a[n*3]=f[i*3];a[n*3+1]=f[i*3+1];a[n*3+2]=f[i*3+2];});
-   OB[k].geometry.attributes.position.needsUpdate=true;});
-  const upd=(o,pairs)=>{const a=o.geometry.attributes.position.array;let n=0;
-   pairs.forEach(([x,y])=>{a[n++]=f[x*3];a[n++]=f[x*3+1];a[n++]=f[x*3+2];
-    a[n++]=f[y*3];a[n++]=f[y*3+1];a[n++]=f[y*3+2];});
-   o.geometry.attributes.position.needsUpdate=true;};
-  upd(OB.edges_same,D.edges.filter(([a,b])=>D.labels[a]===D.labels[b]));
-  upd(OB.edges_cross,D.edges.filter(([a,b])=>D.labels[a]!==D.labels[b]));
- });}
-else {sl.disabled=true;}
+ sl.addEventListener('input',e=>goto(+e.target.value));
+ let timer=null;
+ pb.addEventListener('click',()=>{if(timer){clearInterval(timer);timer=null;
+   pb.textContent='play';return;}
+  pb.textContent='pause';timer=setInterval(()=>{sl.value=(+sl.value+1)%D.frames.length;
+   goto(+sl.value);},120);});
+ goto(0);}
+else {sl.disabled=true;pb.disabled=true;
+ fn.textContent='no per-frame trajectories in this page';}
 (function loop(){requestAnimationFrame(loop);RE.render(S,CAM);})();
 </script></body></html>"""
     html = html.replace("__TITLE__", title).replace(

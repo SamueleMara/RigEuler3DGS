@@ -636,11 +636,16 @@ def main() -> int:
 
     if res.get("node_class"):
         res["node_class_counts"] = res["extraction"]["counts"]
+    # the slider needs the node trajectories: supernode centroids of the
+    # Phase-1 positions, which are in ORIGINAL chronological order here
+    from estimator.motion_coherence_support import supernode_trajectories
+    node_traj = supernode_trajectories(positions, sid)["trajectories"][:, res["node_ids"], :]
     write_support_3d(dbg / "motion_coherence_support_3d.html", res,
                      node_xyz=torch.stack([
                          mu0.cpu()[sid == int(res["node_ids"][i])].mean(0)
                          for i in range(res["num_supernodes"])]),
-                     traj=None, gt_node=gt_node,
+                     traj=node_traj, gt_node=gt_node,
+                     frame_ids=list(range(node_traj.shape[0])),
                      title=f"{args.scene} — motion coherence support")
 
     print(f"\n  === {args.scene} DONE in {time.perf_counter() - t0:.1f}s ===")
