@@ -565,3 +565,17 @@ echo "=============================================================="
 echo " SUMMARY   $(( ($(date +%s) - T_ALL) / 60 )) min"
 echo "=============================================================="
 for line in "${STATUS[@]}"; do echo "  $line"; done
+
+# Exit status: 0 only when every requested scene/stage completed or was reused.
+# Any FAILED(...), REFUSED(...) or SKIPPED(...) record -- execution error, signature
+# conflict, missing input / masks / upstream stage -- makes the run fail, whatever
+# later scenes did (a later success never resets an earlier failure).
+NBAD=0
+for line in "${STATUS[@]}"; do
+  case "$line" in *" FAILED("*|*" REFUSED("*|*" SKIPPED("*) NBAD=$((NBAD + 1));; esac
+done
+if [ "$NBAD" -gt 0 ]; then
+  echo "  $NBAD requested stage(s) did not complete -- exit status 1"
+  exit 1
+fi
+exit 0

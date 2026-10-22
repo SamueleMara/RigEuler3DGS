@@ -333,3 +333,52 @@ def verify_endpoint_provenance(direction, model_dir, *, total_frames=None,
             "Running this combination produces a well-formed result that "
             "answers neither direction's question.")
     return evidence
+
+
+# ---------------------------------------------------------------------------
+# Elapsed time along the PROCESSING order (Phase 2 / Phase 3 window solvers)
+# ---------------------------------------------------------------------------
+def validate_times(times) -> "torch.Tensor":
+    """float64 [T] elapsed seconds: finite, starting at 0, strictly increasing."""
+    import torch
+    t = torch.as_tensor(times, dtype=torch.float64).reshape(-1)
+    if t.numel() == 0:
+        raise ValueError("empty time vector")
+    if not bool(torch.isfinite(t).all()):
+        raise ValueError(f"non-finite times {t.tolist()}")
+    if float(t[0]) != 0.0:
+        raise ValueError(f"time must start at 0 at the canonical frame, got {float(t[0])}")
+    if t.numel() > 1 and not bool((t[1:] - t[:-1] > 0).all()):
+        raise ValueError(f"times must strictly increase along the processing order, got {t.tolist()}")
+    return t
+
+
+def times_from_intervals(intervals) -> "torch.Tensor":
+    """time[0] = 0, time[k] = sum_{j=1..k} intervals[j]: intervals[k] is the elapsed
+    time between processing steps k-1 and k (intervals[0] is unused). Every used
+    interval must be finite and > 0 -- also for a backward pass, whose original
+    frame index decreases while elapsed integration time still increases."""
+    import torch
+    d = torch.as_tensor(intervals, dtype=torch.float64).reshape(-1)
+    used = d[1:]
+    if not bool(torch.isfinite(used).all()) or not bool((used > 0).all()):
+        raise ValueError(f"frame intervals must be finite and > 0, got {used.tolist()}")
+    return validate_times(torch.cat([torch.zeros(1, dtype=torch.float64), torch.cumsum(used, 0)]))
+
+
+def processing_time_s(frames, frame_ids) -> "torch.Tensor":
+    """The elapsed time [s] of every processing step, from the dataset loader's own
+    interval (frames[k][2]) cross-checked against its provenance record
+    (frame_ids['frames'][k]['dt_used_s']). Contradictory metadata fails loudly."""
+    recs = frame_ids.get("frames", []) if isinstance(frame_ids, dict) else []
+    if len(recs) != len(frames):
+        raise ValueError(f"{len(frames)} frames but {len(recs)} provenance records")
+    dts = []
+    for k, (f, r) in enumerate(zip(frames, recs)):
+        a = float(f[2])
+        b = r.get("dt_used_s") if isinstance(r, dict) else None
+        if b is not None and abs(a - float(b)) > 1e-12 * max(abs(a), 1.0):
+            raise ValueError(f"processing step {k}: loader interval {a} s but provenance "
+                             f"dt_used_s {b} s -- contradictory frame-time metadata")
+        dts.append(a)
+    return times_from_intervals(dts)

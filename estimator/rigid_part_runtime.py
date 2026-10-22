@@ -36,6 +36,8 @@ class RigidIEKFConfig:
     """Section 9. `sigma_vdot` and `sigma_wdot` are separate because a linear
     and an angular acceleration do not share units; one scalar for both would
     make the process prior depend on whether the scene is measured in metres.
+    Units: white-acceleration densities, m/s^(3/2) and rad/s^(3/2), with dt in
+    seconds from the caller's `times`; velocities are m/s and rad/s.
     """
     max_iters: int = 8
     max_cg_iters: int = 40

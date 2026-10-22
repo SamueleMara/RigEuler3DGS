@@ -6,7 +6,7 @@ what the stages themselves wrote, and collects per stage:
 
   signature     stage_manifest.json: status, signature hash, observation mode,
                 code commit / diff hash, static PLY + cfg_args sha256, source
-                listing hashes, mask content hash, config, upstream hash
+                content hashes, mask content hash, config, upstream hash
   steps         accepted / rejected iterations, stop reasons
   objective     MAP split (RGB, alpha, depth, prior, total) initial -> final
   covariance    Phase 1: per-frame posterior health and the prior source

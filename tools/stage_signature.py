@@ -11,7 +11,11 @@ still pass the stage's structural validation. The signature covers:
     endpoint    static model dir, sha256 of its point_cloud.ply and cfg_args
     observation mode, background, hard-constraint options, mask root and a
                 content hash of every mask file of the used cameras
-    source      dataset dir, frame/camera counts, rgb/depth file listing hash
+    source      dataset dir, frame/camera counts, and a streaming sha256 over the
+                relative path AND BYTES of every rgb / depth file of the used
+                cameras and frames (schema 2; schema 1 hashed only name + size,
+                so a same-size replacement was reused -- such manifests never
+                match a schema-2 signature and are refused)
     config      the driver's IEKF / coherence / Phase-2/3 settings
     upstream    the signature hash of the Phase-1 (for Phase 2) or Phase-2 (for
                 Phase 3) manifest this stage consumes
@@ -54,8 +58,10 @@ def _sha_file(p: Path, chunk: int = 1 << 20) -> str | None:
     return h.hexdigest()
 
 
-def _listing_hash(root: Path, cams, pattern_ext) -> str | None:
-    """sha256 over (relative path, size) of every file of the given cameras."""
+def _content_digest(root: Path, cams, pattern_ext, frames: int | None = None) -> str | None:
+    """Streaming sha256 over (relative path, byte length, BYTES) of the first
+    `frames` files (sorted) of every given camera -- the files the stage reads.
+    Never loads a whole file: 1 MiB chunks."""
     if not root.is_dir():
         return None
     h = hashlib.sha256()
@@ -64,9 +70,14 @@ def _listing_hash(root: Path, cams, pattern_ext) -> str | None:
         if not d.is_dir():
             h.update(f"missing:{c}".encode())
             continue
-        for f in sorted(d.iterdir()):
-            if f.suffix.lower() in pattern_ext:
-                h.update(f"{c}/{f.name}:{f.stat().st_size}".encode())
+        files = sorted(f for f in d.iterdir() if f.suffix.lower() in pattern_ext)
+        if frames:
+            files = files[:int(frames)]
+        for f in files:
+            h.update(f"{c}/{f.name}:{f.stat().st_size}:".encode())
+            with open(f, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
     return h.hexdigest()
 
 
@@ -112,7 +123,7 @@ def compute(a) -> dict:
         else:
             up = "MISSING_UPSTREAM_MANIFEST"
     sig = {
-        "schema": 1,
+        "schema": 2,
         "code": _code_version(),
         "stage": a.stage, "direction": a.direction, "scene": a.scene,
         "endpoint": {"model_dir": str(model), "ply_sha256": _sha_file(ply),
@@ -124,8 +135,9 @@ def compute(a) -> dict:
                         "mask_root": str(mask_root) if needs_masks else None,
                         "mask_content_sha256": _content_hash(mask_root, cams) if needs_masks else None},
         "source": {"dir": str(src), "frames": int(a.frames), "cameras": cams,
-                   "rgb_listing_sha256": _listing_hash(src / "rgb", cams, EXT),
-                   "depth_listing_sha256": _listing_hash(src / "depth_npy", cams, (".npy",))},
+                   "rgb_content_sha256": _content_digest(src / "rgb", cams, EXT, int(a.frames)),
+                   "depth_content_sha256": _content_digest(src / "depth_npy", cams, (".npy",),
+                                                           int(a.frames))},
         "config": dict(kv.split("=", 1) for kv in (a.config or [])),
         "upstream_signature_sha256": up,
     }

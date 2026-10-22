@@ -89,8 +89,11 @@ def main() -> int:
     ap.add_argument("--rigid-iters", type=int, default=8,
                     help="nonlinear IEKF iterations per frame in Phase 2")
     ap.add_argument("--rigid-cg-iters", type=int, default=40)
-    ap.add_argument("--sigma-vdot", type=float, default=1.0)
-    ap.add_argument("--sigma-wdot", type=float, default=1.0)
+    ap.add_argument("--sigma-vdot", type=float, default=1.0,
+                    help="white linear-acceleration noise density, m/s^(3/2) "
+                         "(Q_tt = s^2 dt^3/3, Q_tv = s^2 dt^2/2, Q_vv = s^2 dt; dt in s)")
+    ap.add_argument("--sigma-wdot", type=float, default=1.0,
+                    help="white angular-acceleration noise density, rad/s^(3/2) (same Q form)")
     ap.add_argument("--phase2-motion-model", choices=MOTION_MODELS,
                     default="rigid-se3",
                     help="section 43: 'rigid-se3' is production. The legacy "
@@ -204,6 +207,13 @@ def main() -> int:
     obs_all = [[(o[0], o[1], o[2] if len(o) > 2 else None) if o is not None
                 else None for o in ob] for (ob, _s, _d) in frames_raw]
     T = len(obs_all)
+    # elapsed seconds along the PROCESSING order, from the loader's own frame
+    # interval (1/30 s by default): every temporal call below gets it, so twists
+    # and velocities are per second, never per frame
+    from utils.sequence_direction import processing_time_s
+    time_s = processing_time_s(frames_raw, frame_ids)
+    if time_s.numel() != T:
+        raise SystemExit(f"{time_s.numel()} time stamps for {T} frames")
     # Canonical geometry comes from the loaded MODEL, which for a backward
     # run is the final endpoint. It is never taken from a trajectory frame.
     mu0 = truth.mu.double()
@@ -332,7 +342,7 @@ def main() -> int:
     stage(f"[3/7] {args.scene}: Phase-1 Kabsch")
     init = kabsch_initialize(members, mu0.cpu(),
                              [torch.as_tensor(p).double().cpu()
-                              for p in positions])
+                              for p in positions], times=time_s)
     kab = init["part"]
     kabsch_R, kabsch_p = kab.R.clone(), kab.p.clone()
     unexp = init["unexplained_fraction_final"]
@@ -376,6 +386,7 @@ def main() -> int:
     from estimator.visibility_constraint import from_args as _vis_from_args
     vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
     res = run_rigid_window(state, mu0, R0, obs_pairs if mseq is None else prepared, _lin, precision_fn,
+                           times=time_s,
                            cfg=rcfg, label="rigid", visibility=vis_seq,
                            observation_model=None if mseq is None else mseq.model)
     if mseq is not None:
@@ -427,8 +438,14 @@ def main() -> int:
             torch.from_numpy(_chrono(poses)).double(), float(ns.dt))
         np.save(p2 / "chronological_twists.npy",
                 chrono_xi.cpu().numpy())
+    # [v (m/s), omega (rad/s)] per processing step, elapsed time in time_base.json
     np.save(p2 / "velocities.npy",
             torch.cat([part.v, part.omega], dim=1).numpy())
+    _json(p2 / "time_base.json", {
+        "dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+        "time_s_processing_order": time_s.tolist(),
+        "rate_units": {"v": "m/s", "omega": "rad/s"},
+        "source": "dataset loader frame interval (frames_raw[k][2] == dt_used_s)"})
     np.save(p2 / "pose_covariances.npy",
             _chrono(res["pose_covariances"].numpy()))
     np.save(p2 / "state_covariances.npy", res["covariances"].numpy())
@@ -447,7 +464,7 @@ def main() -> int:
         pe = o.get("geometry_information_eigenvalues") or [float("nan")]
         ve = o.get("measurement_information_eigenvalues") or [float("nan")]
         rows.append([
-            t, float(t), *part.p[t].tolist(), *rv[t].tolist(),
+            t, float(time_s[t]), *part.p[t].tolist(), *rv[t].tolist(),
             float(rv[t].norm()), *part.v[t].tolist(), *part.omega[t].tolist(),
             sum(r["rgb"] for r in er), sum(r["depth"] for r in er),
             sum(r["total"] for r in er),
@@ -596,6 +613,8 @@ def main() -> int:
         "gt_evaluation": ev_gt,
         "renders": renders,
         "runtime_s": time.perf_counter() - t_start,
+        "time_base": {"dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+                      "rate_units": "v m/s, omega rad/s", "file": "phase2_rigid/time_base.json"},
         "no_axis_in_rgbd_optimizer": True,
         "note": ("section 49: the renderer was asked only which rigid pose "
                  "explains the moving part. The joint was inferred afterwards "

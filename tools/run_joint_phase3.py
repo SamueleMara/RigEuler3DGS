@@ -64,11 +64,18 @@ def _read_csv_column(path: Path, col: str) -> np.ndarray:
     return np.array([float(r[col]) for r in rows])
 
 
-def _finite_rate(q: np.ndarray) -> np.ndarray:
-    """Per-frame rate of an initial coordinate track (processing order)."""
+def _finite_rate(q: np.ndarray, time_s=None) -> np.ndarray:
+    """Rate of an initial coordinate track (processing order): d q / d t in q-units
+    per SECOND when `time_s` (elapsed seconds, processing order) is given -- the
+    production path; per frame index only for callers that pass no times."""
     if q.size < 2:
         return np.zeros_like(q)
-    return np.gradient(q)
+    if time_s is None:
+        return np.gradient(q)
+    t = np.asarray(time_s, float).reshape(-1)
+    if t.size != q.size:
+        raise ValueError(f"{q.size} coordinates but {t.size} time stamps")
+    return np.gradient(q, t)
 
 
 def parse_args(argv=None):
@@ -86,11 +93,12 @@ def parse_args(argv=None):
     ap.add_argument("--iters", type=int, default=5, help="IEKF iterations per frame")
     ap.add_argument("--cg-iters", type=int, default=40)
     ap.add_argument("--sigma-qddot", type=float, default=1.0,
-                    help="white-acceleration noise on the joint rate, per frame^2")
+                    help="white joint-acceleration noise density, (m or rad)/s^(3/2): "
+                         "Q_qq = s^2 dt^3/3, Q_q,qdot = s^2 dt^2/2, Q_qdot,qdot = s^2 dt, dt in s")
     ap.add_argument("--hypotheses", default="prismatic,revolute",
                     help="joint type(s) to run, each with its FIXED joint-identification geometry")
     ap.add_argument("--prior-q", type=float, default=1.0, help="prior sd of q at the anchor (m or rad)")
-    ap.add_argument("--prior-qdot", type=float, default=1.0, help="prior sd of qdot (per frame)")
+    ap.add_argument("--prior-qdot", type=float, default=1.0, help="prior sd of qdot (m/s or rad/s)")
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
@@ -103,7 +111,7 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
-def load_initialisation(p2: Path, members, mu0, T: int) -> dict:
+def load_initialisation(p2: Path, members, mu0, T: int, time_s=None) -> dict:
     """The joint identification Phase 2 wrote, as P / R parts in processing
     order. Missing or degenerate hypotheses are reported, not invented."""
     from estimator import phase2_prismatic as mp
@@ -120,7 +128,7 @@ def load_initialisation(p2: Path, members, mu0, T: int) -> dict:
             raise SystemExit(f"{tp}: {s.size} frames, the RGB-D window has {T}")
         s = s - s[0]
         parts["prismatic"] = mp.PrismaticPart(members, torch.as_tensor(e), torch.as_tensor(s),
-                                              torch.as_tensor(_finite_rate(s)))
+                                              torch.as_tensor(_finite_rate(s, time_s)))
         notes["prismatic"] = {"init": str(gp), "direction": e.tolist(),
                               "s_range_init": float(s.max() - s.min())}
     else:
@@ -140,7 +148,7 @@ def load_initialisation(p2: Path, members, mu0, T: int) -> dict:
         else:
             part = init_revolute(mu0.cpu(), members, None, axis=torch.as_tensor(axis),
                                  angles=torch.as_tensor(th), axis_point=torch.as_tensor(point))
-            part.thetadot = torch.as_tensor(_finite_rate(th)).double()
+            part.thetadot = torch.as_tensor(_finite_rate(th, time_s)).double()
             parts["revolute"] = part
             notes["revolute"] = {"init": str(gr), "axis": axis.tolist(), "axis_point": list(point),
                                  "theta_range_init": float(th.max() - th.min()),
@@ -242,6 +250,12 @@ def main(argv=None) -> int:
     obs_all = [[(o[0], o[1], o[2] if len(o) > 2 else None) if o is not None else None for o in ob]
                for (ob, _s, _d) in frames_raw]
     T = len(obs_all)
+    # elapsed seconds along the PROCESSING order from the loader's frame interval:
+    # the window prediction and the initial qdot are both per second
+    from utils.sequence_direction import processing_time_s
+    time_s = processing_time_s(frames_raw, frame_ids)
+    if time_s.numel() != T:
+        raise SystemExit(f"{time_s.numel()} time stamps for {T} frames")
     mu0, R0 = truth.mu.double(), truth.R.double()
     if int(members.max()) >= mu0.shape[0]:
         raise SystemExit(f"support indexes row {int(members.max())}, the model has {mu0.shape[0]}")
@@ -277,7 +291,7 @@ def main(argv=None) -> int:
     cam_ids = list(range(ncam))
     obs_pairs = [[(o[0], o[1]) if o is not None else None for o in ob] for ob in obs_all]
 
-    init = load_initialisation(p2, members, mu0, T)
+    init = load_initialisation(p2, members, mu0, T, time_s=time_s.numpy())
     wanted = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
     jcfg = JointIEKFConfig(max_iters=args.iters, max_cg_iters=args.cg_iters,
                            sigma_qddot=args.sigma_qddot)
@@ -313,6 +327,7 @@ def main(argv=None) -> int:
         from estimator.visibility_constraint import from_args as _vis_from_args
         vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
         fit = fit_model(state, mu0, obs_pairs if mseq is None else prepared, lin, prec, jcfg, label=name,
+                        times=time_s,
                         visibility=vis_seq, observation_model=None if mseq is None else mseq.model)
         if mseq is not None:
             _json(out / name / "masked_observation.json", {
@@ -384,8 +399,12 @@ def main(argv=None) -> int:
         "frame_order": "processing (backward = T..0); q is relative to the canonical frame",
         "original_frames_processing_order": orig_frames,
         "support": {"file": str(p2 / "support_coherence" / "support.json"), "members": int(members.numel())},
-        "config": {"iters": args.iters, "cg_iters": args.cg_iters, "sigma_qddot_per_frame2": args.sigma_qddot,
-                   "dt": "1 frame", "cameras": ncam, "frames": T,
+        "config": {"iters": args.iters, "cg_iters": args.cg_iters, "sigma_qddot": args.sigma_qddot,
+                   "sigma_qddot_units": "(m or rad)/s^(3/2), white-acceleration density",
+                   "dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+                   "time_s_processing_order": time_s.tolist(),
+                   "rate_units": "qdot in m/s (prismatic) or rad/s (revolute)",
+                   "cameras": ncam, "frames": T,
                    "prior_sd": {"q": args.prior_q, "qdot": args.prior_qdot}},
         "hypotheses": summary_h,
         "energy_difference_P_minus_R": (fitted["prismatic"]["energy_total_after"]

@@ -40,7 +40,7 @@ class JointIEKFConfig:
     max_iters: int = 8
     max_cg_iters: int = 40
     radius_init: float = 1.0
-    sigma_qddot: float = 1.0         # process noise on qdot
+    sigma_qddot: float = 1.0         # white joint-acceleration density, (m or rad)/s^(3/2); dt in s
     prior_weight: float = 1.0
     psd_floor: float = 1e-12
     verbose: bool = False
