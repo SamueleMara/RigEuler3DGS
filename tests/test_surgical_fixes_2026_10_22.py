@@ -119,6 +119,41 @@ def test_A_rates():
     check("[A] a time vector of the wrong length is refused", refused(_finite_rate, q, t.numpy()[:2]))
 
 
+def test_A_joint_reduction():
+    print("\n[A] joint reduction in physical time")
+    from joint_reduction.rigid_trajectory_reduction import reduce_trajectory
+    from estimator.manifold import so3_exp
+    t = torch.tensor([0.0, DT, 2 * DT], dtype=torch.float64)
+    v, w = 0.3, 0.6
+    R = torch.stack([so3_exp(torch.tensor([[0.0, 0.0, w * float(tk)]], dtype=torch.float64))[0] for tk in t])
+    p = torch.stack([torch.tensor([v * float(tk), 0.0, 0.0], dtype=torch.float64) for tk in t])
+    g = torch.Generator().manual_seed(1)
+    mu0 = torch.randn(30, 3, generator=g, dtype=torch.float64)
+    members = torch.arange(30)
+    P_tau = torch.stack([torch.diag(torch.tensor([1e-6] * 3 + [1e-5] * 3, dtype=torch.float64))] * 3)
+    phys = reduce_trajectory(R, p, mu0, members, P_tau=P_tau, times=t, refine=False)
+    frame = reduce_trajectory(R, p, mu0, members, P_tau=P_tau, refine=False)
+    inc = phys["increments"]
+    z = torch.tensor(inc["zeta"], dtype=torch.float64)
+    check("[A] reduction dt = 1/30 s", all(abs(d - DT) < 1e-15 for d in inc["dt"]), str(inc["dt"]))
+    check("[A] relative twist in rad/s: |omega| = 0.6", torch.allclose(z[:, 3:].norm(dim=1),
+                                                                      torch.full((2,), w, dtype=torch.float64),
+                                                                      atol=1e-9), str(z[:, 3:].tolist()))
+    check("[A] relative twist in physical units = 30 x the per-frame value",
+          torch.allclose(z, 30.0 * torch.tensor(frame["increments"]["zeta"], dtype=torch.float64), rtol=1e-12))
+    from joint_reduction.rigid_trajectory_reduction import relative_increments, relative_twist_covariance
+    i1, i0 = relative_increments(R, p, t), relative_increments(R, p)
+    c1 = relative_twist_covariance(P_tau, i1["delta_R"], i1["delta_p"], i1["dt"], i1["eta"])["P_zeta"]
+    c0 = relative_twist_covariance(P_tau, i0["delta_R"], i0["delta_p"], i0["dt"], i0["eta"])["P_zeta"]
+    check("[A] relative-twist covariance uses dt = 1/30 (900 x the per-frame value)",
+          torch.allclose(c1, 900.0 * c0, rtol=1e-10))
+    check("[A] uniform rescaling leaves the one-DOF statistic unchanged (joint identification invariant)",
+          abs(phys["one_dof"]["gamma_1dof"] - frame["one_dof"]["gamma_1dof"]) < 1e-12
+          and np.allclose(phys["one_dof"]["generator"], frame["one_dof"]["generator"], atol=1e-12))
+    check("[A] Phase 2 passes the time base to the reduction",
+          'P_tau=res["pose_covariances"], times=time_s,' in (REPO / "tools" / "run_rigid_se3_pipeline.py").read_text())
+
+
 def test_A_process_noise():
     print("\n[A] process noise at dt = 1/30")
     from estimator import phase2_prismatic as mp
@@ -359,7 +394,7 @@ def test_C_exit_status():
 
 
 def main() -> int:
-    for t in (test_A_time_base, test_A_rates, test_A_process_noise, test_A_production_paths,
+    for t in (test_A_time_base, test_A_rates, test_A_joint_reduction, test_A_process_noise, test_A_production_paths,
               test_B_signatures, test_C_exit_status):
         try:
             t()

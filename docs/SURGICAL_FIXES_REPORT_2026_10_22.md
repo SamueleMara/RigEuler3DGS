@@ -13,7 +13,7 @@ although the loader records `dt_used_s` = 1/30 s. The Kabsch twists and the Phas
 | file | change |
 |---|---|
 | `utils/sequence_direction.py` | New `validate_times`, `times_from_intervals`, `processing_time_s`. Elapsed seconds in processing order, starting at 0, built from the loader's own interval `frames[k][2]`. It is cross-checked against `frame_ids['frames'][k]['dt_used_s']`; a contradiction fails. Non-finite, zero or negative intervals and non-increasing times are refused. A backward pass gets the same increasing elapsed time. |
-| `tools/run_rigid_se3_pipeline.py` | `time_s` is passed to `kabsch_initialize(..., times=)` and `run_rigid_window(..., times=)`. The trace CSV `time` column is now seconds. Writes `phase2_rigid/time_base.json` (dt_s, time_s, units) and `summary.json["time_base"]`. `--sigma-vdot` / `--sigma-wdot` help now states units. |
+| `tools/run_rigid_se3_pipeline.py` | `time_s` is passed to `kabsch_initialize(..., times=)`, `run_rigid_window(..., times=)` and, added after review, `reduce_trajectory(..., times=)`. Before that last change, the joint reduction's relative twists ζ were per frame and their covariance used dt = 1. For uniform sampling this is a units correction only: ζ scales by 30, P_ζ by 900 and the inverse-variance weights by 1/900, so γ_1DOF, the generator and the P/R fits (pose-based) are unchanged, as the tests verify. The trace CSV `time` column is now seconds. Writes `phase2_rigid/time_base.json` (dt_s, time_s, units) and `summary.json["time_base"]`. `--sigma-vdot` / `--sigma-wdot` help now states units. |
 | `tools/run_joint_phase3.py` | `time_s` is passed to `fit_model(..., times=)`. `_finite_rate(q, time_s)` is `np.gradient(q, time_s)`, and `load_initialisation(..., time_s=)` gives prismatic and revolute the same vector. `summary.json` config holds `dt_s`, `time_s_processing_order` and rate units; `"dt": "1 frame"` and `sigma_qddot_per_frame2` were removed. Help text for `--sigma-qddot` and `--prior-qdot` now states units. |
 | `estimator/phase2_model_comparison.py` | `fit_model(..., times=None)` forwards to `run_window`. Other callers are unchanged. |
 | `estimator/joint_iekf.py`, `estimator/rigid_part_runtime.py` | Comments and docstrings only, now stating the units. |
@@ -55,6 +55,7 @@ The stage logic, watchdog, retries, messages and outputs are unchanged.
 |---|---|
 | A: time_s = [0, 1/30, 2/30] forward and backward; contradictory metadata refused; zero, negative, NaN and inf intervals refused; nonuniform intervals | PASS |
 | A: 0.3 m/s gives 0.01 m per 30 Hz step; Kabsch twist 0.3 m/s and 0.6 rad/s; Phase 2 prediction 0.01 m; Phase 3 qdot 0.3 m/s and thetadot 0.6 rad/s; backward sign | PASS |
+| A: joint reduction: dt = 1/30, ζ in rad/s (0.6), 30× the per-frame ζ, P_ζ 900×, γ_1DOF and generator unchanged, call site passes `time_s` | PASS |
 | A: Q_qq = σ²dt³/3, Q_q,qdot = σ²dt²/2, Q_qdot,qdot = σ²dt at dt = 1/30 | PASS |
 | A: Phase 2 and Phase 3 windows predict with dt = 1/30 on the real renderer (tiny scene); production call sites pass the loader times | PASS |
 | A: Phase 2 `poses.npy` stays original-chronological; Phase 3 geometry bitwise unchanged | PASS via the existing tests listed below (unchanged code paths: `_chrono`, `geometry_unchanged`) |
@@ -70,7 +71,25 @@ The stage logic, watchdog, retries, messages and outputs are unchanged.
 - support and joint logic, and the single-part structure;
 - the Phase 1/2/3 MAP acceptance.
 
+## Operational check (review item 5)
+
+While `main` was fast-forwarded, the running v2 batch (`~/run_v2_finish_v3.sh`, part 1) was using a separate
+checkout. This was verified, not assumed:
+- The batch script, the driver and every stage process have working directory `~/Joint3DGS/RigEuler3DGS-v2code`,
+  pinned at `4379c0f`.
+- `estimator`, `utils` and `joint_reduction` resolve to that checkout.
+- The only code loaded from the main checkout is the CUDA rasterizer submodule (an editable install), which no commit
+  here changed.
+- `4379c0f` has no stage signatures, so a schema-1/schema-2 conflict cannot arise in v2.
+
+Part 2 of the batch (v3) runs from the main checkout, deliberately, so that it uses these fixes.
+
 ## Separate note (no code change)
+
+- `utils/bidirectional_time.chronological_twists` (backward diagnostic) takes one constant dt. That is exact for the
+  current uniformly sampled scenes; nonuniform sampling would need the time vector there too.
+- The driver still prints `<scene> done` after a stage of that scene failed. This is cosmetic: the summary lists the
+  failure and the exit status is 1.
 
 - **Process prior strength.** With dt = 1/30 s instead of 1, the unchanged σ values give a process covariance per step
   about 27,000× smaller in position (dt³/3) and 30× smaller in rate (dt) than the earlier, unintended runs did. The

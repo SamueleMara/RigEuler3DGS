@@ -516,7 +516,7 @@ def main() -> int:
     stage(f"[5/7] {args.scene}: joint reduction")
     from joint_reduction import reduce_trajectory
     red = reduce_trajectory(part.R, part.p, mu0.cpu(), members.cpu(),
-                            P_tau=res["pose_covariances"],
+                            P_tau=res["pose_covariances"], times=time_s,
                             refine=not args.no_refine)
     _write_reduction(out / "joint_reduction", red, T)
     od = red["one_dof"]
