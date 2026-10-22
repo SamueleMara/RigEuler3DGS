@@ -296,8 +296,9 @@ def main(argv=None) -> int:
                         ("Background leakage, final state (GT-free)",
                          ["p3_alpha_outside_mean", "p3_foreground_alpha_mean", "p3_rgb_mae_background"]),
                         ("Resources", ["p1_wall_s", "p2_wall_s", "p3_wall_s", "p1_gpu_mib"])):
+        label = {k: l for k, l, _ in METRICS}      # headers in the SAME order as the values
         L += [f"\n## {title}\n", "| scene | dir | " + " | ".join(
-            f"{l} original / masked" for k, l, _ in METRICS if k in keys) + " |", "|---|---|" + "---|" * len(keys)]
+            f"{label[k]} original / masked" for k in keys) + " |", "|---|---|" + "---|" * len(keys)]
         for r in rows:
             L.append(f"| {r['scene']} | {r['direction'][0].upper()} | " +
                      " | ".join(f"{fmt(r[k + '__original'], k)} / {fmt(r[k + '__masked'], k)}" for k in keys) + " |")
