@@ -58,7 +58,7 @@ def _sha_file(p: Path, chunk: int = 1 << 20) -> str | None:
     return h.hexdigest()
 
 
-def _content_digest(root: Path, cams, pattern_ext, frames: int | None = None) -> str | None:
+def _content_digest(root: Path, cams, pattern_ext, frames: int | None = None, start: int = 0) -> str | None:
     """Streaming sha256 over (relative path, byte length, BYTES) of the first
     `frames` files (sorted) of every given camera -- the files the stage reads.
     Never loads a whole file: 1 MiB chunks."""
@@ -71,6 +71,7 @@ def _content_digest(root: Path, cams, pattern_ext, frames: int | None = None) ->
             h.update(f"missing:{c}".encode())
             continue
         files = sorted(f for f in d.iterdir() if f.suffix.lower() in pattern_ext)
+        files = files[int(start):]
         if frames:
             files = files[:int(frames)]
         for f in files:
@@ -135,9 +136,11 @@ def compute(a) -> dict:
                         "mask_root": str(mask_root) if needs_masks else None,
                         "mask_content_sha256": _content_hash(mask_root, cams) if needs_masks else None},
         "source": {"dir": str(src), "frames": int(a.frames), "cameras": cams,
-                   "rgb_content_sha256": _content_digest(src / "rgb", cams, EXT, int(a.frames)),
+                   "frame_start": int(getattr(a, "frame_start", 0) or 0),
+                   "rgb_content_sha256": _content_digest(src / "rgb", cams, EXT, int(a.frames),
+                                                         int(getattr(a, "frame_start", 0) or 0)),
                    "depth_content_sha256": _content_digest(src / "depth_npy", cams, (".npy",),
-                                                           int(a.frames))},
+                                                           int(a.frames), int(getattr(a, "frame_start", 0) or 0))},
         "config": dict(kv.split("=", 1) for kv in (a.config or [])),
         "upstream_signature_sha256": up,
     }
@@ -248,6 +251,7 @@ def main(argv=None) -> int:
     for k in ("stage", "direction", "scene", "source", "model"):
         c.add_argument(f"--{k}", required=True)
     c.add_argument("--frames", required=True)
+    c.add_argument("--frame-start", default="0", help="first frame ID of the motion window")
     c.add_argument("--cameras", required=True)
     c.add_argument("--iterations", default="30000")
     c.add_argument("--observation-mode", required=True)

@@ -34,7 +34,7 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
 
-        if load_iteration:
+        if load_iteration is not None:
             if load_iteration == -1:
                 self.loaded_iter = searchForMaxIteration(os.path.join(self.model_path, "point_cloud"))
             else:
@@ -64,7 +64,7 @@ class Scene:
         else:
             assert False, "Could not recognize scene type! Expected source_path/sparse or source_path/colmap/sparse."
 
-        if not self.loaded_iter:
+        if self.loaded_iter is None:      # iteration 0 is a real checkpoint, not 'none'
             with open(scene_info.ply_path, 'rb') as src_file, open(os.path.join(self.model_path, "input.ply") , 'wb') as dest_file:
                 dest_file.write(src_file.read())
             json_cams = []
@@ -118,7 +118,7 @@ class Scene:
                 all_dynamic_cameras, fps=fps, time_scale=time_scale, time_mode=time_mode
             )
 
-        if self.loaded_iter:
+        if self.loaded_iter is not None:
             point_cloud_path = os.path.join(
                 self.model_path, "point_cloud", "iteration_" + str(self.loaded_iter)
             )

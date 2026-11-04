@@ -103,7 +103,7 @@ def measurement_terms(lin, obs_frame, cam_ids, cfg, model_error=None, model=None
                     image, robust depth on V_orig AND M, alpha term in expected-quad
     `obs_frame` is indexed by ABSOLUTE camera id, `lin.views` by position in cam_ids.
     """
-    from .observation_terms import CameraTerms, camera_terms
+    from .observation_terms import CameraTerms, camera_name, camera_terms
     if model is not None:
         from .masked_observation import phase1_camera_terms
         return phase1_camera_terms(lin.views, [obs_frame[c] for c in cam_ids], cfg, model,
@@ -121,7 +121,8 @@ def measurement_terms(lin, obs_frame, cam_ids, cfg, model_error=None, model=None
         valid = (ob[2].to(v.depth.device) if len(ob) > 2 and ob[2] is not None else d > 0)
         out.append(camera_terms(v, rgb, d, valid, cfg, rgb_robust=bool(cfg.robust_measurement),
                                 rgb_model_var=None if model_error is None else model_error.rgb_var[c],
-                                depth_model_var=None if model_error is None else model_error.depth_var[c]))
+                                depth_model_var=None if model_error is None else model_error.depth_var[c],
+                                camera=camera_name(cfg, c)))
     return out
 
 

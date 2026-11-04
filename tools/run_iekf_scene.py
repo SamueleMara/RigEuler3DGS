@@ -233,6 +233,26 @@ def _count_dataset_frames(source: Path, cams_all) -> int:
     return max(len(sorted(d.glob(f"frame_*{ext}"))) for ext in RGB_EXTENSIONS)
 
 
+def stamps_path(source: Path, spec):
+    if spec in (None, "", "off", "none"):
+        return None
+    return Path(source) / "metadata" / "frame_timestamps.csv" if spec == "auto" else Path(spec)
+
+
+def _frame_timestamps(source: Path, spec):
+    """{frame_index: (timestamp_s, source_frame_index)} from frame_timestamps.csv, or None."""
+    p = stamps_path(source, spec)
+    if p is None:
+        return None
+    if not p.is_file():
+        raise SystemExit(f"--frame-timestamps {spec}: {p} does not exist (no silent fallback to a constant dt)")
+    import csv
+    rows = {}
+    for r in csv.DictReader(open(p)):
+        rows[int(r["frame_index"])] = (float(r["timestamp_s"]), int(r.get("source_frame_index") or r["frame_index"]))
+    return rows
+
+
 def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path, *,
                         direction: str = "forward"):
     """V2 section 16: observations straight from the dataset's own RGB-D files.
@@ -279,6 +299,20 @@ def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path, *,
     names = [str(getattr(c, "image_name", f"cam_{i:03d}")).split("/")[0]
              for i, c in enumerate(cams_all[:n_cam])]
 
+    # Physical time (Calibrated-Bootstrap spec section 1): with
+    # args.frame_timestamps = "auto" (or a csv path) the capture's own
+    # metadata/frame_timestamps.csv supplies each frame's timestamp, and the
+    # per-step interval is t_k - t_(k-1); otherwise the constant args.dt is used
+    # (synthetic, uniformly sampled) and said so.
+    stamps = _frame_timestamps(source, getattr(args, "frame_timestamps", None))
+    if stamps is not None:
+        missing = [t for t in range(start, start + length) if t not in stamps]
+        if missing:
+            raise SystemExit(f"frame_timestamps.csv has no row for frames {missing[:5]}")
+        ts = [stamps[t][0] for t in range(start, start + length)]
+        if any(b <= a for a, b in zip(ts, ts[1:])):
+            raise SystemExit(f"frame timestamps are not strictly increasing over [{start}, {start + length})")
+
     frames, ids = [], []
     for k in range(length):
         t = start + k
@@ -311,9 +345,16 @@ def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path, *,
                             "depth_valid_pixels": int(valid.sum()),
                             "depth_min_m": float(dz[valid].min()) if bool(valid.any()) else None,
                             "depth_max_m": float(dz[valid].max()) if bool(valid.any()) else None})
-        frames.append((per_cam, specs, float(args.dt)))
+        if stamps is None:
+            dt_k = float(args.dt)
+            extra = {}
+        else:
+            j = k if k > 0 else 1                   # frame 0's own interval is never used
+            dt_k = float(ts[j] - ts[j - 1]) if length > 1 else float(args.dt)
+            extra = {"timestamp_s": float(ts[k]), "source_frame_index": int(stamps[t][1])}
+        frames.append((per_cam, specs, dt_k))
         ids.append({"frame": k, "dataset_frame_index": t,
-                    "dt_used_s": float(args.dt), "cameras": cam_ids})
+                    "dt_used_s": dt_k, "cameras": cam_ids, **extra})
 
     any_depth = any(c["depth_frame_id"] for f in ids for c in f["cameras"])
     provenance = {
@@ -324,7 +365,9 @@ def dataset_rgbd_frames(cams_all, cfg, args, truth, source: Path, *,
         "rgb_root": str(source / "rgb"),
         "depth_root": str(source / "depth_npy"),
         "depth_units": "metres, metric Z; 0 means no return and is marked invalid",
-        "dt_source": ("metadata/job_config_resolved.yaml records fps: null and "
+        "dt_source": (f"timestamps from {stamps_path(source, getattr(args, 'frame_timestamps', None))}"
+                      if stamps is not None else
+                      "metadata/job_config_resolved.yaml records fps: null and "
                       f"duration_sec: null, so --dt was used verbatim "
                       f"({args.dt} s) and is persisted here"),
         "synthetic_motion_applied": False,

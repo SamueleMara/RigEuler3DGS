@@ -120,6 +120,8 @@ def main() -> int:
                          "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
+    from estimator.run_config import add_cli as _rc_cli
+    _rc_cli(ap)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--direction", choices=("forward", "backward"),
                     default="forward",
@@ -181,8 +183,10 @@ def main() -> int:
             omega=truth.omega[keep], colors=truth.colors[keep],
             opacity=truth.opacity[keep], scales=truth.scales[keep])
     cfg = IEKFConfig()
+    from estimator import run_config as _rc
+    _w0, _wn = _rc.window(args, args.frames)
     ns = argparse.Namespace(
-        sequence_start=0, sequence_length=args.frames, all_frames=False,
+        sequence_start=_w0, sequence_length=_wn, all_frames=False,
         observation_source="dataset_rgbd", cameras=ncam,
         bootstrap_iters=args.bootstrap_iters,
         supernode_size=args.supernode_size, seed=args.seed,
@@ -193,9 +197,14 @@ def main() -> int:
         max_gaussians=args.max_gaussians, no_model_error=False,
         model_error_beta=1.0, model_error_blur=1)
     ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
+    ns.frame_timestamps = args.frame_timestamps
+    _rc.check_canonical_endpoint(model, args.direction, _w0, _w0 + _wn - 1,
+                                 explicit=args.motion_end_frame is not None or _w0 != 0)
     frames_raw, frame_ids = dataset_rgbd_frames(
         cams_all[:ncam], cfg, ns, truth, Path(source),
         direction=args.direction)
+    cfg = _rc.configure(args, cfg, frame_ids["cameras"][:ncam])
+    _rc.write_manifest(out / "phase2_rigid" / "sensor_manifest.json", args, cfg, frame_ids)
     from utils.sequence_direction import (context_from_frame_ids,
                                           verify_endpoint_provenance)
     ctx = context_from_frame_ids(frame_ids)

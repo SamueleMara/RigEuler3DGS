@@ -197,6 +197,18 @@ class IEKFConfig:
     # strict_frozen_radiance above selects the mode; this acknowledges the
     # unvalidated view-dependent one deliberately (section 12.2).
     allow_unvalidated_view_dependent: bool = False
+    # RigEuler3DGS_Calibrated_Bootstrap_IEKF_Implementation_Spec.md section 4: the
+    # frozen, provenance-tracked sensor model (utils/noise/sensor_model.py) and the
+    # identity of every camera in the order the observations are given. With a
+    # CALIBRATED model each camera's own RGB / depth variance replaces rgb_sigma and
+    # the depth_sigma_* coefficients; None (policy ideal / assumed) keeps them.
+    sensor_model: object = None
+    camera_names: tuple = ()
+    # A separately DECLARED model-mismatch scale, added in variance on top of the
+    # sensor term. It is renderer / appearance-model error, never a sensor statistic,
+    # and defaults to 0 so nothing changes unless it is set and recorded.
+    rgb_model_sigma: float = 0.0
+    depth_model_sigma: float = 0.0
 
 
 @dataclass
@@ -241,13 +253,14 @@ def _frame_terms(views, rgbd_gt, cfg: IEKFConfig, visibility=None, observation_m
     if observation_model is not None:
         from .masked_observation import phase1_camera_terms
         return phase1_camera_terms(views, rgbd_gt, cfg, observation_model)
-    from .observation_terms import camera_terms
+    from .observation_terms import camera_name, camera_terms
     out = []
     for k, (view, (rgb_gt, depth_gt, depth_valid)) in enumerate(zip(views, rgbd_gt, strict=True)):
         M = None if visibility is None else visibility.masks[k].to(view.rgb.device).bool()
         out.append(camera_terms(view, rgb_gt, depth_gt,
                                 depth_valid if M is None else (depth_valid.bool() & M), cfg,
-                                rgb_robust=cfg.robust_measurement, rgb_valid=M))
+                                rgb_robust=cfg.robust_measurement, rgb_valid=M,
+                                camera=camera_name(cfg, k)))
     return out
 
 

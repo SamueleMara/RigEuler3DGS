@@ -104,6 +104,8 @@ def parse_args(argv=None):
     _vis_cli(ap)
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
+    from estimator.run_config import add_cli as _rc_cli
+    _rc_cli(ap)
     ap.add_argument("--evaluate-gt", action="store_true",
                     help="after the fits are written, score them against the dataset GT "
                          "(evaluation only, into <out>/evaluation_gt/)")
@@ -235,15 +237,22 @@ def main(argv=None) -> int:
     cameras = camera_specs(cams_all, ncam)
     truth = state_from_gaussians(gaussians)
     cfg = IEKFConfig()
+    from estimator import run_config as _rc
+    _w0, _wn = _rc.window(args, args.frames)
     ns = argparse.Namespace(
-        sequence_start=0, sequence_length=args.frames, all_frames=False,
+        sequence_start=_w0, sequence_length=_wn, all_frames=False,
         observation_source="dataset_rgbd", cameras=ncam, bootstrap_iters=0, supernode_size=64,
         seed=0, frames_on_cpu=bool(args.frames_on_cpu), frames_on_gpu=not args.frames_on_cpu,
         depth_sigma=None, joint_direct_rgbd=False, joint_direct_gaussian=False, window_length=0,
         all_cameras=False, dt=1.0 / 30.0, max_gaussians=0, no_model_error=False,
         model_error_beta=1.0, model_error_blur=1)
+    ns.frame_timestamps = args.frame_timestamps
+    _rc.check_canonical_endpoint(model, args.direction, _w0, _w0 + _wn - 1,
+                                 explicit=args.motion_end_frame is not None or _w0 != 0)
     frames_raw, frame_ids = dataset_rgbd_frames(cams_all[:ncam], cfg, ns, truth, source,
                                                 direction=args.direction)
+    cfg = _rc.configure(args, cfg, frame_ids["cameras"][:ncam])
+    _rc.write_manifest(out / "sensor_manifest.json", args, cfg, frame_ids)
     ctx = context_from_frame_ids(frame_ids)
     endpoint = verify_endpoint_provenance(args.direction, str(model), total_frames=len(frames_raw),
                                           strict=True)

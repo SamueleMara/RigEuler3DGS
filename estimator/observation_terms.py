@@ -70,11 +70,29 @@ def depth_sensor_sigma(depth_obs: torch.Tensor, valid: torch.Tensor, cfg) -> tor
                          depth_range=rng.unsqueeze(0), layout=("depth",), channel_dim=0).squeeze(0)
 
 
+def camera_name(cfg, index: int):
+    """The identity of the camera at observation position `index` (cfg.camera_names)."""
+    names = tuple(getattr(cfg, "camera_names", ()) or ())
+    return names[index] if 0 <= index < len(names) else None
+
+
+def calibrated_camera(cfg, camera):
+    """The camera's CameraNoise when cfg carries a CALIBRATED sensor model, else None.
+    A calibrated model without the camera identity is an error, never a fallback."""
+    sm = getattr(cfg, "sensor_model", None)
+    if sm is None or not getattr(sm, "is_physical", False):
+        return None
+    if camera is None:
+        raise ValueError("a calibrated sensor model needs the camera identity of every "
+                         "observation (IEKFConfig.camera_names); refusing to fall back")
+    return sm.camera(camera)
+
+
 def camera_terms(view, rgb_target: torch.Tensor, depth_obs: torch.Tensor, depth_valid_obs: torch.Tensor,
                  cfg, *, rgb_robust: bool, rgb_model_var: torch.Tensor | None = None,
                  depth_model_var: torch.Tensor | None = None,
                  coverage: torch.Tensor | None = None, kappa_fn=None,
-                 rgb_valid: torch.Tensor | None = None) -> CameraTerms:
+                 rgb_valid: torch.Tensor | None = None, camera: str | None = None) -> CameraTerms:
     """The measurement of one camera.
 
     rgb_target   the RGB observation (I in the original mode, Y(b) in the masked modes)
@@ -82,11 +100,24 @@ def camera_terms(view, rgb_target: torch.Tensor, depth_obs: torch.Tensor, depth_
     *_model_var  fixed model-error variances (Phase 2/3), or None
     coverage     M (masked modes); with kappa_fn, adds the alpha term 1/2 kappa (M - A)^2
     rgb_valid    optional [H,W] RGB sample mask (the hard negative-ray mode restricts RGB to M = 1)
+    camera       the camera's identity; with a calibrated sensor model (cfg.sensor_model)
+                 its own per-channel RGB variance and depth variance at the observed
+                 depth replace cfg.rgb_sigma / the depth_sigma_* coefficients. Any
+                 declared cfg.rgb_model_sigma / depth_model_sigma is added in variance.
     """
+    cal = calibrated_camera(cfg, camera)
+    rms = float(getattr(cfg, "rgb_model_sigma", 0.0) or 0.0)
+    dms = float(getattr(cfg, "depth_model_sigma", 0.0) or 0.0)
     # ---- RGB ---------------------------------------------------------------
     r_rgb = rgb_target - view.rgb
     if cfg.use_rgb:
-        s2 = torch.full_like(r_rgb, float(cfg.rgb_sigma) ** 2)
+        if cal is not None:
+            var_c = torch.as_tensor(cal.rgb_variance(), dtype=r_rgb.dtype, device=r_rgb.device)
+            s2 = var_c.reshape(3, 1, 1).expand_as(r_rgb).clone()
+        else:
+            s2 = torch.full_like(r_rgb, float(cfg.rgb_sigma) ** 2)
+        if rms > 0:
+            s2 = s2 + rms * rms
         if rgb_model_var is not None:
             s2 = s2 + rgb_model_var.to(s2.device, s2.dtype).expand_as(s2)
         valid_rgb = torch.isfinite(r_rgb)
@@ -101,7 +132,13 @@ def camera_terms(view, rgb_target: torch.Tensor, depth_obs: torch.Tensor, depth_
     used = obs_valid & (view.alpha > cfg.min_alpha_for_depth)
     r_d = torch.where(used, depth_obs - view.depth, torch.zeros_like(view.depth))
     if cfg.use_depth:
-        sd = depth_sensor_sigma(depth_obs, obs_valid, cfg)
+        if cal is not None:
+            z = torch.where(obs_valid, depth_obs, torch.ones_like(depth_obs))
+            sd = cal.depth_variance(z.double()).to(depth_obs.dtype).sqrt()
+        else:
+            sd = depth_sensor_sigma(depth_obs, obs_valid, cfg)
+        if dms > 0:
+            sd = (sd * sd + dms * dms).sqrt()
         if depth_model_var is not None:
             sd = (sd * sd + depth_model_var.to(sd.device, sd.dtype)).sqrt()
         p_d, e_d = robust_term(r_d, sd, used, cfg.robust_measurement, cfg.student_t_nu)

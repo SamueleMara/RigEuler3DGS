@@ -304,6 +304,22 @@ def verify_endpoint_provenance(direction, model_dir, *, total_frames=None,
     """
     direction = normalise(direction)
     expected = canonical_endpoint(direction)
+    from pathlib import Path
+    boot = Path(model_dir) / "bootstrap_manifest.json"
+    if boot.is_file():
+        # A surface-centred bootstrap model (tools/train_tracking_bootstrap.py) records
+        # which endpoint and original frame it IS; its cfg_args points at colmap/ only
+        # for the camera geometry, which is the same at every frame.
+        import json as _json
+        bm = _json.loads(boot.read_text())
+        observed, frame, source = bm.get("endpoint"), bm.get("endpoint_frame"), str(boot)
+        ev = {"direction": direction, "expected_endpoint": expected, "model_path": str(model_dir),
+              "dataset_colmap_path": None, "endpoint_original_frame": frame, "observed_endpoint": observed,
+              "consistent": observed == expected, "basis": "bootstrap_manifest.json"}
+        if strict and observed != expected:
+            raise ValueError(f"--direction {direction} requires the {expected} endpoint model, but {model_dir} "
+                             f"is the bootstrap {observed} endpoint (original frame {frame})")
+        return ev
     source = model_source_path(model_dir)
     frame = endpoint_frame_of_colmap(source) if source else None
 
@@ -373,6 +389,11 @@ def processing_time_s(frames, frame_ids) -> "torch.Tensor":
     recs = frame_ids.get("frames", []) if isinstance(frame_ids, dict) else []
     if len(recs) != len(frames):
         raise ValueError(f"{len(frames)} frames but {len(recs)} provenance records")
+    if recs and all(isinstance(r, dict) and "timestamp_s" in r for r in recs):
+        # recorded capture timestamps: elapsed time along the processing order is
+        # |t_k - t_0| accumulated step by step, positive in BOTH directions
+        ts = [float(r["timestamp_s"]) for r in recs]
+        return times_from_intervals([0.0] + [abs(b - a) for a, b in zip(ts, ts[1:])])
     dts = []
     for k, (f, r) in enumerate(zip(frames, recs)):
         a = float(f[2])

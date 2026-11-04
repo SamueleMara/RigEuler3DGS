@@ -22,7 +22,15 @@ from PIL import Image
 EXT = (".png", ".jpg", ".jpeg")
 
 
-def check(source: Path, mask_root: Path, cameras: int | None, frames: int | None, max_report: int = 12):
+def _frame_no(p: Path) -> int:
+    try:
+        return int(p.stem.split("_")[-1])
+    except ValueError:
+        return 0
+
+
+def check(source: Path, mask_root: Path, cameras: int | None, frames: int | None, max_report: int = 12,
+          start: int = 0):
     cams = sorted(p.name for p in (source / "rgb").glob("cam_*") if p.is_dir())
     if not cams:
         return [f"{source / 'rgb'}: no cam_* folders"], {}
@@ -33,6 +41,7 @@ def check(source: Path, mask_root: Path, cameras: int | None, frames: int | None
     problems, checked = [], 0
     for c in cams:
         rgbs = sorted(q for q in (source / "rgb" / c).iterdir() if q.suffix.lower() in EXT)
+        rgbs = [r for r in rgbs if _frame_no(r) >= int(start)]     # the motion window, not frame 0
         if frames:
             rgbs = rgbs[:frames]
         size = Image.open(rgbs[0]).size if rgbs else None
@@ -68,6 +77,7 @@ def main(argv=None) -> int:
     ap.add_argument("--mask-source", default=None, help="mask root (default <source>/mask)")
     ap.add_argument("--cameras", type=int, default=None)
     ap.add_argument("--frames", type=int, default=None)
+    ap.add_argument("--start", type=int, default=0, help="first frame ID of the window")
     a = ap.parse_args(argv)
     src = Path(a.source)
     root = Path(a.mask_source) if a.mask_source else src / "mask"
@@ -76,7 +86,7 @@ def main(argv=None) -> int:
               "masked-rgb-expected-quad needs whole-object masks; pass --observation-mode original "
               "explicitly to run without them)")
         return 1
-    problems, info = check(src, root, a.cameras, a.frames)
+    problems, info = check(src, root, a.cameras, a.frames, start=a.start)
     if problems:
         print(f"MASKS NOT READY under {root}: {len(problems)} problem(s)")
         for p in problems[:12]:

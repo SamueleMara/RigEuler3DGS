@@ -132,6 +132,8 @@ def main() -> int:
                          "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
+    from estimator.run_config import add_cli as _rc_cli
+    _rc_cli(ap, phase1=True)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
                     help="v2 = section 11-19 coherent-component extraction "
                          "(default); ncut = the superseded two-way normalized "
@@ -248,8 +250,10 @@ def main() -> int:
         print(f"  {mu0.shape[0]} Gaussians, {ncam} cameras")
         from tools.kpart_pipeline import bootstrap_positions
 
+        from estimator import run_config as _rc
+        _w0, _wn = _rc.window(args, args.frames)
         ns = argparse.Namespace(
-            sequence_start=0, sequence_length=args.frames, all_frames=False,
+            sequence_start=_w0, sequence_length=_wn, all_frames=False,
             observation_source="dataset_rgbd", cameras=ncam,
             bootstrap_iters=args.bootstrap_iters,
             supernode_size=args.iekf_supernode_size, seed=args.seed,
@@ -261,9 +265,16 @@ def main() -> int:
             model_error_beta=1.0, model_error_blur=1)
 
         ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
+        ns.frame_timestamps = args.frame_timestamps
+        ns.p0_geometry = args.p0_geometry
+        ns.p0_velocity_sigma = tuple(args.p0_velocity_sigma)
+        _rc.check_canonical_endpoint(model, args.direction, _w0, _w0 + _wn - 1,
+                                     explicit=args.motion_end_frame is not None or _w0 != 0)
         frames_raw, frame_ids = dataset_rgbd_frames(
             cams_all[:ncam], cfg, ns, truth, Path(source),
             direction=args.direction)
+        cfg = _rc.configure(args, cfg, frame_ids["cameras"][:ncam])
+        _rc.write_manifest(out / "sensor_manifest.json", args, cfg, frame_ids)
         from utils.sequence_direction import (context_from_frame_ids,
                                               verify_endpoint_provenance)
         ctx = context_from_frame_ids(frame_ids)

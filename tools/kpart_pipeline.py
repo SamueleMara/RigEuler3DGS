@@ -1720,6 +1720,21 @@ def covariance_report(P: torch.Tensor) -> dict:
     return out
 
 
+def _frame_dt(frames, k: int, default: float) -> float:
+    """Elapsed seconds between processing steps k-1 and k: |t_k - t_(k-1)| from the
+    loader's recorded timestamps when present (real captures, forward or backward),
+    else the constant `default` (synthetic, uniformly sampled)."""
+    if k <= 0:
+        return float(default)
+    a, b = frames[k - 1][1], frames[k][1]
+    if isinstance(a, dict) and isinstance(b, dict) and "timestamp_s" in a and "timestamp_s" in b:
+        dt = abs(float(b["timestamp_s"]) - float(a["timestamp_s"]))
+        if not dt > 0:
+            raise SystemExit(f"processing steps {k - 1}, {k}: non-positive elapsed time {dt}")
+        return dt
+    return float(default)
+
+
 def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                         verbose=True, observer=None):
     """Section 25 Phase 1: multiview motion evidence for EVERY frame.
@@ -1742,15 +1757,15 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
 
     n = truth.num_gaussians
     dev = truth.mu.device
-    bcfg = IEKFConfig(**{**{k: getattr(cfg, k) for k in
-                         ("max_iters", "pcg_max_iters", "use_rgb", "use_depth",
-                          "robust_measurement", "student_t_nu", "rgb_sigma",
-                          "depth_sigma_model", "eps_depth",
-                          "min_alpha_for_depth", "use_trust_region")},
-                      "use_supernodes": True,
-                      "supernode_target_size": args.supernode_size,
-                      "supernode_seed": args.seed,
-                      "max_iters": args.bootstrap_iters})
+    # Every field of the caller's config is kept -- the former subset copy lost
+    # depth_sigma_a / depth_sigma_b (and anything else not listed), so a configured
+    # depth model silently reverted to the defaults. Only the bootstrap's own
+    # controls are overridden.
+    import dataclasses as _dc
+    bcfg = _dc.replace(cfg, use_supernodes=True,
+                       supernode_target_size=args.supernode_size,
+                       supernode_seed=args.seed,
+                       max_iters=args.bootstrap_iters)
     positions, per_frame = [], []
     state = truth
     t0 = time.perf_counter()
@@ -1761,9 +1776,32 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
     # --phase1-covariance-reset restores the old per-frame re-initialisation as
     # an explicit, non-default diagnostic.
     P0 = torch.zeros((n, 12, 12), device=dev, dtype=truth.mu.dtype)
-    P0[:, range(12), range(12)] = torch.tensor(
-        [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
-        dtype=truth.mu.dtype)
+    p0_file = getattr(args, "p0_geometry", None)
+    if p0_file:
+        # Opt-in (spec section 4.1): the POSE block is the bootstrap's geometry
+        # covariance (tools/train_tracking_bootstrap.py), the velocity block a
+        # separately DECLARED process prior -- never inferred from Gaussian scale.
+        import numpy as _np
+        z = _np.load(p0_file)
+        Pg = torch.as_tensor(z["P0_geometry"], dtype=truth.mu.dtype, device=dev)
+        if tuple(Pg.shape) != (n, 6, 6):
+            raise SystemExit(f"{p0_file}: P0_geometry {tuple(Pg.shape)} but the model has {n} Gaussians")
+        if not bool(torch.isfinite(Pg).all()):
+            raise SystemExit(f"{p0_file}: non-finite P0_geometry")
+        ev = torch.linalg.eigvalsh(0.5 * (Pg + Pg.transpose(1, 2)).double().cpu())
+        if float(ev.min()) < -1e-12 * float(ev.abs().max()):
+            raise SystemExit(f"{p0_file}: P0_geometry is not PSD (min eigenvalue {float(ev.min()):.3e})")
+        sv, sw = (float(x) for x in getattr(args, "p0_velocity_sigma", (1.0, 0.316227766)))
+        P0[:, :6, :6] = 0.5 * (Pg + Pg.transpose(1, 2))
+        P0[:, 6:9, 6:9] = torch.eye(3, device=dev, dtype=truth.mu.dtype) * sv * sv
+        P0[:, 9:, 9:] = torch.eye(3, device=dev, dtype=truth.mu.dtype) * sw * sw
+        p0_source = {"pose": f"bootstrap geometry covariance {p0_file}",
+                     "velocity": f"declared prior sd v {sv} m/s, omega {sw} rad/s"}
+    else:
+        P0[:, range(12), range(12)] = torch.tensor(
+            [1e-2] * 3 + [1e-2] * 3 + [1.0] * 3 + [1e-1] * 3, device=dev,
+            dtype=truth.mu.dtype)
+        p0_source = {"pose": "fixed diagonal 1e-2 (legacy default)", "velocity": "fixed diagonal (legacy default)"}
     reset_cov = bool(getattr(args, "phase1_covariance_reset", False))
     P_post = None
     # GT-free mask diagnostics (estimator/mask_diagnostics.py): the tracked
@@ -1802,7 +1840,7 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         new_state, P_new, diag = iekf_frame_step(seed, P,
                                              obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev),
                                              cameras,
-                                             dt=args.dt, cfg=bcfg,
+                                             dt=_frame_dt(frames, ti, args.dt), cfg=bcfg,
                                              partition=partition,
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
@@ -1861,5 +1899,7 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             "frames": len(frames), "runtime_s": time.perf_counter() - t0,
             "per_frame": per_frame,
             "warm_started": True,
+            "P0_source": p0_source,
+            "dt_s_per_step": [_frame_dt(frames, k, args.dt) for k in range(1, len(frames))],
             "rotations": rotations}
     return positions, info

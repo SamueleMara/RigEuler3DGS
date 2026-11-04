@@ -28,6 +28,17 @@
 # --stages "..." static | phase1 | phase2 | phase3   (default: static phase1 phase2)
 # --frames N|auto   frames per sequence (default auto = every frame of the scene;
 #                   the backward run needs the whole sequence, ending at frame T)
+# --motion-start-frame S / --motion-end-frame E   inclusive original frame IDs of the
+#                   motion window (forward canonical endpoint S, backward E); default
+#                   0 .. --frames-1. The endpoint models must BE those frames
+#                   (bootstrap_manifest.json or single-frame COLMAP provenance).
+# --frame-timestamps auto|PATH|off   physical time from metadata/frame_timestamps.csv
+# --sensor-model PATH       calibrated sensor model (tools/calibrate_static_rgbd.py),
+#                           shared by Phase 1/2/3; --sensor-policy ideal|assumed without it
+# --rgb-model-sigma s / --depth-model-sigma s   DECLARED model-mismatch sds
+# --bootstrap-p0            Phase-1 pose prior from static_bidi/<end>/geometry_information.npz
+#                           (tools/train_tracking_bootstrap.py), velocity prior from
+# --p0-velocity-sigma V W   (declared, m/s rad/s)
 # --cameras N|auto  cameras used by Phase 1/2/3 (default 8, the setting of the
 #                   stable results; auto = every rgb/cam_* folder). Static
 #                   training always uses every camera of the COLMAP model.
@@ -98,6 +109,15 @@ while [ $# -gt 0 ]; do
     --observation-mode)       OBS_MODE="$2"; shift 2;;
     --rgb-background-constant) OBS_BG=("$2" "$3" "$4"); shift 4;;
     --rgb-background-distribution) OBS_DIST="$2"; shift 2;;
+    --motion-start-frame)     MSTART="$2"; shift 2;;
+    --motion-end-frame)       MEND="$2"; shift 2;;
+    --frame-timestamps)       TSTAMPS="$2"; shift 2;;
+    --sensor-model)           SENSOR="$2"; shift 2;;
+    --sensor-policy)          SPOL="$2"; shift 2;;
+    --rgb-model-sigma)        RGBMS="$2"; shift 2;;
+    --depth-model-sigma)      DEPMS="$2"; shift 2;;
+    --bootstrap-p0)           BOOTP0=1; shift;;
+    --p0-velocity-sigma)      P0V=("$2" "$3"); shift 3;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -124,6 +144,15 @@ PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
 PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
 VIS_MODE=${VIS_MODE:-off}
+MSTART=${MSTART:-0}; MEND=${MEND:-}; TSTAMPS=${TSTAMPS:-off}; SENSOR=${SENSOR:-}; SPOL=${SPOL:-ideal}
+RGBMS=${RGBMS:-0}; DEPMS=${DEPMS:-0}; BOOTP0=${BOOTP0:-0}
+[ ${#P0V[@]} -eq 2 ] 2>/dev/null || P0V=(1.0 0.316227766)
+if [ -n "$SENSOR" ] && [ ! -f "$SENSOR" ]; then echo "--sensor-model $SENSOR does not exist" >&2; exit 2; fi
+SENSOR_SHA=$( [ -n "$SENSOR" ] && sha256sum "$SENSOR" | cut -c1-64 || echo none )
+# shared by the three runners (estimator/run_config.py)
+RCARGS=(--motion-start-frame "$MSTART" ${MEND:+--motion-end-frame "$MEND"} --frame-timestamps "$TSTAMPS"
+        --sensor-policy "$SPOL" ${SENSOR:+--sensor-model "$SENSOR"}
+        --rgb-model-sigma "$RGBMS" --depth-model-sigma "$DEPMS")
 VISARGS=()
 if [ "$VIS_MODE" != "off" ]; then
   VISARGS=(--object-mask-constraint "$VIS_MODE" --mask-ray-semantics "${VIS_SEM:-trusted-full-ray}"
@@ -328,13 +357,17 @@ run() {
 SIGDIR=$(mktemp -d "${TMPDIR:-/tmp}/rigeuler_sig.XXXXXX")
 trap 'rm -rf "$SIGDIR"' EXIT
 stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
+  local p0sha=none
+  [ "$BOOTP0" = 1 ] && [ -f "$3/geometry_information.npz" ] && p0sha=$(sha256sum "$3/geometry_information.npz" | cut -c1-64)
   "$PY" tools/stage_signature.py compute --stage "$1" --direction "$2" --scene "$S" \
-    --source "$SRC" --model "$3" --frames "$NF" --cameras "$NC" --iterations "$ITERS" \
+    --source "$SRC" --model "$3" --frames "$NF" --frame-start "$MSTART" --cameras "$NC" --iterations "$ITERS" \
     --observation-mode "$OBS_MODE" ${OBS_DIST_RES:+--rgb-background-distribution "$OBS_DIST_RES"} \
     ${OBS_BG[0]:+--rgb-background-constant "${OBS_BG[*]}"} --object-mask-constraint "$VIS_MODE" \
     --mask-options "${VISARGS[*]}" --mask-source "$SRC/${VIS_SUBDIR:-mask}" ${4:+--upstream "$4"} \
     --config "BOOT=$BOOT" "IEKF_SN=$IEKF_SN" "KNN=$KNN" "SNCOUNT=$SNCOUNT" "FOLDS=$FOLDS" \
-             "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" > "$5"
+             "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" \
+             "MSTART=$MSTART" "MEND=$MEND" "TSTAMPS=$TSTAMPS" "SENSOR_SHA=$SENSOR_SHA" "SPOL=$SPOL" \
+             "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
 decide() {
@@ -372,11 +405,12 @@ for S in $SCENES; do
     STATUS+=("$S SKIPPED(input check failed)"); continue
   fi
   read -r _ NF_ALL NC_ALL <<< "$CHK"
-  if [ "$FRAMES" = "auto" ]; then NF=$NF_ALL; else NF=$FRAMES; fi
+  if [ -n "$MEND" ]; then NF=$(( MEND - MSTART + 1 ))
+  elif [ "$FRAMES" = "auto" ]; then NF=$(( NF_ALL - MSTART )); else NF=$FRAMES; fi
   if [ "$CAMS" = "auto" ] || [ "$CAMS" -gt "$NC_ALL" ]; then NC=$NC_ALL; else NC=$CAMS; fi
-  if [ "$NF" -gt "$NF_ALL" ]; then
-    echo "  !! --frames $NF but the scene has $NF_ALL -- skipping"
-    STATUS+=("$S SKIPPED(frames $NF > $NF_ALL)"); continue
+  if [ "$NF" -lt 2 ] || [ $(( MSTART + NF )) -gt "$NF_ALL" ]; then
+    echo "  !! motion window [$MSTART, $(( MSTART + NF - 1 ))] but the scene has frames 0..$(( NF_ALL - 1 )) -- skipping"
+    STATUS+=("$S SKIPPED(frames $MSTART+$NF > $NF_ALL)"); continue
   fi
   if [ "$NF" -lt "$NF_ALL" ]; then
     echo "  note: $NF of $NF_ALL frames; the backward run is anchored at the LAST frame and will refuse a shorter window"
@@ -385,7 +419,7 @@ for S in $SCENES; do
   if [ "$OBS_MODE" != "original" ] || [ "$VIS_MODE" != "off" ]; then
     # masks are checked BEFORE any training or output deletion; no fallback
     MCHK=$("$PY" tools/check_masks.py --source "$SRC" --mask-source "$SRC/${VIS_SUBDIR:-mask}" \
-           --cameras "$NC" --frames "$NF" 2>&1); MRC=$?
+           --cameras "$NC" --frames "$NF" --start "$MSTART" 2>&1); MRC=$?
     if [ $MRC -ne 0 ]; then
       echo "  !! $MCHK" | head -6
       echo "  !! observation mode $OBS_MODE needs the masks -- skipping (pass --observation-mode original explicitly to run without them)"
@@ -444,6 +478,11 @@ for S in $SCENES; do
         echo "  [phase1/$DIR] from static_bidi/$END  $(date +%T)"
         [ "$DRY" = "1" ] || { rm -rf "$P1"; mkdir -p "$P1"; }   # never touch disk in a dry run
         manifest "$P1" "$SIG1" running
+        P0ARGS=()
+        if [ "$BOOTP0" = 1 ]; then
+          P0ARGS=(--p0-geometry "$OUT/static_bidi/$END/geometry_information.npz"
+                  --p0-velocity-sigma "${P0V[0]}" "${P0V[1]}")
+        fi
         run "$LOGS/${S}_phase1_${DIR}.log" \
           "$PY" tools/run_motion_coherence_support.py \
             --scene "$S" --direction "$DIR" \
@@ -451,7 +490,9 @@ for S in $SCENES; do
             --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
-            --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" --out "$P1"
+            --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
+            "${P0ARGS[@]}" \
+            --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! phase1/$DIR failed rc=$RC"
@@ -495,7 +536,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --frames "$NF" --cameras "$NC" \
-          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" \
+          --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
           --out "$P2"
@@ -543,7 +584,7 @@ for S in $SCENES; do
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
-          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" \
+          --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
           --evaluate-gt --out "$P3"
       RC=$?
       if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then

@@ -249,10 +249,13 @@ def phase1_camera_terms(views, prepared, cfg, model: MaskedObservationModel, mod
         depth  robust (Student-t NLL) on V_orig AND M, with the pre-existing alpha gate
         alpha  1/2 kappa (M - A)^2, kappa = trace(W)/12   (expected-quad only)
     """
-    from .observation_terms import camera_terms
+    from .observation_terms import calibrated_camera, camera_name, camera_terms
     if len(views) != len(prepared):
         raise AssertionError(f"{len(views)} views but {len(prepared)} prepared observations")
-    if model.rgb_sigma is not None and abs(float(model.rgb_sigma) - float(cfg.rgb_sigma)) > 0:
+    calibrated = getattr(getattr(cfg, "sensor_model", None), "is_physical", False)
+    # with a calibrated sensor model W is each camera's own fixed 1/sigma^2 (still no
+    # residual reweighting of RGB); otherwise the declared model sigma must match
+    if not calibrated and model.rgb_sigma is not None and abs(float(model.rgb_sigma) - float(cfg.rgb_sigma)) > 0:
         raise AssertionError(f"observation model sigma {model.rgb_sigma} != IEKF rgb_sigma {cfg.rgb_sigma}")
     out = []
     for j, (v, ob) in enumerate(zip(views, prepared)):
@@ -265,7 +268,8 @@ def phase1_camera_terms(views, prepared, cfg, model: MaskedObservationModel, mod
         out.append(camera_terms(v, ob.target(model.background_tensor(v.rgb.device)), ob.depth_observed,
                                 ob.depth_valid, cfg, rgb_robust=False, rgb_model_var=mv_rgb,
                                 depth_model_var=mv_d, coverage=ob.object_coverage,
-                                kappa_fn=model.kappa if model.alpha_term else None))
+                                kappa_fn=model.kappa if model.alpha_term else None,
+                                camera=camera_name(cfg, c)))
     return out
 
 
@@ -355,8 +359,11 @@ def preflight(args, source) -> None:
                          "masked-rgb-expected-quad mode needs whole-object masks; pass "
                          "--observation-mode original explicitly to run the unmasked control.")
     cams = getattr(args, "cameras", None)
+    s0 = int(getattr(args, "motion_start_frame", 0) or 0)
+    e0 = getattr(args, "motion_end_frame", None)
+    nfr = (int(e0) - s0 + 1) if e0 is not None else (int(args.frames) if getattr(args, "frames", None) else None)
     problems, info = check(src, root, int(cams) if isinstance(cams, int) or str(cams).isdigit() else None,
-                           int(args.frames) if getattr(args, "frames", None) else None)
+                           nfr, start=s0)
     if problems:
         raise SystemExit(f"observation mode {mode}: masks not ready under {root} "
                          f"({len(problems)} problem(s)), e.g. " + "; ".join(problems[:4]))
