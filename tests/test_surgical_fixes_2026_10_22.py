@@ -375,6 +375,7 @@ def test_C_exit_status():
             env = dict(os.environ, PY=str(stub), STUB_FAIL=fail, STALL_MIN="0")
             r = subprocess.run(["bash", "run_bidirectional_all.sh", "-i", str(root), "-o", str(out),
                                 "--scenes", scenes, "--stages", "phase1 phase2 phase3", "--cameras", "1",
+                                *(() if "--direction" in extra else ("--direction", "both")),
                                 *extra], cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
             return r.returncode, r.stdout
         rc, out = run("ok", "sa sb")
@@ -387,6 +388,9 @@ def test_C_exit_status():
         check("[C] a signature refusal -> nonzero", rc != 0 and "REFUSED(phase1/forward" in out, f"rc {rc}")
         rc, out = run("nomask", "sa sb", nomask=("sa",))
         check("[C] missing masks -> nonzero", rc != 0 and "sa SKIPPED(masks not ready)" in out, f"rc {rc}")
+        rc, out = run("nodir", "sa", extra=("--direction", "auto"))
+        check("[C] no --direction and no metadata/direction/summary.json -> skipped, nonzero",
+              rc != 0 and "sa SKIPPED(direction unknown)" in out, f"rc {rc}")
         rc, out = run("dry", "sa", extra=("--dry-run",))
         written = sorted(p.name for p in (td / "dry" / "out" / "sa").iterdir())
         check("[C] dry run unchanged: commands printed, nothing written, exit 0",

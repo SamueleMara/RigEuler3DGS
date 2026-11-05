@@ -28,6 +28,10 @@
 # --stages "..." static | phase1 | phase2 | phase3   (default: static phase1 phase2)
 # --frames N|auto   frames per sequence (default auto = every frame of the scene;
 #                   the backward run needs the whole sequence, ending at frame T)
+# --direction auto|forward|backward|both   which pass(es) to run (default auto: the
+#                   scene's metadata/direction/summary.json "recommended_direction";
+#                   a scene without it is SKIPPED unless --direction is given).
+#                   forward needs static_bidi/initial, backward static_bidi/final.
 # --motion-start-frame S / --motion-end-frame E   inclusive original frame IDs of the
 #                   motion window (forward canonical endpoint S, backward E); default
 #                   0 .. --frames-1. The endpoint models must BE those frames
@@ -109,6 +113,7 @@ while [ $# -gt 0 ]; do
     --observation-mode)       OBS_MODE="$2"; shift 2;;
     --rgb-background-constant) OBS_BG=("$2" "$3" "$4"); shift 4;;
     --rgb-background-distribution) OBS_DIST="$2"; shift 2;;
+    --direction)              DIRSEL="$2"; shift 2;;
     --motion-start-frame)     MSTART="$2"; shift 2;;
     --motion-end-frame)       MEND="$2"; shift 2;;
     --frame-timestamps)       TSTAMPS="$2"; shift 2;;
@@ -144,6 +149,8 @@ PHASE3_ITERS=${PHASE3_ITERS:-5}   # Phase-3 IEKF iterations per frame
 PHASE3_HYP=${PHASE3_HYP:-prismatic,revolute}
 DRY=${DRY:-0}
 VIS_MODE=${VIS_MODE:-off}
+DIRSEL=${DIRSEL:-auto}
+case "$DIRSEL" in auto|forward|backward|both) ;; *) echo "--direction must be auto|forward|backward|both" >&2; exit 2;; esac
 MSTART=${MSTART:-0}; MEND=${MEND:-}; TSTAMPS=${TSTAMPS:-off}; SENSOR=${SENSOR:-}; SPOL=${SPOL:-ideal}
 RGBMS=${RGBMS:-0}; DEPMS=${DEPMS:-0}; BOOTP0=${BOOTP0:-0}
 [ ${#P0V[@]} -eq 2 ] 2>/dev/null || P0V=(1.0 0.316227766)
@@ -405,6 +412,22 @@ for S in $SCENES; do
     STATUS+=("$S SKIPPED(input check failed)"); continue
   fi
   read -r _ NF_ALL NC_ALL <<< "$CHK"
+  # ---- which direction(s): explicit flag, else the dataset's recommendation ----
+  case "$DIRSEL" in
+    both) DIRS="forward backward"; DIRSRC="--direction both";;
+    forward|backward) DIRS="$DIRSEL"; DIRSRC="--direction $DIRSEL";;
+    auto)
+      REC=$("$PY" -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("recommended_direction","")).lower())' \
+            "$SRC/metadata/direction/summary.json" 2>/dev/null)
+      case "$REC" in
+        forward|backward) DIRS="$REC"; DIRSRC="metadata/direction/summary.json";;
+        *) echo "  !! no recommended_direction in $SRC/metadata/direction/summary.json -- pass --direction forward|backward|both"
+           STATUS+=("$S SKIPPED(direction unknown)"); continue;;
+      esac;;
+  esac
+  ENDS=""
+  for d in $DIRS; do [ "$d" = forward ] && ENDS="$ENDS initial" || ENDS="$ENDS final"; done
+  echo "  directions: $DIRS  (from $DIRSRC)"
   if [ -n "$MEND" ]; then NF=$(( MEND - MSTART + 1 ))
   elif [ "$FRAMES" = "auto" ]; then NF=$(( NF_ALL - MSTART )); else NF=$FRAMES; fi
   if [ "$CAMS" = "auto" ] || [ "$CAMS" -gt "$NC_ALL" ]; then NC=$NC_ALL; else NC=$CAMS; fi
@@ -430,7 +453,7 @@ for S in $SCENES; do
 
   # ---- static 30k, both endpoints ------------------------------------
   if has_stage static; then
-    for END in initial final; do
+    for END in $ENDS; do
       [ "$END" = initial ] && CM="colmap" || CM="colmap_final"
       M="$OUT/static_bidi/$END"
       if [ "$FORCE_STATIC" != "1" ] && static_ready "$M"; then
@@ -454,8 +477,8 @@ for S in $SCENES; do
     done
   fi
 
-  # Everything below needs both models.
-  for END in initial final; do
+  # Everything below needs the endpoint model of every requested direction.
+  for END in $ENDS; do
     if ! static_ready "$OUT/static_bidi/$END"; then
       echo "  !! static/$END missing -- cannot run the dynamic stages"
       STATUS+=("$S SKIPPED(static/$END absent)"); continue 3
@@ -465,7 +488,7 @@ for S in $SCENES; do
   declare -A DEC1=() DEC2=()       # per-direction decisions, for the dry-run narration
   # ---- Phase 1 + coherence, both directions ---------------------------
   if has_stage phase1; then
-    for DIR in forward backward; do
+    for DIR in $DIRS; do
       [ "$DIR" = forward ] && END=initial || END=final
       P1="$BIDI/$DIR"
       SIG1="$SIGDIR/${S}_phase1_${DIR}.json"
@@ -508,7 +531,7 @@ for S in $SCENES; do
 
   # ---- rigid SE(3) Phase 2, both directions ---------------------------
   if has_stage phase2; then
-    for DIR in forward backward; do
+    for DIR in $DIRS; do
       [ "$DIR" = forward ] && END=initial || END=final
       P1="$BIDI/$DIR"
       P2="$BIDI/${DIR}_rigid"
@@ -556,7 +579,7 @@ for S in $SCENES; do
   # Opt-in. Joint type + geometry FIXED from Phase 2 joint identification;
   # only the per-frame displacement q_k is re-estimated on the RGB-D.
   if has_stage phase3; then
-    for DIR in forward backward; do
+    for DIR in $DIRS; do
       [ "$DIR" = forward ] && END=initial || END=final
       P2="$BIDI/${DIR}_rigid"
       P3="$BIDI/${DIR}_joint"

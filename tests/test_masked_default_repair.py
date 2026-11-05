@@ -138,7 +138,7 @@ def test_B_driver_dry_runs():
         def dry(*extra):
             r = subprocess.run(["bash", "run_bidirectional_all.sh", "-i", str(DATA), "-o", str(out),
                                 "--scenes", "fridge_10905", "--stages", "phase1 phase2 phase3",
-                                "--frames", "2", "--dry-run", *extra],
+                                "--frames", "2", "--dry-run", *(extra or ("--direction", "both"))],
                                cwd=REPO, capture_output=True, text=True, timeout=600)
             lines = [ln for ln in r.stdout.splitlines()
                      if any(t in ln for t in ("run_motion_coherence_support", "run_rigid_se3_pipeline",
@@ -148,11 +148,15 @@ def test_B_driver_dry_runs():
         check("[B] default: six stage commands", len(cmds) == 6, f"{len(cmds)} commands")
         check("[B] default: every stage gets --observation-mode masked-rgb-expected-quad",
               cmds and all("--observation-mode masked-rgb-expected-quad" in c for c in cmds))
-        txt, cmds = dry("--observation-mode", "original")
+        txt, cmds = dry("--direction", "both", "--observation-mode", "original")
         check("[B] original: every stage gets --observation-mode original, no mask source",
               len(cmds) == 6 and all("--observation-mode original" in c and "--mask-source" not in c
                                      for c in cmds), f"{len(cmds)} commands")
-        txt, cmds = dry("--mask-subdir", "no_such_masks")
+        txt, cmds = dry("--direction", "auto")
+        check("[B] no --direction: the dataset's recommended direction (fridge -> forward only)",
+              "directions: forward  (from metadata/direction/summary.json)" in txt and len(cmds) == 3
+              and all("--direction forward" in c for c in cmds), f"{len(cmds)} commands")
+        txt, cmds = dry("--direction", "both", "--mask-subdir", "no_such_masks")
         check("[B] missing masks: the scene is skipped before any stage",
               "SKIPPED(masks not ready)" in txt and not cmds)
         check("[B] dry runs wrote nothing into the output root",

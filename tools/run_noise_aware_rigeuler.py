@@ -42,6 +42,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))          # utils.*, estimator.* for the declared (ideal / assumed) sensor model
 PY = sys.executable
 EXT = (".png", ".jpg", ".jpeg")
 
@@ -118,8 +119,22 @@ def validate(a) -> dict:
                         "(status UNCALIBRATED)")
     if errs:
         raise SystemExit("validation failed:\n  - " + "\n  - ".join(errs))
-    # data completeness and time
-    for t in (S, E):
+    # direction(s): explicit flag, else the dataset's own recommendation (no guessing)
+    a.direction = getattr(a, "direction", "auto")
+    if a.direction in ("forward", "backward"):
+        dirs, dsrc = [a.direction], f"--direction {a.direction}"
+    elif a.direction == "both":
+        dirs, dsrc = ["forward", "backward"], "--direction both"
+    else:
+        f = src / "metadata" / "direction" / "summary.json"
+        rec = str(json.loads(f.read_text()).get("recommended_direction", "")).lower() if f.is_file() else ""
+        if rec not in ("forward", "backward"):
+            raise SystemExit(f"validation failed:\n  - no recommended_direction in {f}; pass --direction "
+                             "forward|backward|both")
+        dirs, dsrc = [rec], str(f)
+    ends = [("initial", S) if d == "forward" else ("final", E) for d in dirs]
+    # data completeness and time (only the endpoints the chosen direction(s) need)
+    for t in [fr for _e, fr in ends]:
         for c in cams:
             m = has_frame(src, c, t)
             if m:
@@ -154,6 +169,7 @@ def validate(a) -> dict:
     if errs:
         raise SystemExit("validation failed:\n  - " + "\n  - ".join(errs))
     return {"cameras": cams, "frames_available": [ids[0], ids[-1]], "timestamps_motion_s": ts,
+            "directions": dirs, "direction_source": dsrc, "endpoints": ends,
             "dt_s": (None if not ts else [round(b - a_, 6) for a_, b in zip(ts, ts[1:])][:3])}
 
 
@@ -203,6 +219,9 @@ def main(argv=None) -> int:
     ap.add_argument("--rgbd-noise-calibration", action="store_true")
     ap.add_argument("--calibration-start-frame", type=int, default=None)
     ap.add_argument("--calibration-end-frame", type=int, default=None)
+    ap.add_argument("--direction", choices=("auto", "forward", "backward", "both"), default="auto",
+                    help="pass(es) to run; auto (default) = the dataset's metadata/direction/summary.json "
+                         "recommended_direction, refused when absent")
     ap.add_argument("--motion-start-frame", type=int, required=True)
     ap.add_argument("--motion-end-frame", type=int, required=True)
     ap.add_argument("--bootstrap-mode", choices=("covariance_surface",), default="covariance_surface")
@@ -238,7 +257,8 @@ def main(argv=None) -> int:
     facts = validate(a)
     stages = a.stages.split()
     scene = src.name
-    print(f"validated {scene}: cameras {facts['cameras']}, motion [{a.motion_start_frame}, {a.motion_end_frame}], "
+    print(f"validated {scene}: directions {facts['directions']} ({facts['direction_source']}), "
+          f"cameras {facts['cameras']}, motion [{a.motion_start_frame}, {a.motion_end_frame}], "
           f"sensor {a.sensor_noise_model}, timestamps {a.frame_timestamps}")
     if not a.dry_run:
         out.mkdir(parents=True, exist_ok=True)
@@ -252,6 +272,7 @@ def main(argv=None) -> int:
                          "motion": [a.motion_start_frame, a.motion_end_frame],
                          "forward_canonical_frame": a.motion_start_frame,
                          "backward_canonical_frame": a.motion_end_frame},
+           "directions": facts["directions"], "direction_source": facts["direction_source"],
            "validation": facts, "config": vars(a),
            "code": {"commit": git("rev-parse", "HEAD"), "dirty": bool(git("status", "--porcelain", "--", "*.py", "*.sh"))},
            "inputs_sha256": {"colmap_cameras.bin": sha(src / "colmap" / "sparse" / "0" / "cameras.bin"),
@@ -310,7 +331,7 @@ def main(argv=None) -> int:
             "rgb_model_sigma": a.rgb_model_sigma, "depth_model_sigma": a.depth_model_sigma,
             "p0_prior_sigma_pos": a.p0_prior_sigma_pos, "p0_prior_sigma_rot": a.p0_prior_sigma_rot,
             "lr_scale": a.lr_scale, "seed": a.seed}
-    for end, frame in (("initial", a.motion_start_frame), ("final", a.motion_end_frame)):
+    for end, frame in facts["endpoints"]:
         d = out / "bootstrap" / end
         bsig = sc.bootstrap_signature(src, facts["cameras"], end, frame, sensor, bopt)
         if "bootstrap" in stages:
@@ -354,6 +375,7 @@ def main(argv=None) -> int:
         cmd = ["bash", "run_bidirectional_all.sh", "-i", src.parent, "-o", out / "pipeline", "--scenes", scene,
                "--stages", " ".join(ph), "--cameras", str(a.cameras or len(facts["cameras"])),
                "--motion-start-frame", a.motion_start_frame, "--motion-end-frame", a.motion_end_frame,
+               "--direction", ("both" if len(facts["directions"]) == 2 else facts["directions"][0]),
                "--frame-timestamps", a.frame_timestamps, *sensor_args, "--bootstrap-p0",
                "--p0-velocity-sigma", *a.p0_velocity_sigma,
                "--rgb-model-sigma", a.rgb_model_sigma, "--depth-model-sigma", a.depth_model_sigma,
