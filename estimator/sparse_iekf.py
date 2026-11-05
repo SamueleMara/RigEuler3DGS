@@ -187,6 +187,10 @@ class IEKFConfig:
     covariance_tangent_transport: bool = False
     # RigEuler3DGS_CODEX_Phase1_FirstReturn_Implementation_2026-11-05.md section 4.2: recorded
     # for the manifests; the observation itself is passed to iekf_frame_step(first_return=...)
+    # DIAGNOSTIC ONLY (wrong-camera audit, Gate C): {camera_name: ["rgb"|"depth"|"alpha", ...]}
+    # removes those channels of that camera from objective, RHS and curvature alike.
+    # None (default) = production.
+    debug_ablation: dict | None = None
     first_return_mode: str = "off"
     first_return_prior_path: str | None = None
     first_return_posterior: str = "unavailable"
@@ -480,6 +484,7 @@ def iekf_frame_step(
     observation_model=None,
     group_geometry: str = "canonical",
     first_return=None,
+    iteration_observer: Callable | None = None,
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
@@ -805,6 +810,14 @@ def iekf_frame_step(
         # ||b|| is the gradient of the true objective at this iterate; it is the
         # quantity that must go to zero for convergence to mean anything.
         grad_norm = float(solve_b.norm())
+        if iteration_observer is not None:
+            with torch.no_grad():
+                iteration_observer(
+                    iteration=j, x=x, x_prior=x_prior, P_prior=P_prior, Lambda_prior=Lambda_prior,
+                    lin=lin, prec=prec, alpha_terms=alpha_terms, terms=getattr(lin, "frame_terms", None),
+                    rhs_pose=rhs_pose, meas_normal=meas_normal, b=b, grouped=grouped, lm=lm,
+                    radius=radius, use_trust_region=cfg.use_trust_region, dt=dt, cfg=cfg_terms,
+                    M_blocks=M_blocks, first_return_depth=fr_depth, rgbd_gt=rgbd_gt, cameras=cameras)
         energy_before = energy
 
         # --- 8/9. Step control ---------------------------------------------

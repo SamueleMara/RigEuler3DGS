@@ -305,12 +305,20 @@ def phase1_camera_terms(views, prepared, cfg, model: MaskedObservationModel, mod
         c = j if cam_ids is None else cam_ids[j]
         mv_rgb = None if model_error is None else model_error.rgb_var[c]
         mv_d = None if model_error is None else model_error.depth_var[c]
+        # DIAGNOSTIC ONLY (cfg.debug_ablation, wrong-camera audit Gate C): a removed channel has
+        # no samples, so it leaves the energy, the RHS and the curvature together
+        abl = set((getattr(cfg, "debug_ablation", None) or {}).get(camera_name(cfg, c), ()))
+        rgb_valid = (ob.object_coverage > 0.5) if model.rgb_support == "foreground" else None
+        if "rgb" in abl:
+            rgb_valid = torch.zeros_like(ob.object_coverage, dtype=torch.bool)
+        dvalid = torch.zeros_like(ob.depth_valid) if "depth" in abl else ob.depth_valid
         out.append(camera_terms(v, ob.target(model.background_tensor(v.rgb.device)), ob.depth_observed,
-                                ob.depth_valid, cfg, rgb_robust=False, rgb_model_var=mv_rgb,
+                                dvalid, cfg, rgb_robust=False, rgb_model_var=mv_rgb,
                                 depth_model_var=mv_d, coverage=ob.object_coverage,
-                                kappa_fn=model.kappa if model.alpha_term else None,
-                                rgb_valid=(ob.object_coverage > 0.5) if model.rgb_support == "foreground" else None,
-                                camera=camera_name(cfg, c)))
+                                # an ablated alpha keeps the operator's shape with a ZERO weight
+                                kappa_fn=(None if not model.alpha_term else model.kappa if "alpha" not in abl
+                                          else (lambda p: torch.zeros_like(p[0] if p.dim() == 3 else p))),
+                                rgb_valid=rgb_valid, camera=camera_name(cfg, c)))
     return out
 
 

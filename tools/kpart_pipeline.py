@@ -1874,6 +1874,9 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         mseq = getattr(args, "masked_observation", None)
         obs_k = obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev)
         dt_k = _frame_dt(frames, ti, args.dt)
+        _obs_it = getattr(args, "phase1_iteration_observer", None)
+        if _obs_it is not None and hasattr(_obs_it, "begin_frame"):
+            _obs_it.begin_frame(ti, fid)          # read-only debug context (processing index, frame ids)
         if fixed_partition is not None and fixed_partition.canonical_hash() != part_hash:
             raise AssertionError("the canonical Phase-1 partition changed during the pass")
         new_state, P_new, diag = iekf_frame_step(seed, P, obs_k,
@@ -1882,6 +1885,7 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                                              partition=fixed_partition if fixed_partition is not None else partition,
                                              group_geometry="current" if fixed_partition is not None else "canonical",
                                              first_return=getattr(args, "first_return", None),
+                                             iteration_observer=getattr(args, "phase1_iteration_observer", None),
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
                                              observation_model=None if mseq is None else mseq.model)
