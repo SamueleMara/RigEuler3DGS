@@ -175,15 +175,25 @@ def run(cmd, log: Path, dry: bool, env=None) -> int:
     return p.returncode
 
 
-def bootstrap_reusable(d: Path, want: dict) -> bool | None:
-    """True reuse / None nothing there / False refuse (a different configuration)."""
-    m = d / "bootstrap_manifest.json"
-    if not d.exists() or not any(d.iterdir()):
-        return None
-    if not m.is_file():
-        return False
-    j = json.loads(m.read_text())
-    return all(j.get(k) == v for k, v in want.items())
+def cached_stage(name, d: Path, sig: dict, dry: bool, man: dict) -> str:
+    """'run' or 'reuse' for a stage directory under tools/stage_cache.py's contract;
+    SystemExit on a refusal (nothing deleted). A same-signature interrupted attempt is
+    moved aside (never deleted) and redone; in a dry run nothing is touched."""
+    import stage_cache as sc
+    decision, msg = sc.decide(d, sig)
+    if decision == "refuse":
+        raise SystemExit(f"  !! [{name}] {msg}")
+    if decision == "reuse":
+        print(f"  [{name}] reusing: {msg}")
+        man["stages"][name] = {"status": "reused", "signature_sha256": sc.sig_hash(sig)}
+        return "reuse"
+    if decision == "redo":
+        if dry:
+            print(f"  [{name}] {msg}: would be moved aside and redone (dry run: untouched)")
+        else:
+            moved = sc.move_aside(d)
+            print(f"  [{name}] {msg}: moved aside to {moved}, redoing")
+    return "run"
 
 
 def main(argv=None) -> int:
@@ -204,6 +214,18 @@ def main(argv=None) -> int:
     ap.add_argument("--rgb-model-sigma", type=float, default=0.0, help="declared model-mismatch sd (not sensor)")
     ap.add_argument("--depth-model-sigma", type=float, default=0.0, help="declared model-mismatch sd [m]")
     ap.add_argument("--p0-velocity-sigma", type=float, nargs=2, default=(1.0, 0.316227766))
+    # bootstrap / calibration settings, passed explicitly so the stage signatures see them
+    ap.add_argument("--knn", type=int, default=24)
+    ap.add_argument("--checkpoints", default="0,250,500,1000,2000")
+    ap.add_argument("--heldout-fraction", type=float, default=0.1)
+    ap.add_argument("--silhouette-sigma", type=float, default=0.1)
+    ap.add_argument("--thickness-weight", type=float, default=0.01)
+    ap.add_argument("--p0-prior-sigma-pos", type=float, default=0.05)
+    ap.add_argument("--p0-prior-sigma-rot", type=float, default=0.5)
+    ap.add_argument("--lr-scale", type=float, default=1.0)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--calibration-bins", type=int, default=8)
+    ap.add_argument("--calibration-min-bin-samples", type=int, default=200)
     ap.add_argument("--observation-mode", default="masked-rgb-expected-quad")
     ap.add_argument("--stages", default="calibration bootstrap phase1 phase2 phase3")
     ap.add_argument("--out", required=True)
@@ -243,57 +265,89 @@ def main(argv=None) -> int:
             (out / "run_manifest.json").write_text(json.dumps(man, indent=1, default=str))
     save()
     sensor_args = []
+    sys.path.insert(0, str(REPO / "tools"))
+    import stage_cache as sc
     # ---- calibration ---------------------------------------------------------
     if a.sensor_noise_model == "calibrated":
+        copt = {"bins": a.calibration_bins, "min_bin_samples": a.calibration_min_bin_samples}
+        csig = sc.calibration_signature(src, facts["cameras"], a.calibration_start_frame,
+                                        a.calibration_end_frame, copt)
+        cdir = out / "calibration"
         if "calibration" in stages:
-            if cal_json.is_file():
-                print(f"  [calibration] present, reusing {cal_json}")
-                man["stages"]["calibration"] = "reused"
-            else:
+            if cached_stage("calibration", cdir, csig, a.dry_run, man) == "run":
+                if not a.dry_run:
+                    sc.record(cdir, csig, "running")
                 rc = run([PY, "tools/calibrate_static_rgbd.py", "--source", src,
                           "--calibration-start-frame", a.calibration_start_frame,
                           "--calibration-end-frame", a.calibration_end_frame,
-                          "--cameras", ",".join(facts["cameras"]), "--out", out / "calibration"],
+                          "--cameras", ",".join(facts["cameras"]), "--bins", a.calibration_bins,
+                          "--min-bin-samples", a.calibration_min_bin_samples, "--out", cdir],
                          out / "logs" / "calibration.log", a.dry_run)
-                man["stages"]["calibration"] = "complete" if rc == 0 else "failed"
-                save()
-                if rc:
-                    return 1
-        elif not cal_json.is_file() and not a.dry_run:
-            raise SystemExit(f"--sensor-noise-model calibrated but {cal_json} does not exist and the calibration "
-                             "stage was not requested")
+                if not a.dry_run:
+                    bad = sc.validate("calibration", cdir, csig) if rc == 0 else ["calibration tool failed"]
+                    sc.record(cdir, csig, "complete" if not bad else "failed",
+                              {"problems": bad} if bad else None)
+                    man["stages"]["calibration"] = {"status": "complete" if not bad else "failed",
+                                                    "signature_sha256": sc.sig_hash(csig), "problems": bad}
+                    save()
+                    if bad:
+                        return 1
+        elif not a.dry_run and sc.decide(cdir, csig)[0] != "reuse":
+            raise SystemExit(f"--sensor-noise-model calibrated: {cdir} is not a complete calibration with "
+                             "this signature and the calibration stage was not requested")
         sensor_args = ["--sensor-model", cal_json]
-        if cal_json.is_file():
-            man["sensor_model_id"] = json.loads(cal_json.read_text()).get("sensor_model_id")
+        sid = json.loads(cal_json.read_text()).get("sensor_model_id") if cal_json.is_file() else "PENDING_CALIBRATION"
+        man["sensor_model_id"] = sid
+        sensor = {"policy": "calibrated", "sensor_model_id": sid}
     else:
         sensor_args = ["--sensor-policy", a.sensor_noise_model]
+        from utils.noise.sensor_model import declared_model
+        sensor = {"policy": a.sensor_noise_model, "sensor_model_id": declared_model(a.sensor_noise_model).model_id}
     # ---- bootstrap: two independent endpoints --------------------------------
+    bopt = {"num_gaussians": a.num_gaussians, "knn": a.knn, "refine_iters": a.refine_iters,
+            "checkpoints": a.checkpoints, "heldout_fraction": a.heldout_fraction,
+            "silhouette_sigma": a.silhouette_sigma, "thickness_weight": a.thickness_weight,
+            "rgb_model_sigma": a.rgb_model_sigma, "depth_model_sigma": a.depth_model_sigma,
+            "p0_prior_sigma_pos": a.p0_prior_sigma_pos, "p0_prior_sigma_rot": a.p0_prior_sigma_rot,
+            "lr_scale": a.lr_scale, "seed": a.seed}
     for end, frame in (("initial", a.motion_start_frame), ("final", a.motion_end_frame)):
         d = out / "bootstrap" / end
+        bsig = sc.bootstrap_signature(src, facts["cameras"], end, frame, sensor, bopt)
         if "bootstrap" in stages:
-            want = {"endpoint_frame": frame, "num_gaussians": None, "refine_iters": a.refine_iters,
-                    "sensor_policy": a.sensor_noise_model}
-            want.pop("num_gaussians")
-            r = bootstrap_reusable(d, want)
-            if r is True:
-                print(f"  [bootstrap/{end}] present with the same configuration, reusing")
-                man["stages"][f"bootstrap_{end}"] = "reused"
-            elif r is False:
-                raise SystemExit(f"{d} holds a bootstrap with a different configuration; use a new --out")
-            else:
+            if cached_stage(f"bootstrap_{end}", d, bsig, a.dry_run, man) == "run":
+                if not a.dry_run:
+                    sc.record(d, bsig, "running")
                 rc = run([PY, "tools/train_tracking_bootstrap.py", "--source", src, "--frame", frame,
                           "--endpoint", end, "--out", d, *sensor_args,
-                          "--num-gaussians", a.num_gaussians, "--refine-iters", a.refine_iters,
-                          "--rgb-model-sigma", a.rgb_model_sigma, "--depth-model-sigma", a.depth_model_sigma],
+                          "--num-gaussians", a.num_gaussians, "--knn", a.knn, "--refine-iters", a.refine_iters,
+                          "--checkpoints", a.checkpoints, "--heldout-fraction", a.heldout_fraction,
+                          "--silhouette-sigma", a.silhouette_sigma, "--thickness-weight", a.thickness_weight,
+                          "--rgb-model-sigma", a.rgb_model_sigma, "--depth-model-sigma", a.depth_model_sigma,
+                          "--p0-prior-sigma-pos", a.p0_prior_sigma_pos, "--p0-prior-sigma-rot", a.p0_prior_sigma_rot,
+                          "--lr-scale", a.lr_scale, "--seed", a.seed],
                          out / "logs" / f"bootstrap_{end}.log", a.dry_run)
-                man["stages"][f"bootstrap_{end}"] = "complete" if rc == 0 else "failed"
-                save()
-                if rc:
-                    return 1
-        # the driver reads the endpoint models from <root>/<scene>/static_bidi/<end> (copies: exFAT)
+                if not a.dry_run:
+                    bad = sc.validate("bootstrap", d, bsig) if rc == 0 else ["bootstrap tool failed"]
+                    sc.record(d, bsig, "complete" if not bad else "failed", {"problems": bad} if bad else None)
+                    man["stages"][f"bootstrap_{end}"] = {"status": "complete" if not bad else "failed",
+                                                         "signature_sha256": sc.sig_hash(bsig), "problems": bad}
+                    save()
+                    if bad:
+                        return 1
+        # the driver reads the endpoint models from <root>/<scene>/static_bidi/<end> (copies: exFAT);
+        # an existing copy must be byte-identical to this bootstrap, never silently stale
         dst = out / "pipeline" / scene / "static_bidi" / end
-        if not a.dry_run and d.is_dir() and not dst.exists():
-            shutil.copytree(d, dst, ignore=shutil.ignore_patterns("source_responsibility.npz"))
+        if not a.dry_run and d.is_dir():
+            keys = [f"point_cloud/iteration_{a.refine_iters}/point_cloud.ply", "geometry_information.npz",
+                    "bootstrap_manifest.json"]
+            if dst.exists():
+                stale = [k for k in keys if sc.sha_file(dst / k) != sc.sha_file(d / k)]
+                if stale:
+                    raise SystemExit(f"{dst} differs from {d} ({', '.join(stale)}): a stale endpoint copy -- "
+                                     "choose a new --out")
+            else:
+                shutil.copytree(d, dst, ignore=shutil.ignore_patterns("source_responsibility.npz",
+                                                                      "stage_signature.json*"))
     # ---- Phase 1/2/3 through the driver ---------------------------------------
     ph = [s for s in stages if s in ("phase1", "phase2", "phase3")]
     if ph:

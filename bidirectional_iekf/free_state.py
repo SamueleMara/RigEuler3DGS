@@ -110,8 +110,9 @@ class FullStateRecorder:
         return torch.stack([store[t] for t in range(len(order))])
 
     def write(self, out_dir, *, direction: str, canonical_endpoint: str,
-              processing_order_original_indices, dt_seconds: float,
+              processing_order_original_indices, dt_seconds: float | None,
               dt_is_measured: bool, model_path: str, source_path: str,
+              dt_intervals_seconds=None,
               ply_sha256: str = "", scene: str = "", extra: dict | None = None
               ) -> dict:
         """Write the state in ORIGINAL chronological order."""
@@ -209,8 +210,15 @@ class FullStateRecorder:
             "rotation_convention": ("R+ = Exp(hat(dphi)) @ R, the left/spatial "
                                     "SO(3) convention used throughout"),
             "rate_convention": rate_convention,
-            "rates_are_per": "second, at the dt recorded below",
-            "dt_seconds": float(dt_seconds),
+            "rates_are_per": ("second, over the measured intervals recorded below"
+                              if dt_intervals_seconds is not None else
+                              "second, at the dt recorded below"),
+            "dt_seconds": (None if dt_seconds is None else float(dt_seconds)),
+            "dt_intervals_seconds": (None if dt_intervals_seconds is None
+                                     else [float(x) for x in dt_intervals_seconds]),
+            "dt_intervals_order": ("original chronological: interval k is between "
+                                   "original frames k and k+1 of the window"
+                                   if dt_intervals_seconds is not None else None),
             "dt_is_measured": bool(dt_is_measured),
             "dt_note": ("the dataset's job_config_resolved.yaml records "
                         "fps: null and duration_sec: null, so dt is a "

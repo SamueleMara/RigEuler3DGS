@@ -441,18 +441,28 @@ def main() -> int:
     # time, so a backward run's stored twist is a reverse-time quantity and
     # reversing the array would keep the wrong sign. The chronological twist
     # is RECOMPUTED from the restored poses (section E).
-    if ctx.is_backward:
-        from utils.bidirectional_time import chronological_twists
-        chrono_xi = chronological_twists(
-            torch.from_numpy(_chrono(poses)).double(), float(ns.dt))
-        np.save(p2 / "chronological_twists.npy",
-                chrono_xi.cpu().numpy())
+    # Durations come from the MEASURED time base (processing order), never from
+    # ns.dt: chronological interval t is between original frames t and t+1, i.e. the
+    # processing intervals read in reverse for a backward run. Written for both
+    # directions so forward and backward exports compare row by row.
+    from utils.bidirectional_time import chronological_twists
+    proc_iv = (time_s[1:] - time_s[:-1]).double()
+    chrono_iv = proc_iv.flip(0) if ctx.is_backward else proc_iv
+    chrono_xi = chronological_twists(torch.from_numpy(_chrono(poses)).double(), chrono_iv)
+    np.save(p2 / "chronological_twists.npy", chrono_xi.cpu().numpy())
     # [v (m/s), omega (rad/s)] per processing step, elapsed time in time_base.json
     np.save(p2 / "velocities.npy",
             torch.cat([part.v, part.omega], dim=1).numpy())
+    _iv = (time_s[1:] - time_s[:-1]).tolist()
+    _uniform = bool(_iv) and (max(_iv) - min(_iv)) <= 1e-9 * max(abs(max(_iv)), 1.0)
     _json(p2 / "time_base.json", {
-        "dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+        "dt_s": (_iv[0] if _uniform else None),
+        "uniform": _uniform,
+        "intervals_s_processing_order": _iv,
+        "intervals_s_chronological": (_iv[::-1] if ctx.is_backward else _iv),
         "time_s_processing_order": time_s.tolist(),
+        "chronological_twists": "phase2_rigid/chronological_twists.npy, [v; omega] per chronological step, "
+                                "divided by the measured chronological interval",
         "rate_units": {"v": "m/s", "omega": "rad/s"},
         "source": "dataset loader frame interval (frames_raw[k][2] == dt_used_s)"})
     np.save(p2 / "pose_covariances.npy",
@@ -622,7 +632,7 @@ def main() -> int:
         "gt_evaluation": ev_gt,
         "renders": renders,
         "runtime_s": time.perf_counter() - t_start,
-        "time_base": {"dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+        "time_base": {"dt_s": (_iv[0] if _uniform else None), "uniform": _uniform,
                       "rate_units": "v m/s, omega rad/s", "file": "phase2_rigid/time_base.json"},
         "no_axis_in_rgbd_optimizer": True,
         "note": ("section 49: the renderer was asked only which rigid pose "

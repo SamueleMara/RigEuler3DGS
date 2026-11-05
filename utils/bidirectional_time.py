@@ -68,14 +68,22 @@ def chronological_twists(poses, dt):
     order first, then call this. Returns [T,6] with [rho; phi] per frame; the
     last entry repeats the previous one so the array lines up with the poses,
     which is a padding convention, not a measurement.
+
+    `dt` is one positive duration (uniform sampling) or the [T-1] positive
+    CHRONOLOGICAL durations time[t+1] - time[t] (measured, possibly nonuniform):
+    xi[t] = Log(T[t+1] T[t]^-1) / (time[t+1] - time[t]).
     """
     eta, _, _ = relative_increments(poses)
-    dt = float(dt)
-    if dt <= 0.0:
+    d = torch.as_tensor(dt, dtype=eta.dtype, device=eta.device)
+    if d.dim() == 0:
+        d = d.expand(eta.shape[0])
+    elif d.shape != (eta.shape[0],):
+        raise ValueError(f"dt must be a scalar or [{eta.shape[0]}] durations, got shape {tuple(d.shape)}")
+    if not bool(torch.isfinite(d).all()) or not bool((d > 0).all()):
         raise ValueError(
-            f"dt must be positive, got {dt}. The backward pass reverses the "
+            f"dt must be positive, got {d.tolist()}. The backward pass reverses the "
             "ORDER and keeps dt positive; it never negates time.")
-    xi = eta / dt
+    xi = eta / d[:, None]
     return torch.cat([xi, xi[-1:]], dim=0)
 
 

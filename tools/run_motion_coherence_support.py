@@ -397,11 +397,22 @@ def main() -> int:
                     for chunk in iter(lambda: handle.read(1 << 20), b""):
                         h.update(chunk)
                 digest = h.hexdigest()
+            # measured capture intervals when the loader read timestamps (chronological,
+            # interval k between original frames k and k+1); otherwise the declared dt
+            _recs = sorted(frame_ids["frames"], key=lambda r: r["dataset_frame_index"])
+            if all("timestamp_s" in r for r in _recs):
+                _ts = [float(r["timestamp_s"]) for r in _recs]
+                _rec_iv = [b - a for a, b in zip(_ts, _ts[1:])]
+                _rec_dt = (_rec_iv[0] if _rec_iv and max(_rec_iv) - min(_rec_iv) <= 1e-9 else None)
+                _rec_measured = True
+            else:
+                _rec_iv, _rec_dt, _rec_measured = None, float(ns.dt), False
             fs = recorder.write(
                 args.full_state_out, direction=ctx.direction,
                 canonical_endpoint=ctx.endpoint,
                 processing_order_original_indices=order,
-                dt_seconds=float(ns.dt), dt_is_measured=False,
+                dt_seconds=_rec_dt, dt_is_measured=_rec_measured,
+                dt_intervals_seconds=_rec_iv,
                 model_path=str(model), source_path=str(source),
                 ply_sha256=digest, scene=args.scene,
                 extra={"max_gaussians": int(args.max_gaussians),

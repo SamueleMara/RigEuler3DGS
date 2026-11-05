@@ -419,6 +419,7 @@ def from_args(args, source, frames_raw, frame_ids, cfg=None) -> MaskedSequence |
     c = seq.counts()
     print(f"  observation mode {model.mode}: render background {list(model.background)}, masks {root}")
     print(f"    {c['frames']} frames x {c['cameras']} cameras, foreground {100 * c['foreground_fraction']:.1f}% "
-          f"of pixels; RGB sigma {model.rgb_sigma} (fixed W)"
+          f"of pixels; RGB sigma {model.rgb_sigma} (fixed W; replaced by each camera's own "
+          f"sigma when a calibrated sensor model is configured)"
           + (f", kappa = 1/(4 sigma^2) = {0.25 / model.rgb_sigma ** 2:.4g}" if model.alpha_term and model.rgb_sigma else ""))
     return seq

@@ -1837,14 +1837,24 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             prior.append(prior_block.detach().cpu())
         vis_seq = getattr(args, "visibility_constraint", None)
         mseq = getattr(args, "masked_observation", None)
-        new_state, P_new, diag = iekf_frame_step(seed, P,
-                                             obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev),
+        obs_k = obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev)
+        dt_k = _frame_dt(frames, ti, args.dt)
+        new_state, P_new, diag = iekf_frame_step(seed, P, obs_k,
                                              cameras,
-                                             dt=_frame_dt(frames, ti, args.dt), cfg=bcfg,
+                                             dt=dt_k, cfg=bcfg,
                                              partition=partition,
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
                                              observation_model=None if mseq is None else mseq.model)
+        audit = getattr(args, "phase1_audit", None)
+        if audit is not None:
+            # READ-ONLY diagnostic (tools/audit_calibrated_phase1.py): it receives clones of
+            # the covariances and must not touch the states; nothing it returns is used.
+            with torch.no_grad():
+                audit(ti=ti, fid=fid, prior_state=seed, P_prev=P.detach().clone(), state=new_state,
+                      P_post=P_new.detach().clone(), diag=diag, obs=obs_k, cfg=bcfg, dt=dt_k,
+                      cameras=cameras, observation_model=None if mseq is None else mseq.model,
+                      canonical=truth)
         if mseq is not None:
             ev = [r for r in diag.rows if r.get("event") in ("initial", "accepted", "rejected")]
             acc = [r for r in ev if r.get("event") == "accepted"]

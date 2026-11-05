@@ -410,7 +410,9 @@ def main(argv=None) -> int:
         "support": {"file": str(p2 / "support_coherence" / "support.json"), "members": int(members.numel())},
         "config": {"iters": args.iters, "cg_iters": args.cg_iters, "sigma_qddot": args.sigma_qddot,
                    "sigma_qddot_units": "(m or rad)/s^(3/2), white-acceleration density",
-                   "dt_s": float(time_s[1] - time_s[0]) if T > 1 else None,
+                   "dt_s": (float(time_s[1] - time_s[0]) if T > 1 and bool(torch.allclose(
+                       time_s[1:] - time_s[:-1], time_s[1:2] - time_s[:1], rtol=1e-9, atol=0)) else None),
+                   "intervals_s_processing_order": (time_s[1:] - time_s[:-1]).tolist(),
                    "time_s_processing_order": time_s.tolist(),
                    "rate_units": "qdot in m/s (prismatic) or rad/s (revolute)",
                    "cameras": ncam, "frames": T,

@@ -248,3 +248,56 @@ def geometry_covariance(fisher: torch.Tensor, prior_sigma_pos: float, prior_sigm
             "prior": {"sigma_pos_m": prior_sigma_pos, "sigma_rot_rad": prior_sigma_rot},
             "approximation": ("per-Gaussian 6x6 blocks of (F + Lambda_prior)^-1; inter-Gaussian and "
                               "shared-camera covariance are NOT represented")}
+
+
+# ---------------------------------------------------------------------------
+# bootstrap refinement objective (pure; CPU-testable)
+# ---------------------------------------------------------------------------
+def pixel_partition(height: int, width: int, heldout_fraction: float, seed: int, camera_index: int):
+    """Deterministic, disjoint (train, held) split of the WHOLE image: drawn once per
+    camera from (seed, camera_index) and never resampled. Returns two bool [H,W]."""
+    rng = np.random.default_rng([int(seed), int(camera_index)])
+    held = rng.random((height, width)) < float(heldout_fraction)
+    return ~held, held
+
+
+def bootstrap_loss_terms(rgb_render, alpha, invdepth_render, obs: dict, S, *, silhouette_sigma: float,
+                         nu: float = 5.0) -> dict:
+    """The bootstrap refinement terms on ONE pixel partition S ([H,W] bool).
+
+    Supports (spec 4c88725 surgical review, section 1):
+        alpha   all of S, foreground AND background:
+                E_alpha = sum_{p in S} (A - M)^2 / (2 sigma_A^2 |S|)
+                -- a soft loss on the hard binary object mask; opacity spilled onto
+                M = 0 pixels is penalised (it was not, when S lay inside M)
+        RGB     S AND M:  1/2 sum W_rgb |C - I|^2 / |S AND M|
+        depth   S AND M AND observed-valid AND A > 0.5:
+                Student-t NLL of inverse depth, Var(1/z) = Var(z)/z^4
+    Background rays and invalid observations never enter RGB or depth. A term whose
+    support is empty is exactly 0 and reported with count 0 (never NaN).
+
+    obs: rgb [3,H,W], M [H,W] float in {0,1}, V [H,W] bool valid depth, invz, var_invz [H,W],
+         w_rgb [3,1,1] fixed RGB precision."""
+    S = S.bool()
+    M = obs["M"]
+    Mb = M > 0.5
+    zero = alpha.sum() * 0.0
+    n_a = int(S.sum())
+    e_a = ((alpha - M) ** 2)[S].sum() / (2.0 * silhouette_sigma ** 2 * n_a) if n_a else zero
+    Srgb = S & Mb
+    n_r = int(Srgb.sum())
+    e_r = (0.5 * (obs["w_rgb"] * (rgb_render - obs["rgb"]) ** 2).sum(0))[Srgb].sum() / n_r if n_r else zero
+    inv = invdepth_render / alpha.clamp_min(1e-3)
+    Sd = Srgb & obs["V"].bool() & (alpha.detach() > 0.5)
+    n_d = int(Sd.sum())
+    if n_d:
+        z2 = (inv - obs["invz"]) ** 2 / obs["var_invz"]
+        e_d = (0.5 * (nu + 1.0) * torch.log1p(z2 / nu))[Sd].sum() / n_d
+    else:
+        e_d = zero
+    with torch.no_grad():
+        bg = S & ~Mb
+        stats = {"pixels": n_a, "foreground": int(Srgb.sum()), "background": int(bg.sum()), "depth": n_d,
+                 "foreground_miss": float((M - alpha).clamp_min(0)[Srgb].mean()) if n_r else None,
+                 "offmask_opacity": float(alpha[bg].mean()) if int(bg.sum()) else None}
+    return {"rgb": e_r, "alpha": e_a, "depth": e_d, "stats": stats}

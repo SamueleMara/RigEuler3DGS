@@ -164,9 +164,10 @@ def main(argv=None) -> int:
     torch.manual_seed(a.seed)
     np.random.seed(a.seed)
     src, out = Path(a.source), Path(a.out)
-    if out.exists() and any(out.iterdir()):
+    # a new directory; the orchestrator's 'running' stage_signature.json is the only allowed content
+    if out.exists() and any(p.name != "stage_signature.json" for p in out.iterdir()):
         raise SystemExit(f"{out} exists and is not empty; give a new directory")
-    out.mkdir(parents=True)
+    out.mkdir(parents=True, exist_ok=True)
 
     # ---- sensor model ------------------------------------------------------
     from estimator.sparse_iekf import IEKFConfig
@@ -217,16 +218,17 @@ def main(argv=None) -> int:
     names = [str(c.image_name).split("/")[0] for c in cams_s]
     if names != [c[0] for c in cams]:
         raise SystemExit(f"camera order mismatch {names} vs {[c[0] for c in cams]}")
-    rng = np.random.default_rng(a.seed)
+    from estimator.surface_bootstrap import bootstrap_loss_terms, pixel_partition
     data = []
-    for name, cam in zip(names, cams_s):
+    for ci, (name, cam) in enumerate(zip(names, cams_s)):
         rgb, dep, msk = obs[name]
-        held = (rng.random(msk.shape) < a.heldout_fraction) & msk
+        # one seeded split of the WHOLE image per camera, fixed for the whole refinement
+        train_px, held = pixel_partition(msk.shape[0], msk.shape[1], a.heldout_fraction, a.seed, ci)
         t = lambda x: torch.as_tensor(x, device="cuda")                       # noqa: E731
         z = np.where(np.isfinite(dep) & (dep > 0), dep, 1.0)
         vz = depth_var(name, z)
         data.append({"cam": cam, "name": name, "rgb": t(rgb).permute(2, 0, 1), "M": t(msk.astype(np.float32)),
-                     "train": t((msk & ~held).astype(np.float32)), "held": t(held.astype(np.float32)),
+                     "train": t(train_px), "held": t(held),
                      "invz": t((1.0 / z).astype(np.float32)), "V": t(np.isfinite(dep) & (dep > 0)),
                      "var_invz": t((vz / z ** 4).astype(np.float32)),
                      "w_rgb": t((1.0 / rgb_var(name)).astype(np.float32)).reshape(3, 1, 1)})
@@ -240,31 +242,34 @@ def main(argv=None) -> int:
     ones = None
     nu = 5.0
 
-    def losses(dd, keyset):
+    def losses(dd, keyset, with_stats=False):
         nonlocal ones
         cam = dd["cam"]
         r = render(cam, gs, pipe, bg0)
         if ones is None or ones.shape[0] != gs.get_xyz.shape[0]:
             ones = torch.ones((gs.get_xyz.shape[0], 3), device="cuda")
         A = render(cam, gs, pipe, bg0, override_color=ones)["render"][0]
-        W = dd[keyset]
-        lr = 0.5 * (W[None] * dd["w_rgb"] * (r["render"] - dd["rgb"]) ** 2).sum() / W.sum().clamp_min(1)
-        ls = 0.5 * (W * (A - dd["M"]) ** 2).sum() / (a.silhouette_sigma ** 2 * W.sum().clamp_min(1))
-        inv = r["depth"].squeeze(0) / A.clamp_min(1e-3)
-        dv = (W > 0) & dd["V"] & (A > 0.5)
-        z2 = (inv - dd["invz"]) ** 2 / dd["var_invz"]
-        ld = (0.5 * (nu + 1) * torch.log1p(z2 / nu))[dv].sum() / dv.sum().clamp_min(1)
-        return lr, ls, ld
+        t_ = bootstrap_loss_terms(r["render"], A, r["depth"].squeeze(0), dd, dd[keyset],
+                                  silhouette_sigma=a.silhouette_sigma, nu=nu)
+        out = (t_["rgb"], t_["alpha"], t_["depth"])
+        return (out, t_["stats"]) if with_stats else out
 
     ckpts = sorted({int(x) for x in a.checkpoints.split(",") if int(x) <= a.refine_iters} | {a.refine_iters})
     report = []
 
     def evaluate(it):
         with torch.no_grad():
-            parts = [tuple(float(x) for x in losses(dd, "held")) for dd in data]
-        rep = {"iteration": it, "heldout_rgb": float(np.mean([p[0] for p in parts])),
-               "heldout_silhouette": float(np.mean([p[1] for p in parts])),
-               "heldout_depth_nll": float(np.mean([p[2] for p in parts])), "num_gaussians": int(gs.get_xyz.shape[0])}
+            got = [losses(dd, part, with_stats=True) for part in ("held", "train") for dd in data]
+        n = len(data)
+        held, train = got[:n], got[n:]
+        rep = {"iteration": it, "heldout_rgb": float(np.mean([float(p[0][0]) for p in held])),
+               "heldout_silhouette": float(np.mean([float(p[0][1]) for p in held])),
+               "heldout_depth_nll": float(np.mean([float(p[0][2]) for p in held])),
+               "train_rgb": float(np.mean([float(p[0][0]) for p in train])),
+               "train_silhouette": float(np.mean([float(p[0][1]) for p in train])),
+               "train_depth_nll": float(np.mean([float(p[0][2]) for p in train])),
+               "heldout_per_camera": [{"camera": dd["name"], **p[1]} for dd, p in zip(data, held)],
+               "num_gaussians": int(gs.get_xyz.shape[0])}
         report.append(rep)
         print(f"  it {it:5d}: held-out rgb {rep['heldout_rgb']:.4g}  sil {rep['heldout_silhouette']:.4g}  "
               f"depth NLL {rep['heldout_depth_nll']:.4g}")
