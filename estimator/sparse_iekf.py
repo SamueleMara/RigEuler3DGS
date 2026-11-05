@@ -179,6 +179,11 @@ class IEKFConfig:
     supernode_count: int | None = None
     supernode_knn: int = 8
     supernode_seed: int = 0
+    # RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md section 5 E5: express the
+    # prior information in the tangent at the ACCEPTED state before adding the Fisher
+    # (Lambda_post = J^T Lambda_prior J + F, J = blockdiag(I, J_l(a)^-1, I, I),
+    # a = Log(R R_prior^T)). Off = the legacy Lambda_prior + F.
+    covariance_tangent_transport: bool = False
 
     # ---- V2 section 6: support inference before joint reduction --------
     # On a real scene only part of the cloud moves, so the joint must be fitted
@@ -450,6 +455,7 @@ def iekf_frame_step(
     information_observer: Callable | None = None,
     visibility=None,
     observation_model=None,
+    group_geometry: str = "canonical",
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
@@ -462,7 +468,15 @@ def iekf_frame_step(
     the measurement is masked RGB + (expected mode) 1/2 kappa (A - M)^2 + depth on
     the object only -- in the energy, the RHS, the normal operator, the Fisher
     preconditioner and the posterior alike.
+
+    ``group_geometry`` (with a supplied ``partition``): "canonical" evaluates the
+    group tangent's lever arms mu_i - c_c on the partition's canonical means (the
+    original behaviour); "current" keeps the canonical MEMBERSHIP but evaluates the
+    lever arms on this frame's predicted means and member centroids, which is the
+    rigid-motion tangent of a group that has already rotated away from canonical.
     """
+    if group_geometry not in ("canonical", "current"):
+        raise ValueError(f"group_geometry must be 'canonical' or 'current', not {group_geometry!r}")
     cfg = cfg or IEKFConfig()
     if cfg.cache_derivative_basis:
         raise NotImplementedError(
@@ -580,7 +594,17 @@ def iekf_frame_step(
             x_prior.mu, target_size=cfg.supernode_target_size,
             num_supernodes=cfg.supernode_count, knn=cfg.supernode_knn,
             seed=cfg.supernode_seed)
-        grouped = GroupedObservation(linearization=None, partition=part)
+        if partition is not None and group_geometry == "current":
+            sid = part.supernode_id.long()
+            if bool((sid < 0).any()):
+                raise ValueError("group_geometry='current' needs every Gaussian assigned to a group")
+            cnt = torch.bincount(sid, minlength=part.num_supernodes).clamp_min(1).to(x_prior.mu.dtype)
+            cent = torch.zeros((part.num_supernodes, 3), device=x_prior.mu.device, dtype=x_prior.mu.dtype)
+            cent.index_add_(0, sid, x_prior.mu)
+            grouped = GroupedObservation(linearization=None, partition=part, canonical_means=x_prior.mu,
+                                         centroids=cent / cnt[:, None])
+        else:
+            grouped = GroupedObservation(linearization=None, partition=part)
         group_metric = ScalingMetric.from_physical_scales(
             (part.num_supernodes, STATE_DIM), x.mu.device, x.mu.dtype,
             sigma_mu=cfg.scale_sigma_mu, sigma_phi=cfg.scale_sigma_phi,
@@ -991,7 +1015,21 @@ def iekf_frame_step(
     # --- 11. Approximate posterior marginals, ONCE (section 17) ------------
     prec, alpha_terms = _terms(lin)
     fisher_pose = measurement_operators(lin, prec, alpha_terms)[2]()
-    Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
+    transport_info = {"covariance_tangent_transport": bool(cfg.covariance_tangent_transport)}
+    if cfg.covariance_tangent_transport:
+        # Lambda_prior lives in the tangent at x_prior; the Fisher in the tangent at x.
+        # A left error e at x maps to the prior coordinate a + J_l(a)^-1 e (BCH, first
+        # order in e), so the prior information seen from x is J^T Lambda_prior J.
+        from .manifold import so3_left_jacobian_inverse
+        a = boxminus(x, x_prior)[:, 3:6].double()
+        J = torch.eye(STATE_DIM, dtype=torch.float64, device=a.device).repeat(a.shape[0], 1, 1)
+        J[:, 3:6, 3:6] = so3_left_jacobian_inverse(a)
+        Lp = J.transpose(1, 2) @ Lambda_prior.double() @ J
+        Lambda_prior_x = (0.5 * (Lp + Lp.transpose(1, 2))).to(Lambda_prior.dtype)
+        transport_info["max_rotation_rad"] = float(a.norm(dim=1).max()) if a.numel() else 0.0
+        Lambda_post = approximate_posterior_information(Lambda_prior_x, fisher_pose)
+    else:
+        Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
     # Invert in float64 and project back onto the PSD cone. The measurement
     # Fisher spans ~1e6 between a well-seen and an unseen direction, so the
     # block condition number is past what float32 can invert: without this the
@@ -1028,6 +1066,12 @@ def iekf_frame_step(
     P_post = P_post.to(Lambda_post.dtype)
 
     diag.add(iteration=-2, event="posterior",
+             # section 5 E1/E4: per-Gaussian (Lambda_prior,i + F_ii)^-1 blocks, not the exact
+             # marginal of the coupled problem; uncertified unless the solve converged
+             approximation="BLOCK_INFORMATION_APPROXIMATION",
+             posterior_status=("LOCAL_HESSIAN_AT_CONVERGED_STATE" if stop_reason == "converged"
+                               else "UNCERTIFIED_NOT_CONVERGED"),
+             **transport_info,
              posterior_inverse_fallbacks=int(post_diag.n_fallback),
              mean_fisher_trace=float(fisher_pose.diagonal(dim1=1, dim2=2).sum(-1).mean()),
              posterior_psd_blocks_floored=psd_diag["blocks_floored"],

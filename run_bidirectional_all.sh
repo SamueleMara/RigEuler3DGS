@@ -43,6 +43,12 @@
 # --bootstrap-p0            Phase-1 pose prior from static_bidi/<end>/geometry_information.npz
 #                           (tools/train_tracking_bootstrap.py), velocity prior from
 # --p0-velocity-sigma V W   (declared, m/s rad/s)
+# Phase 1 only (RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md):
+# --phase1-partition canonical|per-frame   supernodes fixed from the endpoint (default) or
+#                           the legacy per-frame regrouping (control)
+# --phase1-covariance-transport            EXPERIMENTAL Lie-tangent transport of the prior
+# --phase1-alpha-precision coupled|declared, --phase1-alpha-sd S,
+# --phase1-rgb-support full|foreground     EXPERIMENTAL likelihood arms (masked mode)
 # --cameras N|auto  cameras used by Phase 1/2/3 (default 8, the setting of the
 #                   stable results; auto = every rgb/cam_* folder). Static
 #                   training always uses every camera of the COLMAP model.
@@ -123,6 +129,11 @@ while [ $# -gt 0 ]; do
     --depth-model-sigma)      DEPMS="$2"; shift 2;;
     --bootstrap-p0)           BOOTP0=1; shift;;
     --p0-velocity-sigma)      P0V=("$2" "$3"); shift 3;;
+    --phase1-partition)       P1PART="$2"; shift 2;;
+    --phase1-covariance-transport) P1TRANS=1; shift;;
+    --phase1-alpha-precision) P1ALPHA="$2"; shift 2;;
+    --phase1-alpha-sd)        P1ALPHASD="$2"; shift 2;;
+    --phase1-rgb-support)     P1RGBSUP="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -157,6 +168,14 @@ RGBMS=${RGBMS:-0}; DEPMS=${DEPMS:-0}; BOOTP0=${BOOTP0:-0}
 if [ -n "$SENSOR" ] && [ ! -f "$SENSOR" ]; then echo "--sensor-model $SENSOR does not exist" >&2; exit 2; fi
 SENSOR_SHA=$( [ -n "$SENSOR" ] && sha256sum "$SENSOR" | cut -c1-64 || echo none )
 # shared by the three runners (estimator/run_config.py)
+P1PART=${P1PART:-canonical}; P1TRANS=${P1TRANS:-0}
+P1ALPHA=${P1ALPHA:-coupled}; P1ALPHASD=${P1ALPHASD:-}; P1RGBSUP=${P1RGBSUP:-full}
+case "$P1PART" in canonical|per-frame) ;; *) echo "--phase1-partition must be canonical|per-frame" >&2; exit 2;; esac
+case "$P1ALPHA" in coupled|declared) ;; *) echo "--phase1-alpha-precision must be coupled|declared" >&2; exit 2;; esac
+case "$P1RGBSUP" in full|foreground) ;; *) echo "--phase1-rgb-support must be full|foreground" >&2; exit 2;; esac
+P1ARGS=(--phase1-partition "$P1PART" --alpha-precision "$P1ALPHA" --rgb-support "$P1RGBSUP")
+[ -n "$P1ALPHASD" ] && P1ARGS+=(--alpha-sd "$P1ALPHASD")
+[ "$P1TRANS" = 1 ] && P1ARGS+=(--phase1-covariance-transport)
 RCARGS=(--motion-start-frame "$MSTART" ${MEND:+--motion-end-frame "$MEND"} --frame-timestamps "$TSTAMPS"
         --sensor-policy "$SPOL" ${SENSOR:+--sensor-model "$SENSOR"}
         --rgb-model-sigma "$RGBMS" --depth-model-sigma "$DEPMS")
@@ -374,7 +393,8 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
     --config "BOOT=$BOOT" "IEKF_SN=$IEKF_SN" "KNN=$KNN" "SNCOUNT=$SNCOUNT" "FOLDS=$FOLDS" \
              "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" \
              "MSTART=$MSTART" "MEND=$MEND" "TSTAMPS=$TSTAMPS" "SENSOR_SHA=$SENSOR_SHA" "SPOL=$SPOL" \
-             "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" > "$5"
+             "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" \
+             "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
 decide() {
@@ -514,7 +534,7 @@ for S in $SCENES; do
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
             --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
-            "${P0ARGS[@]}" \
+            "${P0ARGS[@]}" "${P1ARGS[@]}" \
             --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then

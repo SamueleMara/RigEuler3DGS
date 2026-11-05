@@ -127,6 +127,13 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    ap.add_argument("--phase1-partition", choices=("canonical", "per-frame"), default="canonical",
+                    help="canonical (DEFAULT): the IEKF supernode partition is built once from this "
+                         "direction's endpoint and held for the whole pass | per-frame: the legacy "
+                         "regrouping from each frame's predicted means (control)")
+    ap.add_argument("--phase1-covariance-transport", action="store_true",
+                    help="EXPERIMENTAL: express the prior information in the tangent at the accepted "
+                         "state (J^T Lambda_prior J) before adding the Fisher; off = legacy")
     ap.add_argument("--phase1-covariance-reset", action="store_true",
                     help="DIAGNOSTIC: re-initialise the Phase-1 covariance every frame instead of "
                          "carrying the previous posterior (the old behaviour; off by default)")
@@ -265,6 +272,8 @@ def main() -> int:
             model_error_beta=1.0, model_error_blur=1)
 
         ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
+        ns.phase1_partition = args.phase1_partition
+        ns.phase1_covariance_transport = bool(args.phase1_covariance_transport)
         ns.frame_timestamps = args.frame_timestamps
         ns.p0_geometry = args.p0_geometry
         ns.p0_velocity_sigma = tuple(args.p0_velocity_sigma)
@@ -353,6 +362,10 @@ def main() -> int:
         from estimator.mask_diagnostics import resources as _resources
         (out / "mask_diagnostics.json").write_text(json.dumps(
             ns.mask_diagnostics.report(), indent=1, default=str))
+        parts_arr = _info.pop("partition_arrays", None)
+        if parts_arr is not None:
+            # Gate B: the immutable canonical Phase-1 partition (membership, centres)
+            np.savez_compressed(out / "phase1_partition.npz", **parts_arr)
         (out / "phase1_frames.json").write_text(json.dumps(
             {k: v for k, v in _info.items() if k != "rotations"}, indent=1, default=str))
         (out / "stage_resources.json").write_text(json.dumps(
@@ -600,7 +613,8 @@ def main() -> int:
                                         load_optimized_gt, supernode_gt)
     # Sections 2-6: the optimized labelled 3DGS model is the PRIMARY GT.
     gt = load_optimized_gt(model, mu0)
-    sparse = load_static_dynamic_gt(source, mu0)
+    sparse = load_static_dynamic_gt(source, mu0,
+                                    endpoint="final" if args.direction == "backward" else "initial")
     if gt.get("status") == NOT_FOUND:
         # Section 5: do not silently call sparse-NN labels ground truth.
         write_json(out / "evaluation" / "optimized_3dgs_gt.json", gt)

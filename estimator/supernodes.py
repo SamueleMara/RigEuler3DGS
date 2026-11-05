@@ -160,16 +160,18 @@ class GroupedObservation:
     """H_G G, matrix-free, on top of the validated per-Gaussian operators."""
 
     def __init__(self, linearization, partition: SupernodePartition,
-                 canonical_means: torch.Tensor | None = None):
+                 canonical_means: torch.Tensor | None = None,
+                 centroids: torch.Tensor | None = None):
         self.lin = linearization
         self.part = partition
-        # The tangent is defined against CANONICAL geometry (section 3.2's
-        # mu_i^0 - c_c^0), not the current deformed state, so the group basis
-        # cannot drift as the estimate moves.
+        # By default the tangent is defined against CANONICAL geometry (section
+        # 3.2's mu_i^0 - c_c^0). `canonical_means` / `centroids` override the
+        # lever-arm geometry while the MEMBERSHIP stays the partition's own
+        # (Phase 1's fixed partition with lever arms at the current state).
         self.means = (canonical_means if canonical_means is not None
                       else partition.canonical_means).contiguous().float()
         self.sid = partition.supernode_id.contiguous().to(torch.int32)
-        self.cent = partition.centroids.contiguous().float()
+        self.cent = (centroids if centroids is not None else partition.centroids).contiguous().float()
 
     @property
     def num_supernodes(self) -> int:

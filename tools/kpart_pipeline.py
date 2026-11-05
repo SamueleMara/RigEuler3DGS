@@ -580,6 +580,7 @@ def run_kpart_discovery(truth, cameras, frames, cfg, args, writer, *,
         positions, pos_info = bootstrap_positions(truth, cameras, frames, cfg,
                                                   partition, args,
                                                   verbose=verbose, observer=observer)
+        pos_info.pop("partition_arrays", None)
         writer.json("motion_evidence", pos_info)
         dbg.record(positions=positions, motion_info=pos_info)
 
@@ -1765,7 +1766,41 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
     bcfg = _dc.replace(cfg, use_supernodes=True,
                        supernode_target_size=args.supernode_size,
                        supernode_seed=args.seed,
-                       max_iters=args.bootstrap_iters)
+                       max_iters=args.bootstrap_iters,
+                       covariance_tangent_transport=bool(getattr(args, "phase1_covariance_transport", False)))
+    # RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md Gate B (confirmed
+    # defect): with partition=None the IEKF regrouped every frame from the already
+    # drifting predicted means. The partition is now built ONCE from this direction's
+    # canonical endpoint (truth = the endpoint model of the direction being processed)
+    # and held for the whole pass. Membership is canonical; the group tangent's lever
+    # arms are evaluated at each frame's predicted geometry ("current"), which is the
+    # rigid tangent of a group that has already rotated. --phase1-partition per-frame
+    # restores the legacy regrouping as an explicit control.
+    part_mode = getattr(args, "phase1_partition", "canonical")
+    if part_mode not in ("canonical", "per-frame"):
+        raise SystemExit(f"--phase1-partition must be canonical or per-frame, not {part_mode!r}")
+    fixed_partition, part_info, part_arrays = None, {"mode": part_mode}, None
+    if partition is not None:
+        # a caller-supplied canonical partition (tools/kpart_pipeline.run) keeps its
+        # original semantics: held fixed, canonical lever arms
+        part_info = {"mode": "caller-supplied", "canonical_hash": partition.canonical_hash(),
+                     "num_supernodes": partition.num_supernodes, "lever_geometry": "canonical"}
+    elif part_mode == "canonical":
+        from estimator.supernodes import build_supernodes
+        fixed_partition = build_supernodes(
+            truth.mu, target_size=bcfg.supernode_target_size, num_supernodes=bcfg.supernode_count,
+            knn=bcfg.supernode_knn, seed=bcfg.supernode_seed)
+        part_hash = fixed_partition.canonical_hash()
+        part_info.update({"canonical_hash": part_hash, "num_supernodes": fixed_partition.num_supernodes,
+                          "target_size": bcfg.supernode_target_size, "config": fixed_partition.config,
+                          "lever_geometry": "current",
+                          "member_counts_q": [int(x) for x in torch.quantile(
+                              fixed_partition.member_counts.double().cpu(),
+                              torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64))]})
+        # membership for the stage outputs (not JSON): callers pop info["partition_arrays"]
+        part_arrays = {"supernode_id": fixed_partition.supernode_id.detach().cpu().numpy(),
+                       "canonical_centroids": fixed_partition.centroids.detach().cpu().numpy(),
+                       "canonical_means": fixed_partition.canonical_means.detach().cpu().numpy()}
     positions, per_frame = [], []
     state = truth
     t0 = time.perf_counter()
@@ -1839,10 +1874,13 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         mseq = getattr(args, "masked_observation", None)
         obs_k = obs if mseq is None else mseq.prepare_frame(ti, obs, device=dev)
         dt_k = _frame_dt(frames, ti, args.dt)
+        if fixed_partition is not None and fixed_partition.canonical_hash() != part_hash:
+            raise AssertionError("the canonical Phase-1 partition changed during the pass")
         new_state, P_new, diag = iekf_frame_step(seed, P, obs_k,
                                              cameras,
                                              dt=dt_k, cfg=bcfg,
-                                             partition=partition,
+                                             partition=fixed_partition if fixed_partition is not None else partition,
+                                             group_geometry="current" if fixed_partition is not None else "canonical",
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
                                              observation_model=None if mseq is None else mseq.model)
@@ -1883,6 +1921,10 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         cov_report = covariance_report(P_new)
         cov_report["prior_source"] = prior_source
         stop = next((r for r in diag.rows if r.get("event") == "stop"), None)
+        post = next((r for r in diag.rows if r.get("event") == "posterior"), {})
+        cov_report["approximation"] = post.get("approximation", "BLOCK_INFORMATION_APPROXIMATION")
+        cov_report["posterior_status"] = post.get("posterior_status")
+        cov_report["covariance_tangent_transport"] = post.get("covariance_tangent_transport")
         P_post = P_new
         if observer is not None:
             observer(ti, state, prior[0])
@@ -1911,5 +1953,8 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             "warm_started": True,
             "P0_source": p0_source,
             "dt_s_per_step": [_frame_dt(frames, k, args.dt) for k in range(1, len(frames))],
+            "converged_frames": sum(1 for r in per_frame[1:] if r.get("stop_reason") == "converged"),
+            "partition": part_info,
+            "partition_arrays": part_arrays,
             "rotations": rotations}
     return positions, info

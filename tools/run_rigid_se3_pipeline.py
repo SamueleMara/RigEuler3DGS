@@ -323,7 +323,7 @@ def main() -> int:
         np.save(p1dir / "centers" / f"centers_frame_{t:04d}.npy",
                 torch.as_tensor(p).double().cpu().numpy())
     _json(p1dir / "phase1_info.json",
-          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v) and k != "rotations"})
+          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v) and k not in ("rotations", "partition_arrays")})
 
     # =====================================================================
     # 2. COHERENCE MOVING_RIGID SUPPORT (sections 1, 2)

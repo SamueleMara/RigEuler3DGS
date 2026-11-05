@@ -246,6 +246,12 @@ def main(argv=None) -> int:
     ap.add_argument("--calibration-bins", type=int, default=8)
     ap.add_argument("--calibration-min-bin-samples", type=int, default=200)
     ap.add_argument("--observation-mode", default="masked-rgb-expected-quad")
+    # Phase 1 only (RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md), passed to the driver
+    ap.add_argument("--phase1-partition", choices=("canonical", "per-frame"), default="canonical")
+    ap.add_argument("--phase1-covariance-transport", action="store_true")
+    ap.add_argument("--phase1-alpha-precision", choices=("coupled", "declared"), default="coupled")
+    ap.add_argument("--phase1-alpha-sd", type=float, default=None)
+    ap.add_argument("--phase1-rgb-support", choices=("full", "foreground"), default="full")
     ap.add_argument("--stages", default="calibration bootstrap phase1 phase2 phase3")
     ap.add_argument("--out", required=True)
     ap.add_argument("--dry-run", action="store_true")
@@ -330,7 +336,9 @@ def main(argv=None) -> int:
             "silhouette_sigma": a.silhouette_sigma, "thickness_weight": a.thickness_weight,
             "rgb_model_sigma": a.rgb_model_sigma, "depth_model_sigma": a.depth_model_sigma,
             "p0_prior_sigma_pos": a.p0_prior_sigma_pos, "p0_prior_sigma_rot": a.p0_prior_sigma_rot,
-            "lr_scale": a.lr_scale, "seed": a.seed}
+            "lr_scale": a.lr_scale, "seed": a.seed,
+            # EVALUATION ONLY labels: synthetic inputs carry labelled endpoint clouds, real captures none
+            "gt_labels": "off" if a.dataset_kind == "real" else "auto"}
     for end, frame in facts["endpoints"]:
         d = out / "bootstrap" / end
         bsig = sc.bootstrap_signature(src, facts["cameras"], end, frame, sensor, bopt)
@@ -345,7 +353,7 @@ def main(argv=None) -> int:
                           "--silhouette-sigma", a.silhouette_sigma, "--thickness-weight", a.thickness_weight,
                           "--rgb-model-sigma", a.rgb_model_sigma, "--depth-model-sigma", a.depth_model_sigma,
                           "--p0-prior-sigma-pos", a.p0_prior_sigma_pos, "--p0-prior-sigma-rot", a.p0_prior_sigma_rot,
-                          "--lr-scale", a.lr_scale, "--seed", a.seed],
+                          "--lr-scale", a.lr_scale, "--seed", a.seed, "--gt-labels", bopt["gt_labels"]],
                          out / "logs" / f"bootstrap_{end}.log", a.dry_run)
                 if not a.dry_run:
                     bad = sc.validate("bootstrap", d, bsig) if rc == 0 else ["bootstrap tool failed"]
@@ -379,7 +387,11 @@ def main(argv=None) -> int:
                "--frame-timestamps", a.frame_timestamps, *sensor_args, "--bootstrap-p0",
                "--p0-velocity-sigma", *a.p0_velocity_sigma,
                "--rgb-model-sigma", a.rgb_model_sigma, "--depth-model-sigma", a.depth_model_sigma,
-               "--observation-mode", a.observation_mode]
+               "--observation-mode", a.observation_mode,
+               "--phase1-partition", a.phase1_partition, "--phase1-alpha-precision", a.phase1_alpha_precision,
+               "--phase1-rgb-support", a.phase1_rgb_support,
+               *(("--phase1-alpha-sd", a.phase1_alpha_sd) if a.phase1_alpha_sd is not None else ()),
+               *(("--phase1-covariance-transport",) if a.phase1_covariance_transport else ())]
         env = dict(os.environ, ITERS=str(a.refine_iters))
         print(f"  (driver ITERS={a.refine_iters}: the bootstrap's final checkpoint is the endpoint model)")
         rc = run(cmd, out / "logs" / "pipeline.log", a.dry_run, env=env)

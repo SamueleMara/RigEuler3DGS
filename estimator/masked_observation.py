@@ -30,6 +30,19 @@ here. Depth keeps its existing robust precision, on V_used only.
 
 Nothing here touches training, opacity, scales, colours or the camera model, and
 nothing calls the hard negative-ray QP (visibility_constraint.py).
+
+Controlled likelihood arms (RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md
+section 3 C2; opt-in, defaults reproduce the expected-quad objective above):
+  alpha_precision "coupled"   kappa = trace(W Sigma_b)  (exact background expectation;
+                              with calibrated W this is ~1/(4 sigma_rgb^2), e.g. ~1e4)
+                  "declared"  kappa = 1 / alpha_sd^2, a SEPARATELY declared silhouette
+                              factor 1/2 (M - A)^2 / alpha_sd^2, independent of W. The
+                              objective is then no longer the exact expectation over b.
+  rgb_support     "full"      RGB term on Y(b) over the whole image (default)
+                  "foreground" RGB term on M = 1 pixels only: off-mask pixels carry no
+                              RGB-precision silhouette evidence; the silhouette is the
+                              declared alpha factor alone (requires alpha_precision
+                              "declared"). Depth is unchanged (V_orig AND M).
 """
 from __future__ import annotations
 
@@ -44,6 +57,8 @@ DEFAULT_MODE = "masked-rgb-expected-quad"      # the motion pipeline's default (
 DISTRIBUTIONS = ("uniform01",)
 UNIFORM01_MEAN = 0.5
 UNIFORM01_VAR = 1.0 / 12.0
+ALPHA_PRECISIONS = ("coupled", "declared")
+RGB_SUPPORTS = ("full", "foreground")
 
 
 @dataclass(frozen=True)
@@ -52,10 +67,27 @@ class MaskedObservationModel:
     background: tuple                    # the render background: b (constant) or b_bar (expected)
     distribution: str | None = None      # expected-quad only
     rgb_sigma: float | None = None       # the declared fixed RGB sigma (Phase 1)
+    alpha_precision: str = "coupled"     # coupled | declared (section C2 arms)
+    alpha_sd: float | None = None        # declared silhouette sd (alpha_precision "declared")
+    rgb_support: str = "full"            # full | foreground
 
     def __post_init__(self):
         if self.mode not in MODES[1:]:
             raise ValueError(f"MaskedObservationModel is for {MODES[1:]}, not {self.mode!r}")
+        if self.alpha_precision not in ALPHA_PRECISIONS:
+            raise ValueError(f"alpha_precision must be one of {ALPHA_PRECISIONS}, not {self.alpha_precision!r}")
+        if self.rgb_support not in RGB_SUPPORTS:
+            raise ValueError(f"rgb_support must be one of {RGB_SUPPORTS}, not {self.rgb_support!r}")
+        if self.alpha_precision == "declared":
+            if self.mode != "masked-rgb-expected-quad":
+                raise ValueError("a declared alpha precision needs the masked-rgb-expected-quad mode")
+            if self.alpha_sd is None or not float(self.alpha_sd) > 0:
+                raise ValueError("alpha_precision 'declared' needs a positive alpha_sd")
+        elif self.alpha_sd is not None:
+            raise ValueError("alpha_sd is only used with alpha_precision 'declared'")
+        if self.rgb_support == "foreground" and self.alpha_precision != "declared":
+            raise ValueError("rgb_support 'foreground' needs alpha_precision 'declared': the coupled "
+                             "kappa is the expectation of the off-mask RGB term it would remove")
         if len(self.background) != 3 or not all(0.0 <= float(c) <= 1.0 for c in self.background):
             raise ValueError(f"background must be 3 values in [0,1], got {self.background}")
         if self.mode == "masked-rgb-expected-quad" and self.distribution not in DISTRIBUTIONS:
@@ -76,9 +108,13 @@ class MaskedObservationModel:
         return torch.tensor([float(c) for c in self.background], device=device, dtype=torch.float32)
 
     def kappa(self, p_rgb: torch.Tensor) -> torch.Tensor:
-        """kappa[p] = trace(W[p] Sigma_b) for a diagonal per-channel W ([3,H,W] or broadcastable)."""
+        """kappa[p] = trace(W[p] Sigma_b) for a diagonal per-channel W ([3,H,W] or broadcastable);
+        1 / alpha_sd^2 everywhere with a declared alpha precision."""
+        base = p_rgb[0] if p_rgb.dim() == 3 else p_rgb
         if not self.alpha_term:
-            return torch.zeros_like(p_rgb[0] if p_rgb.dim() == 3 else p_rgb)
+            return torch.zeros_like(base)
+        if self.alpha_precision == "declared":
+            return torch.full_like(base, 1.0 / float(self.alpha_sd) ** 2)
         return p_rgb.sum(0) * self.background_variance if p_rgb.dim() == 3 else 3.0 * p_rgb * self.background_variance
 
     def to_dict(self) -> dict:
@@ -86,7 +122,11 @@ class MaskedObservationModel:
                 "background_distribution": self.distribution,
                 "background_covariance": (f"{self.background_variance:.10g} * I3" if self.alpha_term else None),
                 "rgb_precision": "fixed W (no residual reweighting of RGB)",
-                "alpha_term": ("0.5 * kappa * (A - M)^2, kappa = trace(W Sigma_b)" if self.alpha_term else None),
+                "alpha_term": (None if not self.alpha_term else
+                               "0.5 * kappa * (A - M)^2, kappa = trace(W Sigma_b)" if self.alpha_precision == "coupled"
+                               else f"0.5 * (A - M)^2 / alpha_sd^2, declared alpha_sd = {self.alpha_sd}"),
+                "alpha_precision": self.alpha_precision, "alpha_sd": self.alpha_sd,
+                "rgb_support": self.rgb_support,
                 "depth": "original metric depth on V_orig AND M only; zero precision elsewhere",
                 "note": ("the artificial background is a designed contrast cost, not an independently "
                          "sensed observation; information/covariance is conditional on this objective")}
@@ -269,6 +309,7 @@ def phase1_camera_terms(views, prepared, cfg, model: MaskedObservationModel, mod
                                 ob.depth_valid, cfg, rgb_robust=False, rgb_model_var=mv_rgb,
                                 depth_model_var=mv_d, coverage=ob.object_coverage,
                                 kappa_fn=model.kappa if model.alpha_term else None,
+                                rgb_valid=(ob.object_coverage > 0.5) if model.rgb_support == "foreground" else None,
                                 camera=camera_name(cfg, c)))
     return out
 
@@ -312,6 +353,13 @@ def add_cli(ap) -> None:
     ap.add_argument("--rgb-background-distribution", choices=DISTRIBUTIONS, default=None,
                     help="masked-rgb-expected-quad: the background distribution (uniform01 = independent "
                          "Uniform[0,1] channels; the default when that mode is chosen)")
+    ap.add_argument("--alpha-precision", choices=ALPHA_PRECISIONS, default="coupled",
+                    help="expected-quad alpha term: coupled (kappa = trace(W)/12, default) | declared "
+                         "(kappa = 1/alpha_sd^2, an explicitly declared silhouette factor; experimental arm)")
+    ap.add_argument("--alpha-sd", type=float, default=None, help="declared silhouette sd (--alpha-precision declared)")
+    ap.add_argument("--rgb-support", choices=RGB_SUPPORTS, default="full",
+                    help="full (Y(b) over the image, default) | foreground (RGB on M = 1 only; needs "
+                         "--alpha-precision declared; experimental arm)")
 
 
 def model_from_args(args, cfg=None) -> MaskedObservationModel | None:
@@ -332,10 +380,19 @@ def model_from_args(args, cfg=None) -> MaskedObservationModel | None:
             raise SystemExit("masked-rgb-constant needs --rgb-background-constant R G B")
         if dist is not None:
             raise SystemExit("--rgb-background-distribution is for masked-rgb-expected-quad")
+        if (getattr(args, "alpha_precision", "coupled") or "coupled") != "coupled" or \
+                getattr(args, "alpha_sd", None) is not None or (getattr(args, "rgb_support", "full") or "full") != "full":
+            raise SystemExit("--alpha-precision / --alpha-sd / --rgb-support are for masked-rgb-expected-quad")
         return MaskedObservationModel(mode, tuple(float(c) for c in const), None, sigma)
     if const is not None:
         raise SystemExit("--rgb-background-constant is for masked-rgb-constant")
-    return MaskedObservationModel(mode, (UNIFORM01_MEAN,) * 3, dist or "uniform01", sigma)
+    try:
+        return MaskedObservationModel(mode, (UNIFORM01_MEAN,) * 3, dist or "uniform01", sigma,
+                                      alpha_precision=getattr(args, "alpha_precision", "coupled") or "coupled",
+                                      alpha_sd=getattr(args, "alpha_sd", None),
+                                      rgb_support=getattr(args, "rgb_support", "full") or "full")
+    except ValueError as ex:
+        raise SystemExit(f"observation model: {ex}")
 
 
 def preflight(args, source) -> None:
@@ -386,9 +443,12 @@ def observation_manifest(args, seq=None, cfg=None) -> dict:
     out.update({"background_distribution": m.distribution, "render_background_bbar": list(m.background),
                 "background_covariance": (f"{m.background_variance:.10g} * I3" if m.alpha_term else None),
                 "rgb": "Y(b) = M I + (1 - M) b over the whole image, rendered on the same b",
-                "rgb_precision": "fixed quadratic W (no residual reweighting); kappa = trace(W)/12"
+                "rgb_precision": ("fixed quadratic W (no residual reweighting); "
+                                  + ("kappa = trace(W)/12" if m.alpha_precision == "coupled"
+                                     else f"kappa = 1/alpha_sd^2 (declared alpha_sd {m.alpha_sd})"))
                                  if m.alpha_term else "fixed quadratic W (no residual reweighting)",
-                "alpha_term": m.alpha_term,
+                "alpha_term": m.alpha_term, "alpha_precision": m.alpha_precision, "alpha_sd": m.alpha_sd,
+                "rgb_support": m.rgb_support,
                 "depth_valid": "V_orig AND M AND finite(D), then the pre-existing alpha > min_alpha_for_depth gate",
                 "depth_objective": "Student-t NLL on used samples (IRLS score in the GN system)",
                 "masks": {"root": seq.mask_root, "cameras": seq.cameras,
