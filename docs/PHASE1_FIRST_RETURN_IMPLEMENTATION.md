@@ -49,6 +49,16 @@ Canonical (frame-100) model against frame f:
 
 The same Gaussian ids top the front-contradiction ranking at every frame, including the static one (29947, 20074, 29452, 17474, …). These are persistent canonical-geometry defects, i.e. Phase-0 repair candidates, not motion.
 
+### Smoke: one real transition 100 -> 101 (audit tool, same endpoint, RGB 0.04 / depth 0.003 declared)
+
+| | off (legacy) | depth (first return) |
+|---|---|---|
+| displacement from canonical p50 / p99 | 2.30 / 35.2 mm | 0.89 / 22.2 mm |
+| peak GPU | 1753 MiB | 1839 MiB |
+| wall incl. ~6 s setup | 8.2 s | 24.6 s |
+
+One frame only. This is not evidence of better tracking. It shows the mode runs at full scale, and that a depth-mode frame costs about 9x a legacy frame (about 1 h per 188-frame arm).
+
 ## 5. Tests
 
 | Test | Result |

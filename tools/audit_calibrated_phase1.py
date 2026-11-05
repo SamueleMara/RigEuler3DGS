@@ -411,12 +411,16 @@ class Phase1Audit:
                    "prior", "gradient_norm", "step_norm", "gain_ratio", "pcg_iterations", "pcg_rel_residual",
                    "pcg_reason", "radius", "trust_radius", "mean_dmu", "max_dmu", "reason")
         stop_row = next((r for r in diag.rows if r.get("event") == "stop"), {})
+        post_row = next((r for r in diag.rows if r.get("event") == "posterior"), {})
         row["solver"] = {"iterations": [{k: r.get(k) for k in it_keys if k in r} for r in diag.rows
                                         if r.get("event") in ("initial", "accepted", "rejected", "stop")],
                          "stop_reason": stop_row.get("reason"),
                          "converged": stop_row.get("reason") == "converged",
-                         "posterior_status": ("LOCAL_HESSIAN_AT_CONVERGED_STATE" if stop_row.get("reason") == "converged"
-                                              else "UNCERTIFIED_NOT_CONVERGED")}
+                         # the IEKF's own label (POSTERIOR_UNCERTIFIED in first-return depth mode)
+                         "posterior_status": post_row.get("posterior_status") or (
+                             "LOCAL_HESSIAN_AT_CONVERGED_STATE" if stop_row.get("reason") == "converged"
+                             else "UNCERTIFIED_NOT_CONVERGED"),
+                         "curvature": post_row.get("curvature")}
         if self.snapshot_dir is not None:
             from estimator.process import process_predict
             self.snapshot_dir.mkdir(parents=True, exist_ok=True)
