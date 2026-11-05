@@ -486,6 +486,8 @@ def setup_window(args):
     frames_raw, frame_ids = dataset_rgbd_frames(cams_all[:ncam], cfg, ns, truth, Path(args.source), direction=args.direction)
     cfg = rc.configure(args, cfg, frame_ids["cameras"][:ncam])
     ns.masked_observation = masked_from_args(args, args.source, frames_raw, frame_ids, cfg)
+    from estimator.first_return_observation import from_args as fr_from_args
+    ns.first_return = fr_from_args(args, list(cfg.camera_names))
     window = [(ob, fid) for (ob, _s, _d), fid in zip(frames_raw, frame_ids["frames"])]
     return truth, camera_specs(cams_all, ncam), window, cfg, ns, frame_ids
 
@@ -624,7 +626,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", required=True)
     from estimator.masked_observation import add_cli as mask_cli
     from estimator.run_config import add_cli as rc_cli
+    from estimator.first_return_observation import add_cli as fr_cli
     mask_cli(ap)
+    fr_cli(ap)
     rc_cli(ap, phase1=True)
     a = ap.parse_args(argv)
     t0 = time.time()
@@ -656,7 +660,9 @@ def main(argv=None) -> int:
            "sensor_model_id": (ex["cfg"].sensor_model.model_id if ex["cfg"].sensor_model is not None else None),
            "camera_names": list(ex["cfg"].camera_names), "P0_source": info.get("P0_source"),
            "gt_labels": gt_info, "canonical_control": ex.get("canonical_control"),
-           "phase1_partition": info.get("partition"), "rows": audit.rows, "runtime_s": round(time.time() - t0, 1),
+           "phase1_partition": info.get("partition"), "first_return": info.get("first_return"),
+           "first_return_per_frame": [r.get("first_return") for r in info.get("per_frame", [])],
+           "rows": audit.rows, "runtime_s": round(time.time() - t0, 1),
            "notes": ["P0 / P_post are per-Gaussian block approximations (BLOCK_INFORMATION_APPROXIMATION): "
                      "inter-Gaussian and shared-camera covariance are not represented",
                      "a posterior after an iteration_budget stop is UNCERTIFIED_NOT_CONVERGED",

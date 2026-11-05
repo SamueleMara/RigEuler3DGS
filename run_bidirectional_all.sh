@@ -49,6 +49,8 @@
 # --phase1-covariance-transport            EXPERIMENTAL Lie-tangent transport of the prior
 # --phase1-alpha-precision coupled|declared, --phase1-alpha-sd S,
 # --phase1-rgb-support full|foreground     EXPERIMENTAL likelihood arms (masked mode)
+# --phase1-first-return-mode off|audit|depth, --phase1-first-return-prior PATH
+#                           first-return depth likelihood (estimator/first_return_observation.py)
 # --cameras N|auto  cameras used by Phase 1/2/3 (default 8, the setting of the
 #                   stable results; auto = every rgb/cam_* folder). Static
 #                   training always uses every camera of the COLMAP model.
@@ -134,6 +136,8 @@ while [ $# -gt 0 ]; do
     --phase1-alpha-precision) P1ALPHA="$2"; shift 2;;
     --phase1-alpha-sd)        P1ALPHASD="$2"; shift 2;;
     --phase1-rgb-support)     P1RGBSUP="$2"; shift 2;;
+    --phase1-first-return-mode)  P1FR="$2"; shift 2;;
+    --phase1-first-return-prior) P1FRP="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -176,6 +180,15 @@ case "$P1RGBSUP" in full|foreground) ;; *) echo "--phase1-rgb-support must be fu
 P1ARGS=(--phase1-partition "$P1PART" --alpha-precision "$P1ALPHA" --rgb-support "$P1RGBSUP")
 [ -n "$P1ALPHASD" ] && P1ARGS+=(--alpha-sd "$P1ALPHASD")
 [ "$P1TRANS" = 1 ] && P1ARGS+=(--phase1-covariance-transport)
+P1FR=${P1FR:-off}; P1FRP=${P1FRP:-}
+case "$P1FR" in off|audit|depth) ;; *) echo "--phase1-first-return-mode must be off|audit|depth" >&2; exit 2;; esac
+if [ "$P1FR" != off ]; then
+  [ -f "$P1FRP" ] || { echo "--phase1-first-return-mode $P1FR needs --phase1-first-return-prior FILE" >&2; exit 2; }
+  P1ARGS+=(--first-return-mode "$P1FR" --first-return-prior "$P1FRP")
+  P1FRSHA=$(sha256sum "$P1FRP" | cut -c1-64)
+else
+  P1FRSHA=none
+fi
 RCARGS=(--motion-start-frame "$MSTART" ${MEND:+--motion-end-frame "$MEND"} --frame-timestamps "$TSTAMPS"
         --sensor-policy "$SPOL" ${SENSOR:+--sensor-model "$SENSOR"}
         --rgb-model-sigma "$RGBMS" --depth-model-sigma "$DEPMS")
@@ -394,7 +407,8 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
              "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" \
              "MSTART=$MSTART" "MEND=$MEND" "TSTAMPS=$TSTAMPS" "SENSOR_SHA=$SENSOR_SHA" "SPOL=$SPOL" \
              "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" \
-             "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" > "$5"
+             "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" \
+             "P1FR=$P1FR" "P1FRSHA=$P1FRSHA" > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
 decide() {

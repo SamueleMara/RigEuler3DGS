@@ -23,6 +23,8 @@ RigEuler3DGS_CODEX_Phase1_FirstReturn_Implementation_2026-11-05.md sections 2, 6
         --sensor-model CAL --first-return-prior P --frames 90 119 133 145 160 190 --out DIR
     python observation_diagnostics/first_return_audit.py calibrate --model M --source S \\
         --sensor-model CAL --frames 60 79 --z-far 2.0 --out prior.json
+    python observation_diagnostics/first_return_audit.py assume --cameras cam_000 ... \\
+        --lambda-per-m L --z-near 0.2 --z-far F --reason "..." --out prior.json
 """
 from __future__ import annotations
 
@@ -149,7 +151,7 @@ def run_audit(a) -> int:
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     rows = []
     for f in a.frames:
-        truth, cameras, window, cfg, ns, _ = _setup(a, f, f)
+        truth, cameras, window, cfg, ns, _ = _setup(a, f, f + 1)      # a window needs end > start; frame f = index 0
         prior = load_prior(a.first_return_prior, list(cfg.camera_names))
         obs_model = FirstReturnObservation("audit", prior)
         state, what = _state_at(truth, a.phase1_dir, f)
@@ -278,7 +280,23 @@ def main(argv=None) -> int:
     pc.add_argument("--lambda-min", type=float, default=1e-3)
     pc.add_argument("--lambda-max", type=float, default=1e2)
     pc.add_argument("--lambda-steps", type=int, default=31)
+    ps = sub.add_parser("assume", help="write an explicitly ASSUMED prior (no data; every number from the caller)")
+    ps.add_argument("--cameras", nargs="+", required=True)
+    ps.add_argument("--lambda-per-m", type=float, required=True)
+    ps.add_argument("--z-near", type=float, required=True)
+    ps.add_argument("--z-far", type=float, required=True)
+    ps.add_argument("--unknown-sigma", default="sensor")
+    ps.add_argument("--reason", required=True, help="why this value is assumed (recorded as provenance)")
+    ps.add_argument("--out", required=True)
     a = ap.parse_args(argv)
+    if a.cmd == "assume":
+        from estimator.first_return_types import write_prior
+        sm = {"kind": "sensor"} if a.unknown_sigma == "sensor" else {"kind": "constant", "sigma_m": float(a.unknown_sigma)}
+        raw = write_prior(a.out, {c: {"z_near_m": a.z_near, "z_far_m": a.z_far, "lambda_per_m": a.lambda_per_m,
+                                      "unknown_depth_sigma_model": sm} for c in a.cameras},
+                          "assumed", {"method": "declared by the caller, no data", "reason": a.reason})
+        print(f"wrote {a.out} (ASSUMED, model_id {raw['model_id'][:12]})")
+        return 0
     return run_audit(a) if a.cmd == "audit" else run_calibrate(a)
 
 

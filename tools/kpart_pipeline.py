@@ -1881,6 +1881,7 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                                              dt=dt_k, cfg=bcfg,
                                              partition=fixed_partition if fixed_partition is not None else partition,
                                              group_geometry="current" if fixed_partition is not None else "canonical",
+                                             first_return=getattr(args, "first_return", None),
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
                                              observation_model=None if mseq is None else mseq.model)
@@ -1925,6 +1926,8 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
         cov_report["approximation"] = post.get("approximation", "BLOCK_INFORMATION_APPROXIMATION")
         cov_report["posterior_status"] = post.get("posterior_status")
         cov_report["covariance_tangent_transport"] = post.get("covariance_tangent_transport")
+        cov_report["curvature"] = post.get("curvature")
+        fr_eval = getattr(diag, "first_return", None)
         P_post = P_new
         if observer is not None:
             observer(ti, state, prior[0])
@@ -1937,7 +1940,8 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                           "mean_displacement": float(d.norm(dim=1).mean()),
                           "max_displacement": float(d.norm(dim=1).max()),
                           "covariance": cov_report,
-                          "stop_reason": stop.get("reason") if stop else None})
+                          "stop_reason": stop.get("reason") if stop else None,
+                          **({"first_return": fr_eval.summary(top=10)} if fr_eval is not None else {})})
         # `fid` is a per-frame provenance dict, not an index -- the bar gets
         # the loop counter.
         _fb.note(f"mean |dx| {per_frame[-1]['mean_displacement']:.5f}")
@@ -1955,6 +1959,8 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
             "dt_s_per_step": [_frame_dt(frames, k, args.dt) for k in range(1, len(frames))],
             "converged_frames": sum(1 for r in per_frame[1:] if r.get("stop_reason") == "converged"),
             "partition": part_info,
+            "first_return": (None if getattr(args, "first_return", None) is None
+                             else args.first_return.to_manifest()),
             "partition_arrays": part_arrays,
             "rotations": rotations}
     return positions, info

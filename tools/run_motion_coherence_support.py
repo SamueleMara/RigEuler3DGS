@@ -139,6 +139,8 @@ def main() -> int:
                          "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
+    from estimator.first_return_observation import add_cli as _fr_cli
+    _fr_cli(ap)
     from estimator.run_config import add_cli as _rc_cli
     _rc_cli(ap, phase1=True)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
@@ -180,6 +182,11 @@ def main() -> int:
     out = Path(args.out or f"output/motion_coherence_{args.scene}")
     from estimator.masked_observation import preflight as _obs_preflight
     _obs_preflight(args, source)            # masks ready? before any model load / GPU work
+    if getattr(args, "first_return_mode", "off") != "off":
+        # prior schema + camera coverage BEFORE any GPU work (cameras from <source>/rgb/cam_*)
+        from estimator.first_return_observation import from_args as _fr_from_args
+        _cams = sorted(p.name for p in (Path(source) / "rgb").glob("cam_*") if p.is_dir())[:args.cameras]
+        _fr_from_args(args, _cams)
     (out / "numerical").mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     print(f"=== MOTION COHERENCE: {args.scene} ===")
@@ -301,6 +308,15 @@ def main() -> int:
         ns.visibility_constraint = _vis_from_args(args, source, frames_raw, frame_ids)
         from estimator.masked_observation import from_args as _masked_from_args
         ns.masked_observation = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+        from estimator.first_return_observation import from_args as _fr_from_args
+        ns.first_return = _fr_from_args(args, list(cfg.camera_names))
+        if ns.first_return is not None:
+            cfg = __import__("dataclasses").replace(
+                cfg, first_return_mode=ns.first_return.mode, first_return_prior_path=ns.first_return.prior.path,
+                first_return_posterior="unavailable")
+            (out / "first_return.json").write_text(json.dumps(ns.first_return.to_manifest(), indent=1, default=str))
+            print(f"  first-return mode {ns.first_return.mode}: prior {ns.first_return.prior.model_id[:12]} "
+                  f"({ns.first_return.prior.status})")
         from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
         from estimator.renderer_bridge import build_linearization as _build_lin
         _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, ns.masked_observation)

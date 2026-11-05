@@ -252,6 +252,8 @@ def main(argv=None) -> int:
     ap.add_argument("--phase1-alpha-precision", choices=("coupled", "declared"), default="coupled")
     ap.add_argument("--phase1-alpha-sd", type=float, default=None)
     ap.add_argument("--phase1-rgb-support", choices=("full", "foreground"), default="full")
+    ap.add_argument("--phase1-first-return-mode", choices=("off", "audit", "depth"), default="off")
+    ap.add_argument("--phase1-first-return-prior", default=None)
     ap.add_argument("--stages", default="calibration bootstrap phase1 phase2 phase3")
     ap.add_argument("--out", required=True)
     ap.add_argument("--dry-run", action="store_true")
@@ -391,7 +393,9 @@ def main(argv=None) -> int:
                "--phase1-partition", a.phase1_partition, "--phase1-alpha-precision", a.phase1_alpha_precision,
                "--phase1-rgb-support", a.phase1_rgb_support,
                *(("--phase1-alpha-sd", a.phase1_alpha_sd) if a.phase1_alpha_sd is not None else ()),
-               *(("--phase1-covariance-transport",) if a.phase1_covariance_transport else ())]
+               *(("--phase1-covariance-transport",) if a.phase1_covariance_transport else ()),
+               "--phase1-first-return-mode", a.phase1_first_return_mode,
+               *(("--phase1-first-return-prior", a.phase1_first_return_prior) if a.phase1_first_return_prior else ())]
         env = dict(os.environ, ITERS=str(a.refine_iters))
         print(f"  (driver ITERS={a.refine_iters}: the bootstrap's final checkpoint is the endpoint model)")
         rc = run(cmd, out / "logs" / "pipeline.log", a.dry_run, env=env)
