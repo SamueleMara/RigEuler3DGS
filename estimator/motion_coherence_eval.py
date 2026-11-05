@@ -37,7 +37,8 @@ def require_prediction_on_disk(path) -> Path:
     return p
 
 
-def load_static_dynamic_gt(source, mu0: Tensor, max_dist: float | None = None) -> dict:
+def load_static_dynamic_gt(source, mu0: Tensor, max_dist: float | None = None,
+                           endpoint: str = "initial") -> dict:
     """Section 22: the real GT representation, mapped to Gaussians.
 
     The datasets ship a SPARSE labelled point cloud, `pointcloud/
@@ -49,13 +50,18 @@ def load_static_dynamic_gt(source, mu0: Tensor, max_dist: float | None = None) -
     are carried to Gaussians by nearest neighbour in the canonical frame. A
     Gaussian farther than `max_dist` from any labelled point is UNMAPPED and is
     excluded from every metric rather than being assigned a guess.
+
+    `endpoint` names the canonical endpoint of mu0: a BACKWARD run's canonical state
+    is the final model, labelled by points3D_parts_final.ply (the moving link is
+    elsewhere at the final configuration, so the initial cloud would mislabel it).
     """
     from plyfile import PlyData
+    from utils.gt_part_labels import LABEL_FILES
 
-    src = Path(source) / "pointcloud" / "points3D_parts.ply"
+    src = Path(source) / "pointcloud" / LABEL_FILES[endpoint]
     if not src.is_file():
         return {"available": False, "source": str(src),
-                "reason": "no points3D_parts.ply in this dataset"}
+                "reason": f"no {LABEL_FILES[endpoint]} in this dataset"}
     v = PlyData.read(str(src))["vertex"].data
     xyz = torch.tensor(np.stack([v["x"], v["y"], v["z"]], 1), dtype=torch.float64)
     part = torch.tensor(np.asarray(v["part"]).astype(np.int64))

@@ -98,8 +98,10 @@ def load_frame(source: Path, cam: str, t: int):
     return rgb, d, m, [rp, dp, mp]
 
 
-def write_model(out: Path, it: int, params: dict, source: Path, colmap_subdir: str):
-    """A 3DGS model directory (sh_degree 3, SH rest = 0) every loader in the repo reads."""
+def write_model(out: Path, it: int, params: dict, source: Path, colmap_subdir: str, gt_part=None):
+    """A 3DGS model directory (sh_degree 3, SH rest = 0) every loader in the repo reads.
+    `gt_part` (EVALUATION ONLY, synthetic inputs): written as the per-vertex fields gt_part /
+    gt_dynamic exactly as GaussianModel.save_ply does (-1 = unlabelled in both)."""
     from plyfile import PlyData, PlyElement
     n = params["xyz"].shape[0]
     dc = (params["rgb"] - 0.5) / 0.28209479177387814
@@ -114,6 +116,12 @@ def write_model(out: Path, it: int, params: dict, source: Path, colmap_subdir: s
         attrs[f"scale_{i}"] = np.log(np.maximum(params["scales"][:, i], 1e-7))
     for i in range(4):
         attrs[f"rot_{i}"] = params["quat_wxyz"][:, i]
+    if gt_part is not None:
+        from utils.gt_part_labels import dynamic_from_part
+        if len(gt_part) != n:
+            raise AssertionError(f"{len(gt_part)} GT labels for {n} Gaussians")
+        attrs["gt_part"] = np.asarray(gt_part, np.float64)
+        attrs["gt_dynamic"] = dynamic_from_part(gt_part).astype(np.float64)
     dtype = [(k, "f4") for k in attrs]
     arr = np.empty(n, dtype=dtype)
     for k, v in attrs.items():
@@ -159,6 +167,9 @@ def main(argv=None) -> int:
     ap.add_argument("--p0-prior-sigma-rot", type=float, default=0.5, help="declared weak prior [rad]")
     ap.add_argument("--lr-scale", type=float, default=1.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--gt-labels", choices=("auto", "off"), default="auto",
+                    help="EVALUATION ONLY: auto = label the seeds from pointcloud/points3D_parts[_final].ply "
+                         "of this endpoint when the dataset has it (synthetic); off = never (real captures)")
     a = ap.parse_args(argv)
     t_start = time.time()
     torch.manual_seed(a.seed)
@@ -208,7 +219,25 @@ def main(argv=None) -> int:
     print(f"  {n} seeds (voxel {1000 * h:.1f} mm) from {len(Y)} samples; median sigma_surface "
           f"{1000 * math.sqrt(float(np.median(fit['sigma_surface2']))):.2f} mm, inliers "
           f"{100 * float(np.median(fit['inlier_fraction'])):.0f} %")
-    write_model(out, 0, params, src, a.colmap_subdir)
+    # EVALUATION ONLY: static / dynamic GT at the seeds (utils/gt_part_labels.py). The
+    # population is fixed from here on, so the seed's label is the Gaussian's label.
+    gt_part, gt_info = None, {"status": "OFF" if a.gt_labels == "off" else "NO_LABELLED_CLOUD",
+                              "evaluation_only": True}
+    if a.gt_labels == "auto":
+        from utils.gt_part_labels import labelled_cloud, nn_labels, summary
+        cloud = labelled_cloud(src, a.endpoint)
+        if cloud is not None:
+            lab = nn_labels(params["xyz"], cloud)
+            gt_part = lab["part"]
+            gt_info = {"status": "LABELLED", "evaluation_only": True, "cloud": cloud["path"],
+                       "cloud_sha256": cloud["sha256"], "cloud_points": int(len(cloud["part"])),
+                       "method": "nearest labelled sample of the same endpoint at the SEED position; "
+                                 "ids fixed through the refinement",
+                       "max_dist_m": lab["max_dist"], "factor_of_median_spacing": lab["factor"],
+                       **summary(gt_part, lab["nn_distance"])}
+            print(f"  GT labels (evaluation only): {gt_info['num_static']} static, {gt_info['num_dynamic']} "
+                  f"dynamic, {gt_info['num_unlabelled']} unlabelled from {cloud['path']}")
+    write_model(out, 0, params, src, a.colmap_subdir, gt_part)
 
     # ---- 2. refinement ------------------------------------------------------
     from gaussian_renderer import render
@@ -289,10 +318,10 @@ def main(argv=None) -> int:
             raise AssertionError("the Gaussian count changed during the bootstrap refinement")
         if it in ckpts:
             evaluate(it)
-            write_model(out, it, params_from_gaussians(gs), src, a.colmap_subdir)
+            write_model(out, it, params_from_gaussians(gs), src, a.colmap_subdir, gt_part)
     final_it = a.refine_iters
     if final_it == 0:
-        write_model(out, 0, params, src, a.colmap_subdir)
+        write_model(out, 0, params, src, a.colmap_subdir, gt_part)
     shutil.copy(out / "point_cloud" / f"iteration_{final_it}" / "point_cloud.ply", out / "point_cloud.ply")
 
     # ---- 3. responsibility, ownership, Fisher, P0 ----------------------------
@@ -337,7 +366,7 @@ def main(argv=None) -> int:
                                     "entries": int(resp["weight"].size), "unseen_gaussians": own["unseen"]},
            "observability": {"observable_directions_histogram": np.bincount(obsv, minlength=7).tolist(),
                              "note": cov["approximation"]},
-           "camera_names": names,
+           "camera_names": names, "gt_labels": gt_info,
            "input_sha256": hashlib.sha256("".join(_sha(f) for f in files).encode()).hexdigest(),
            "policy_notes": ["only the endpoint frame's own observations are used",
                             "Sigma_render (rendering footprint) is stored separately from P0 (centre uncertainty)",

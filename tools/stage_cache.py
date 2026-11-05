@@ -31,7 +31,7 @@ IMPL = {
                   "utils/noise/sensor_model.py", "estimator/observation_terms.py", "estimator/renderer_bridge.py",
                   "estimator/sparse_iekf.py", "gaussian_renderer/__init__.py", "scene/__init__.py",
                   "scene/gaussian_model.py", "scene/dataset_readers.py", "tools/run_iekf_scene.py",
-                  "observation_diagnostics/renderer_access.py"],
+                  "observation_diagnostics/renderer_access.py", "utils/gt_part_labels.py"],
 }
 
 
