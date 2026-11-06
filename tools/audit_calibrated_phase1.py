@@ -628,6 +628,7 @@ def main(argv=None) -> int:
     ap.add_argument("--phase1-partition", choices=("canonical", "per-frame"), default="canonical")
     ap.add_argument("--phase1-covariance-transport", action="store_true")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--deterministic", action="store_true", help="bitwise reproducible reductions")
     from estimator.masked_observation import add_cli as mask_cli
     from estimator.run_config import add_cli as rc_cli
     from estimator.first_return_observation import add_cli as fr_cli
@@ -635,6 +636,9 @@ def main(argv=None) -> int:
     fr_cli(ap)
     rc_cli(ap, phase1=True)
     a = ap.parse_args(argv)
+    if a.deterministic:
+        from estimator.deterministic_ops import enable as _det_enable
+        print(f"deterministic reductions: {_det_enable()}")
     t0 = time.time()
     if a.residual_report_only:
         truth, cameras, window, cfg, ns, _ids = setup_window(a)

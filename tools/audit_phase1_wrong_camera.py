@@ -93,8 +93,8 @@ class StateCapture:
                  for k, v in r.items() if isinstance(v, (int, float, str, bool)) or v is None}
                 for r in diag.rows if r.get("event") in ("initial", "accepted", "rejected", "stop", "posterior")]
         f32 = lambda t: t.detach().float().cpu()                               # noqa: E731
-        self.frames.append({"ti": ti, "fid": fid, "dt": float(dt), "mu": f32(state.mu), "v": f32(state.v),
-                            "omega": f32(state.omega), "mu_pred": f32(pred.mu), "v_pred": f32(pred.v),
+        self.frames.append({"ti": ti, "fid": fid, "dt": float(dt), "mu": f32(state.mu), "R": f32(state.R),
+                            "v": f32(state.v), "omega": f32(state.omega), "mu_pred": f32(pred.mu), "v_pred": f32(pred.v),
                             "P_post": f32(P_post) if self.keep_P else None, "rows": rows})
 
 
@@ -114,7 +114,7 @@ class WrongCameraObserver:
     @torch.no_grad()
     def __call__(self, *, iteration, x, x_prior, P_prior, Lambda_prior, lin, prec, alpha_terms, terms,
                  rhs_pose, meas_normal, b, grouped, lm, radius, use_trust_region, dt, cfg, M_blocks,
-                 first_return_depth, rgbd_gt, cameras):
+                 first_return_depth, rgbd_gt, cameras, **kw):
         from estimator import wrong_camera_audit as wa
         if first_return_depth:
             raise SystemExit("the wrong-camera audit decomposes the LEGACY operator; first-return depth mode is "
@@ -316,6 +316,7 @@ def main(argv=None, _setup=None) -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--source", required=True)
     ap.add_argument("--out", required=True)
+    ap.add_argument("--deterministic", action="store_true", help="bitwise reproducible reductions")
     ap.add_argument("--direction", choices=("forward",), default="forward")
     ap.add_argument("--bootstrap-iters", type=int, default=12)
     ap.add_argument("--iekf-supernode-size", type=int, default=64)
@@ -328,12 +329,20 @@ def main(argv=None, _setup=None) -> int:
     ap.add_argument("--loo-tol", type=float, default=1e-6)
     ap.add_argument("--loo-max-iters", type=int, default=400)
     ap.add_argument("--gate-c", action="store_true", help="also run the nonlinear ablation arms")
+    ap.add_argument("--deep", action="store_true",
+                    help="also the objective-conflict, group-mediation and nonlinear-attribution analyses of the "
+                         "first update (estimator/wrong_camera_deep.py)")
+    ap.add_argument("--deep-ungrouped-max-iters", type=int, default=1500)
+    ap.add_argument("--deep-top-groups", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     from estimator.masked_observation import add_cli as mask_cli
     from estimator.run_config import add_cli as rc_cli
     mask_cli(ap)
     rc_cli(ap, phase1=True)
     a = ap.parse_args(argv)
+    if a.deterministic:
+        from estimator.deterministic_ops import enable as _det_enable
+        print(f"deterministic reductions: {_det_enable()}")
     a.first_return_mode, a.first_return_prior, a.phase1_covariance_transport, a.gt_labels = "off", None, False, "off"
     out = Path(a.out) / "wrong_camera_audit"
     (out / "plots").mkdir(parents=True, exist_ok=True)
@@ -362,6 +371,7 @@ def main(argv=None, _setup=None) -> int:
            "sensor_model_id": cfg.sensor_model.model_id if cfg.sensor_model is not None else None,
            "declared": {"rgb_model_sigma": cfg.rgb_model_sigma, "depth_model_sigma": cfg.depth_model_sigma},
            "observation_mode": a.observation_mode, "phase1_partition": a.phase1_partition,
+           "deterministic_reductions": bool(a.deterministic),
            "p0_geometry": a.p0_geometry, "p0_velocity_sigma": list(a.p0_velocity_sigma),
            "num_gaussians": int(truth.mu.shape[0]),
            "note": "forces / LOO decompose the LEGACY production operator at a frozen iterate; the LOO solves are the "
@@ -532,6 +542,8 @@ def main(argv=None, _setup=None) -> int:
                    "aggregate": {"runaway": agg(runaway), "stable": agg(stable)}, "cases": cases}
         (out / "first_update_case_studies.json").write_text(json.dumps(studies, indent=1, default=float))
         _plots(out / "plots", per_frame, studies, arm_names)
+        if a.deep:
+            status.update(_deep(a, out, truth, cameras, window, cfg, ns, names, on, runaway, stable))
 
     # ---- Gate C: nonlinear ablations ---------------------------------------------------------
     abl_rows = []
@@ -581,6 +593,39 @@ def main(argv=None, _setup=None) -> int:
     _conclusion(out, man, status, per_frame, abl_rows, names)
     print(f"wrote {out} in {time.time() - t_start:.0f} s; status {status}")
     return 0 if all(not str(v).startswith("FAIL") for v in status.values()) else 1
+
+
+def _deep(a, out, truth, cameras, window, cfg, ns, names, on, runaway, stable) -> dict:
+    """Objective conflict, group mediation and nonlinear attribution at processing index 1."""
+    from estimator.wrong_camera_deep import DeepObserver
+    fr1 = on["capture"].frames[0]
+    sets = {"runaway": runaway.tolist(), "stable": stable.tolist()}
+    deep = DeepObserver(names, sets, {k: fr1[k] for k in ("mu", "R", "v", "omega")}, frame=fr1["ti"],
+                        tol=a.loo_tol, max_iters=a.loo_max_iters, max_iters_ungrouped=a.deep_ungrouped_max_iters,
+                        top_groups=a.deep_top_groups)
+    print("deep: objective conflict, group mediation, nonlinear attribution at the first update")
+    t0 = time.time()
+    chk = replay(truth, cameras, window[:2], cfg, ns, observer=deep, keep_P=False)
+    same = bool(torch.equal(chk["capture"].frames[0]["mu"], fr1["mu"]))
+    meta = {"processing_index": fr1["ti"], "frame": fr1["fid"], "x_post_source": "the Gate-B 'on' replay",
+            "x_post_bitwise_reproduced": same, "deterministic_reductions": bool(a.deterministic),
+            "num_runaway": len(sets["runaway"]), "num_stable": len(sets["stable"]), "seconds": round(time.time() - t0, 1)}
+    (out / "objective_conflict.json").write_text(json.dumps(
+        {**meta, "definition": "s = b . d / |d| per Gaussian (or supernode), d = accepted 6D pose change of the frame; "
+                               "s > 0 the term pulls along the update, s < 0 it opposes", **deep.conflict},
+        indent=1, default=float))
+    if deep.group_mediation is not None:
+        (out / "group_mediation.json").write_text(json.dumps({**meta, **deep.group_mediation}, indent=1, default=float))
+    if deep.attribution is not None:
+        acc = [r for r in fr1["rows"] if r.get("event") in ("initial", "posterior", "accepted")]
+        (out / "nonlinear_attribution.json").write_text(json.dumps(
+            {**meta, **deep.attribution, "production_energy_rows_of_this_frame": acc}, indent=1, default=float))
+    st = {"deep_x_post_reproduced": "PASS" if same else "NOT_BITWISE (run with --deterministic)"}
+    gm = deep.group_mediation or {}
+    errs = [c["decomposition_rel_err"] for k in ("grouped", "ungrouped") for c in gm.get(k, {}).get("cameras", {}).values()]
+    if errs:
+        st["deep_mediation_decomposition"] = "PASS" if max(errs) < 1e-3 else f"FAIL (max rel err {max(errs):.1e})"
+    return st
 
 
 def _plots(pdir, per_frame, studies, arm_names):

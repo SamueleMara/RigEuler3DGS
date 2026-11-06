@@ -141,6 +141,8 @@ def main() -> int:
     _mask_obs_cli(ap)
     from estimator.first_return_observation import add_cli as _fr_cli
     _fr_cli(ap)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="order-independent (bitwise reproducible) IEKF reductions, estimator/deterministic_ops.py")
     from estimator.run_config import add_cli as _rc_cli
     _rc_cli(ap, phase1=True)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
@@ -182,6 +184,9 @@ def main() -> int:
     out = Path(args.out or f"output/motion_coherence_{args.scene}")
     from estimator.masked_observation import preflight as _obs_preflight
     _obs_preflight(args, source)            # masks ready? before any model load / GPU work
+    if getattr(args, "deterministic", False):
+        from estimator.deterministic_ops import enable as _det_enable
+        print(f"  deterministic reductions: {_det_enable()}")
     if getattr(args, "first_return_mode", "off") != "off":
         # prior schema + camera coverage BEFORE any GPU work (cameras from <source>/rgb/cam_*)
         from estimator.first_return_observation import from_args as _fr_from_args

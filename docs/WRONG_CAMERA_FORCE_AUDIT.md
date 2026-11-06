@@ -44,3 +44,73 @@ Spec: `CODEX_DEBUG_RigEuler3DGS_REAL_FRIDGE_WRONG_CAMERA_GAUSSIAN_DRIFT.md`. Bra
 ## Real data: NOT RUN
 
 The only real fridge model is the frame-100 endpoint. The stationary test needs a frame-80 endpoint, so `~/run_phase1_gates.sh wcep80` builds it with the v4 settings and the v4 calibrated sensor model. Gate D (wooden box, synthetic stationary/moving controls) is also NOT RUN: the tool is forward-only and would need those endpoints.
+
+## Follow-up: deeper analysis (2026-11-06)
+
+All of it is opt-in or a separate tool. The production default is unchanged: the observer receives three extra keyword arguments (`background`, `visibility`, `observation_model`), and only when an observer is set.
+
+### Deterministic reductions: `estimator/deterministic_ops.py`, `--deterministic`
+
+- The 14 float `atomicAdd` sites are replaced by a two-pass int64 fixed-point accumulation:
+  - `iekf.cu`: 5 sites (H^T, Fisher)
+  - `iekf_group.cu`: 7 sites (group adjoint, group Fisher)
+  - `iekf_visibility.cu`: 2 sites
+- These are compiled as a separate JIT copy generated from the current production sources, and the site count is asserted.
+- `enable()` swaps the six entry points in-process and turns on `torch.use_deterministic_algorithms`.
+- Available as `--deterministic` in the wrong-camera audit, `audit_calibrated_phase1.py`, `phase0_geometry_consistency.py` and `run_motion_coherence_support.py`. In the driver it is `--phase1-deterministic`.
+- Real fridge, 80–99 from the frame-80 endpoint: two replays are **bitwise identical** in every frame (μ, v, ω, P_post and the accept sequence), at 134 s per replay. The stationary drift is unchanged (frame-99 median 12.9 mm, p99 500 mm), so it is not a nondeterminism artefact.
+
+### Deep first-update analyses: `estimator/wrong_camera_deep.py`, `--deep`
+
+All three run at processing index 1 (80→81).
+
+- `objective_conflict.json`
+  - Each camera × channel force, and the prior force, projected on every selected Gaussian's accepted 6D pose change (and per supernode, against its least-squares rigid increment).
+  - Sign convention: s > 0 pulls along the update, s < 0 opposes it.
+  - Evaluated at inner iteration 0, where the prior exerts no force, and at the last inner iteration.
+- `group_mediation.json`
+  - The exact split I_c = A⁻¹b_c[own runaway rows] + A⁻¹b_c[their groupmates] + A⁻¹b_c[rest of scene] − A⁻¹A_c(δ_-c).
+  - Computed in the canonical grouped system and in the per-Gaussian system, with the same frozen factors, prior and damping.
+- `nonlinear_attribution.json`
+  - Per camera × channel energy of the full production objective (true render) with all Gaussians, only the runaway set, only the stable set, their supernodes, or one supernode moved to x_post.
+  - Includes the exact prior energy ½dᵀΛd of each move.
+  - Self-checked against the IEKF's own initial and accepted energies.
+
+### Phase-0 geometry consistency: `tools/phase0_geometry_consistency.py`
+
+Every composited contributor is classified per camera as off-mask, in front, matched, behind, or no depth. The comparison uses σ_eff, which includes the sensor sd, the declared sd and the Gaussian's extent along the ray.
+
+Repair rules (opt-in, written to a new model directory):
+
+- `majority`: C > S.
+- `unanimous`: contradicted in every camera that sees the Gaussian.
+
+With START == END, the evidence comes from that single frame (a synthetic endpoint).
+
+Results (CPU/GPU-light, evidence 60–80 on the frame-80 endpoint):
+
+| Scene | Majority | Unanimous | Cross-view in front > 2 cm |
+|---|---|---|---|
+| fridge ep80 | 9952 / 29957 (33%) | 3012 (10%) | cam0→cam2 45%, cam2→cam0 38%, cam1→others 5–10% |
+| fridge ep100 (80–100) | 10044 / 30316 (33%) | 3114 | the same pattern |
+| USB (frame 59) | 29 / 30036 | 7 | 1–6% in every pair |
+| washer (frame 59) | 14 / 29989 | 2 | median 2.6%, worst pairs 30–39% (geometry) |
+
+Runaway Gaussians removed: 253/299 (majority) and 91/299 (unanimous). Stable Gaussians removed: 72/300 and 22/300.
+
+### Cross-camera registration: `tools/cross_camera_registration.py`
+
+- Robust point-to-plane ICP between cameras' back-projected observed depth (median over the stationary frames, object mask), starting from the calibrated cameras. No model is used.
+- Each pair records its cycle consistency, T_BA·T_AB.
+- On the fridge, only cam_000↔cam_002 gains clearly. The fraction within 1 cm goes 0.12→0.33 and 0.07→0.24, and within 2 cm 0.29→0.54 and 0.16→0.41.
+- That pair's transform is 5.8° / 31 mm and 6.7° / 51 mm, with a cycle residual of 1.95° / 38 mm.
+- The largest false gain over the 56 USB control pairs (perfect cameras) is +0.12 within 1 cm, with cycle residuals of 0.7–1.9° / 19–27 mm. Low-overlap pairs slide.
+- So the evidence is that cam_000↔cam_002 is more inconsistent than any control pair, but **not** that the extrinsics are wrong by a single rigid transform.
+
+### Tests
+
+| Test | Result |
+|---|---|
+| `tests/test_deterministic_ops.py` | PASS 8: each reduction equals production (6e-8 to 1.5e-7 rel); bitwise repeat; 4-frame replay bitwise |
+| `tests/test_wrong_camera_deep.py` | PASS 11: artefacts; x_post reproduced bitwise; the mediation split is exact (≤1.1e-5) grouped and ungrouped; the nonlinear energies equal the IEKF's initial and accepted energies; zero prior force at iteration 0 |
+| `tests/test_cross_camera_registration.py` | PASS 4: back-projection inverts projection (3e-14); a 2° / 20 mm transform is recovered; identity |
