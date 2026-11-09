@@ -89,7 +89,7 @@ def parse_args(argv=None):
     ap.add_argument("--phase2-dir", required=True,
                     help="bidirectional/<direction>_rigid (support + joint_reduction)")
     ap.add_argument("--frames", type=int, default=60)
-    ap.add_argument("--cameras", type=int, default=8)
+    ap.add_argument("--cameras", default="all", help="all | first N | cam_001,cam_002 (utils/camera_selection.py)")
     ap.add_argument("--iters", type=int, default=5, help="IEKF iterations per frame")
     ap.add_argument("--cg-iters", type=int, default=40)
     ap.add_argument("--sigma-qddot", type=float, default=1.0,
@@ -232,8 +232,9 @@ def main(argv=None) -> int:
     # inference_only: the loader would otherwise attach GT part labels to the model
     dataset, pipe, gaussians, sc = load_scene(str(model), str(source), inference_only=True,
                                             camera_device="cpu")
-    cams_all = sc.getTrainCameras()
-    ncam = min(args.cameras, len(cams_all))
+    from utils.camera_selection import select_cameras
+    cams_all = select_cameras(sc.getTrainCameras(), args.cameras)
+    ncam = len(cams_all)
     cameras = camera_specs(cams_all, ncam)
     truth = state_from_gaussians(gaussians)
     cfg = IEKFConfig()

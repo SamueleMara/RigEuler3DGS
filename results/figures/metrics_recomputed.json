@@ -1,0 +1,68 @@
+{
+  "n_scenes": 10,
+  "n_revolute": 8,
+  "n_prismatic": 2,
+  "rigeuler_runs": {
+    "foldchair_102255": "v5_canonical",
+    "laptop_10211": "v5_canonical",
+    "storage_45135": "v5_canonical",
+    "oven_101917": "v5_canonical",
+    "scissor_11100": "v5_canonical",
+    "washer_103776": "v5_gates_canonical",
+    "blade_103706": "v5_canonical",
+    "fridge_10905": "v5_canonical",
+    "stapler_103111": "v5_canonical",
+    "USB_100109": "v5_canonical"
+  },
+  "methods": {
+    "FreeArtGS": {
+      "correct_joint_types": "10/10",
+      "mean_axis_direction_error_deg": 0.04874026733964073,
+      "median_axis_direction_error_deg": 0.03045636523471855,
+      "mean_revolute_state_mae_deg": 2.944109541053093,
+      "median_revolute_state_mae_deg": 0.19092142472336335,
+      "mean_revolute_state_mae_excl_washer_deg": 0.42263822589247196,
+      "mean_prismatic_state_mae_mm": 0.4933094809588224,
+      "mean_revolute_axis_line_distance_mm": 7.959081880762813,
+      "median_revolute_axis_line_distance_mm": 0.8666403435616307,
+      "mean_gaussian_count": 73064.1
+    },
+    "RigEuler3DGS": {
+      "correct_joint_types": "10/10",
+      "mean_axis_direction_error_deg": 0.05101,
+      "median_axis_direction_error_deg": 0.0365,
+      "mean_revolute_state_mae_deg": 0.1302125,
+      "median_revolute_state_mae_deg": 0.15005000000000002,
+      "mean_revolute_state_mae_excl_washer_deg": 0.1273,
+      "mean_prismatic_state_mae_mm": 0.33899999999999997,
+      "mean_revolute_axis_line_distance_mm": 1.7702499999999999,
+      "median_revolute_axis_line_distance_mm": 1.6625,
+      "mean_gaussian_count": 29977.4
+    }
+  },
+  "n_contributing": {
+    "axis": 10,
+    "revolute_mae": 8,
+    "revolute_mae_excl_washer": 7,
+    "prismatic_mae": 2,
+    "revolute_axis_line": 8,
+    "gaussians": 10
+  },
+  "aggregation": "arithmetic mean / median over scenes, equal weight; no unit mixing",
+  "real_rigeuler_only": {
+    "type_agreement_with_visual_expectation_out_of_8": {
+      "v6": {
+        "C": 5,
+        "majority": 6,
+        "unanimous": 5
+      },
+      "v5": {
+        "C": 4,
+        "majority": 3,
+        "unanimous": 3
+      }
+    },
+    "rl_threshold": 10.0,
+    "note": "visual expectation, not ground truth; no numerical real-scene joint errors"
+  }
+}

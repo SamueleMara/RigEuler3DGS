@@ -43,11 +43,15 @@
 # --bootstrap-p0            Phase-1 pose prior from static_bidi/<end>/geometry_information.npz
 #                           (tools/train_tracking_bootstrap.py), velocity prior from
 # --p0-velocity-sigma V W   (declared, m/s rad/s)
-# --cameras N|auto  cameras used by Phase 1/2/3 (default 8, the setting of the
-#                   stable results; auto = every rgb/cam_* folder). Static
-#                   training always uses every camera of the COLMAP model.
+# --cameras all|N|cam_001,cam_002   which cameras run (default all: every rgb/cam_*
+#                   folder). A name list applies to EVERY stage: static training
+#                   uses only those views and only the seed points they saw, and
+#                   an existing endpoint model built from other cameras is refused
+#                   (use a new --output, or FORCE_STATIC=1 to retrain it). A count N
+#                   keeps its old meaning, the first N cameras for Phase 1/2/3 with
+#                   static training on all of them.
 #                   Each view keeps its own linearization on the GPU, so many
-#                   cameras (e.g. 64) need far more than an 8 GB card.
+#                   cameras (e.g. 64) need far more than an 8 GB card: pass --cameras 8.
 # --object-mask-constraint off|visible-negative-hard   (default off)
 #                hard visible-object-opacity constraint on trusted negative mask
 #                rays in Phase 1/2/3 (estimator/visibility_constraint.py); with
@@ -136,7 +140,7 @@ INPUT=${INPUT%/}; OUTPUT=${OUTPUT%/}
 STAGES=${STAGES:-"static phase1 phase2"}
 ITERS=${ITERS:-30000}
 FRAMES=${FRAMES:-auto}
-CAMS=${CAMS:-8}
+CAMS=${CAMS:-all}
 BOOT=${BOOT:-12}            # Phase-1 IEKF iterations per frame
 RIGID_ITERS=${RIGID_ITERS:-8}
 KNN=${KNN:-12}
@@ -367,7 +371,7 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
   local p0sha=none
   [ "$BOOTP0" = 1 ] && [ -f "$3/geometry_information.npz" ] && p0sha=$(sha256sum "$3/geometry_information.npz" | cut -c1-64)
   "$PY" tools/stage_signature.py compute --stage "$1" --direction "$2" --scene "$S" \
-    --source "$SRC" --model "$3" --frames "$NF" --frame-start "$MSTART" --cameras "$NC" --iterations "$ITERS" \
+    --source "$SRC" --model "$3" --frames "$NF" --frame-start "$MSTART" --cameras "$NC_NAMES" --iterations "$ITERS" \
     --observation-mode "$OBS_MODE" ${OBS_DIST_RES:+--rgb-background-distribution "$OBS_DIST_RES"} \
     ${OBS_BG[0]:+--rgb-background-constant "${OBS_BG[*]}"} --object-mask-constraint "$VIS_MODE" \
     --mask-options "${VISARGS[*]}" --mask-source "$SRC/${VIS_SUBDIR:-mask}" ${4:+--upstream "$4"} \
@@ -430,7 +434,16 @@ for S in $SCENES; do
   echo "  directions: $DIRS  (from $DIRSRC)"
   if [ -n "$MEND" ]; then NF=$(( MEND - MSTART + 1 ))
   elif [ "$FRAMES" = "auto" ]; then NF=$(( NF_ALL - MSTART )); else NF=$FRAMES; fi
-  if [ "$CAMS" = "auto" ] || [ "$CAMS" -gt "$NC_ALL" ]; then NC=$NC_ALL; else NC=$CAMS; fi
+  if ! NC_NAMES=$("$PY" utils/camera_selection.py resolve --source "$SRC" --cameras "$CAMS" 2>&1); then
+    echo "  !! $NC_NAMES -- skipping"
+    STATUS+=("$S SKIPPED(cameras not in the scene)"); continue
+  fi
+  NC=$(( $(tr -cd , <<< "$NC_NAMES" | wc -c) + 1 ))
+  # a name list narrows static training too; a count, or every camera, is plain training
+  STATIC_CAMS=()
+  if [ "$NC" -lt "$NC_ALL" ]; then
+    case "$CAMS" in *[!0-9]*) STATIC_CAMS=(--cameras "$NC_NAMES");; esac
+  fi
   if [ "$NF" -lt 2 ] || [ $(( MSTART + NF )) -gt "$NF_ALL" ]; then
     echo "  !! motion window [$MSTART, $(( MSTART + NF - 1 ))] but the scene has frames 0..$(( NF_ALL - 1 )) -- skipping"
     STATUS+=("$S SKIPPED(frames $MSTART+$NF > $NF_ALL)"); continue
@@ -438,11 +451,11 @@ for S in $SCENES; do
   if [ "$NF" -lt "$NF_ALL" ]; then
     echo "  note: $NF of $NF_ALL frames; the backward run is anchored at the LAST frame and will refuse a shorter window"
   fi
-  echo "  input OK: $NF_ALL frames x $NC_ALL cameras  (using $NF x $NC)"
+  echo "  input OK: $NF_ALL frames x $NC_ALL cameras  (using $NF x $NC: $NC_NAMES)"
   if [ "$OBS_MODE" != "original" ] || [ "$VIS_MODE" != "off" ]; then
     # masks are checked BEFORE any training or output deletion; no fallback
     MCHK=$("$PY" tools/check_masks.py --source "$SRC" --mask-source "$SRC/${VIS_SUBDIR:-mask}" \
-           --cameras "$NC" --frames "$NF" --start "$MSTART" 2>&1); MRC=$?
+           --cameras "$NC_NAMES" --frames "$NF" --start "$MSTART" 2>&1); MRC=$?
     if [ $MRC -ne 0 ]; then
       echo "  !! $MCHK" | head -6
       echo "  !! observation mode $OBS_MODE needs the masks -- skipping (pass --observation-mode original explicitly to run without them)"
@@ -467,7 +480,7 @@ for S in $SCENES; do
             --depths depth_npy --sapien_depth_is_metric \
             --iterations "$ITERS" --static_train_iters "$ITERS" \
             --test_iterations 999999 --disable_viewer --no_wandb \
-            --data_device cpu
+            --data_device cpu "${STATIC_CAMS[@]}"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
           echo "    !! static/$END failed rc=$RC"; tail -5 "$M/train.log"
@@ -482,6 +495,10 @@ for S in $SCENES; do
     if ! static_ready "$OUT/static_bidi/$END"; then
       echo "  !! static/$END missing -- cannot run the dynamic stages"
       STATUS+=("$S SKIPPED(static/$END absent)"); continue 3
+    fi
+    if ! ECHK=$("$PY" utils/camera_selection.py endpoint --model "$OUT/static_bidi/$END" --source "$SRC" --cameras "$CAMS" 2>&1); then
+      echo "  !! static/$END: $ECHK -- use a new --output, or FORCE_STATIC=1 to retrain"
+      STATUS+=("$S REFUSED(static/$END, built from other cameras)"); continue 3
     fi
   done
 
@@ -510,7 +527,7 @@ for S in $SCENES; do
           "$PY" tools/run_motion_coherence_support.py \
             --scene "$S" --direction "$DIR" \
             --model "$OUT/static_bidi/$END" --source "$SRC" \
-            --frames "$NF" --cameras "$NC" --bootstrap-iters "$BOOT" \
+            --frames "$NF" --cameras "$NC_NAMES" --bootstrap-iters "$BOOT" \
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
             --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
@@ -558,7 +575,7 @@ for S in $SCENES; do
         "$PY" tools/run_rigid_se3_pipeline.py \
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
-          --frames "$NF" --cameras "$NC" \
+          --frames "$NF" --cameras "$NC_NAMES" \
           --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
           --coherence-support "$P1/predicted_support.json" \
           --phase1-centers "$P1/phase1_centers" \
@@ -606,7 +623,7 @@ for S in $SCENES; do
         "$PY" tools/run_joint_phase3.py \
           --scene "$S" --direction "$DIR" \
           --model "$OUT/static_bidi/$END" --source "$SRC" \
-          --phase2-dir "$P2" --frames "$NF" --cameras "$NC" \
+          --phase2-dir "$P2" --frames "$NF" --cameras "$NC_NAMES" \
           --iters "$PHASE3_ITERS" --hypotheses "$PHASE3_HYP" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
           --evaluate-gt --out "$P3"
       RC=$?

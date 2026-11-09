@@ -160,9 +160,12 @@ A scene that fails is skipped with the reason printed, and the rest of the batch
 
 * `--frames auto` (the default) uses every frame of the scene. The backward run is anchored at the
   last frame, so it needs the full sequence.
-* `--cameras` sets how many cameras Phase 1/2/3 use. The default is 8, as in the stable results;
-  `--cameras auto` uses all of them.
-* Static training always uses every camera in the COLMAP model.
+* `--cameras` selects the cameras. The default `all` uses every `rgb/cam_*` folder.
+  * A name list, `--cameras cam_001,cam_002`, applies to every stage. Static training uses only
+    those views and only the COLMAP seed points they saw, and an endpoint model built from other
+    cameras is refused.
+  * A count, `--cameras 8`, means the first 8 cameras for Phase 1/2/3, with static training on all
+    of them.
 
 **Example of a failing scene.** `real/fridge_plastic_20261016_163314` has an initial model
 (`colmap/sparse/0`) holding **984 images**, every frame of its 3 cameras, while `colmap_final` holds
@@ -402,8 +405,8 @@ python tools/benchmark_masked_rgb_observation.py --model "$RES/fridge_10905/stat
 * The Phase-1 covariance repair falls back to the CPU if the GPU cannot allocate its workspace.
 * The driver sets `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 * What stays on the GPU is the render linearization of every camera used for the motion stages, and
-  it grows with the camera count. 8 cameras fit; 64 cameras (`--cameras auto` on
-  `preparation_64cams`) ran out of memory on some scenes even with the above.
+  it grows with the camera count. 8 cameras fit; 64 cameras (the default `--cameras all` on
+  `preparation_64cams`) ran out of memory on some scenes even with the above, so pass `--cameras 8` there.
 
 For reference, a completed Washer run under the example `RES` root is organised as follows:
 
@@ -488,8 +491,8 @@ SCENES="washer_103776" SRC_ROOT="$DATA" OUT_ROOT="$RES" STAGES="static phase1 ph
 Defaults:
 
 * Static training: `ITERS=30000`.
-* Window: `--frames auto` (every frame of the scene, 60 on the synthetic data); `--cameras 8` for
-  Phase 1/2/3 (`--cameras auto` = all).
+* Window: `--frames auto` (every frame of the scene, 60 on the synthetic data); `--cameras all`
+  (a count or a name list selects fewer).
 * Phase 1: `BOOT=12` iterations per frame, `IEKF_SN=64` (grouped-state size).
 * Support: `KNN=12`, `SNCOUNT=192` (coherence graph nodes), `FOLDS=5`.
 * Phase 2: `RIGID_ITERS=8` iterations per frame.
