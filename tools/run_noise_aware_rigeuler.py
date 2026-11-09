@@ -43,6 +43,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))          # utils.*, estimator.* for the declared (ideal / assumed) sensor model
+from utils.camera_selection import resolve  # noqa: E402
+
 PY = sys.executable
 EXT = (".png", ".jpg", ".jpeg")
 
@@ -81,8 +83,10 @@ def validate(a) -> dict:
     cams = sorted(p.name for p in (src / "rgb").glob("cam_*") if p.is_dir())
     if not cams:
         raise SystemExit(f"{src}/rgb has no cam_* folders")
-    if a.cameras:
-        cams = cams[:a.cameras]
+    try:
+        cams = resolve(a.cameras, cams)
+    except ValueError as ex:
+        raise SystemExit(str(ex))
     ids = frame_ids(src, cams[0])
     for c in cams[1:]:
         if frame_ids(src, c) != ids:
@@ -227,7 +231,7 @@ def main(argv=None) -> int:
     ap.add_argument("--bootstrap-mode", choices=("covariance_surface",), default="covariance_surface")
     ap.add_argument("--sensor-noise-model", choices=("calibrated", "ideal", "assumed"), required=True)
     ap.add_argument("--frame-timestamps", default=None, help="auto (real default) | PATH | off (synthetic default)")
-    ap.add_argument("--cameras", type=int, default=None, help="first N cameras (default all)")
+    ap.add_argument("--cameras", default="all", help="all | first N | cam_001,cam_002, for every stage")
     ap.add_argument("--num-gaussians", type=int, default=30000)
     ap.add_argument("--refine-iters", type=int, default=1000)
     ap.add_argument("--rgb-model-sigma", type=float, default=0.0, help="declared model-mismatch sd (not sensor)")
@@ -349,7 +353,7 @@ def main(argv=None) -> int:
                 if not a.dry_run:
                     sc.record(d, bsig, "running")
                 rc = run([PY, "tools/train_tracking_bootstrap.py", "--source", src, "--frame", frame,
-                          "--endpoint", end, "--out", d, *sensor_args,
+                          "--endpoint", end, "--cameras", ",".join(facts["cameras"]), "--out", d, *sensor_args,
                           "--num-gaussians", a.num_gaussians, "--knn", a.knn, "--refine-iters", a.refine_iters,
                           "--checkpoints", a.checkpoints, "--heldout-fraction", a.heldout_fraction,
                           "--silhouette-sigma", a.silhouette_sigma, "--thickness-weight", a.thickness_weight,
@@ -383,7 +387,7 @@ def main(argv=None) -> int:
     ph = [s for s in stages if s in ("phase1", "phase2", "phase3")]
     if ph:
         cmd = ["bash", "run_bidirectional_all.sh", "-i", src.parent, "-o", out / "pipeline", "--scenes", scene,
-               "--stages", " ".join(ph), "--cameras", str(a.cameras or len(facts["cameras"])),
+               "--stages", " ".join(ph), "--cameras", ",".join(facts["cameras"]),
                "--motion-start-frame", a.motion_start_frame, "--motion-end-frame", a.motion_end_frame,
                "--direction", ("both" if len(facts["directions"]) == 2 else facts["directions"][0]),
                "--frame-timestamps", a.frame_timestamps, *sensor_args, "--bootstrap-p0",

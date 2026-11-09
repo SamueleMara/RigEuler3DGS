@@ -152,6 +152,7 @@ def main(argv=None) -> int:
     ap.add_argument("--endpoint", choices=("initial", "final"), required=True)
     ap.add_argument("--out", required=True, help="new model directory")
     ap.add_argument("--colmap-subdir", default="colmap", help="camera geometry (identical for every frame)")
+    ap.add_argument("--cameras", default="all", help="all | first N | cam_001,cam_002 (utils/camera_selection.py)")
     ap.add_argument("--sensor-model", default=None)
     ap.add_argument("--sensor-policy", choices=("ideal", "assumed"), default="ideal")
     ap.add_argument("--num-gaussians", type=int, default=30000)
@@ -198,7 +199,13 @@ def main(argv=None) -> int:
 
     # ---- 1. samples and the surface fit ------------------------------------
     from estimator.surface_bootstrap import backproject, fit_surface, gaussian_parameters, voxel_seeds
+    from utils.camera_selection import resolve, select_cameras
     cams = colmap_cameras(src / a.colmap_subdir)
+    try:
+        chosen = resolve(a.cameras, [c[0] for c in cams])
+    except ValueError as ex:
+        raise SystemExit(str(ex))
+    cams = [c for c in cams if c[0] in chosen]
     Y, D, V, C, S, files = [], [], [], [], [], []
     obs = {}
     for ci, (name, geo) in enumerate(cams):
@@ -243,7 +250,7 @@ def main(argv=None) -> int:
     from gaussian_renderer import render
     from tools.run_iekf_scene import load_scene
     _ds, pipe, gs, sc = load_scene(str(out), str(src / a.colmap_subdir), camera_device="cpu", inference_only=True)
-    cams_s = sorted(sc.getTrainCameras() + sc.getTestCameras(), key=lambda c: c.image_name)
+    cams_s = select_cameras(sorted(sc.getTrainCameras() + sc.getTestCameras(), key=lambda c: c.image_name), a.cameras)
     names = [str(c.image_name).split("/")[0] for c in cams_s]
     if names != [c[0] for c in cams]:
         raise SystemExit(f"camera order mismatch {names} vs {[c[0] for c in cams]}")

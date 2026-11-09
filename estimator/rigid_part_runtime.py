@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from . import velocity_decay
 from .joint_iekf import FrameRecord, JointIEKFConfig, _energy, frame_step
 from .joint_manifold import se3_adjoint, se3_exp, se3_left_jacobian, se3_log
 from .manifold import project_to_so3
@@ -50,6 +51,8 @@ class RigidIEKFConfig:
     # The initial pose/velocity uncertainty at the canonical frame.
     sigma_tau0: float = 1e-2
     sigma_xi0: float = 1.0
+    # > 0: mean-reverting twist, correlation time in seconds (velocity_decay.py)
+    velocity_tau: float = 0.0
 
     def to_joint(self) -> JointIEKFConfig:
         """The shared solver's config. Only solver knobs cross over."""
@@ -130,13 +133,18 @@ class RigidState:
         which image evidence about the pose reaches the velocity, because a
         single image has no velocity derivative at all (section 11). At
         `xi = 0` it degenerates to the familiar `[[I, dt I], [0, I]]`.
+
+        With `velocity_tau > 0` the twist decays, `xi_{t+1} = phi xi_t`, and the
+        pose integrates it over `h = tau (1 - phi)` in place of `dt`.
         """
         p = self.parts[0]
-        xi = p.twist(frame) * float(dt)
+        phi, h, _, _, _ = velocity_decay.terms(dt, self._cfg.velocity_tau)
+        xi = p.twist(frame) * h
         E_R, E_t = se3_exp(xi.reshape(1, 6))
         F = torch.eye(RIGID_ERROR_DIM, dtype=torch.float64)
         F[TAU, TAU] = se3_adjoint(E_R, E_t)[0]
-        F[TAU, XI] = float(dt) * se3_left_jacobian(xi.reshape(1, 6))[0]
+        F[TAU, XI] = h * se3_left_jacobian(xi.reshape(1, 6))[0]
+        F[XI, XI] = phi * torch.eye(6, dtype=torch.float64)
         return F
 
     def process_noise(self, dt: float) -> Tensor:
@@ -146,16 +154,16 @@ class RigidState:
         pose is driven by the velocity, so an unmodelled acceleration reaches
         it through `dt^3/3`.
         """
-        dt = float(dt)
+        _, _, cxx, cxv, cvv = velocity_decay.terms(dt, self._cfg.velocity_tau)
         Q = torch.zeros((RIGID_ERROR_DIM, RIGID_ERROR_DIM),
                         dtype=torch.float64)
         s2 = torch.tensor([self._cfg.sigma_vdot ** 2] * 3
                           + [self._cfg.sigma_wdot ** 2] * 3,
                           dtype=torch.float64)
-        Q[TAU, TAU] = torch.diag(s2 * dt ** 3 / 3.0)
-        Q[TAU, XI] = torch.diag(s2 * dt ** 2 / 2.0)
-        Q[XI, TAU] = torch.diag(s2 * dt ** 2 / 2.0)
-        Q[XI, XI] = torch.diag(s2 * dt)
+        Q[TAU, TAU] = torch.diag(s2 * cxx)
+        Q[TAU, XI] = torch.diag(s2 * cxv)
+        Q[XI, TAU] = torch.diag(s2 * cxv)
+        Q[XI, XI] = torch.diag(s2 * cvv)
         return Q
 
     def predict(self, frame: int, dt: float, sigma_qddot: float = 1.0):
@@ -164,12 +172,13 @@ class RigidState:
         F = self.process_matrix(frame, dt)
         Q = self.process_noise(dt)
         if frame + 1 < p.num_frames:
-            E_R, E_t = se3_exp((p.twist(frame) * float(dt)).reshape(1, 6))
+            phi, h, _, _, _ = velocity_decay.terms(dt, self._cfg.velocity_tau)
+            E_R, E_t = se3_exp((p.twist(frame) * h).reshape(1, 6))
             p.R[frame + 1] = project_to_so3(
                 (E_R[0] @ p.R[frame]).reshape(1, 3, 3))[0]
             p.p[frame + 1] = E_R[0] @ p.p[frame] + E_t[0]
-            p.v[frame + 1] = p.v[frame].clone()
-            p.omega[frame + 1] = p.omega[frame].clone()
+            p.v[frame + 1] = p.v[frame] * phi
+            p.omega[frame + 1] = p.omega[frame] * phi
         self.covariance = F @ self.covariance @ F.T + Q
         return self
 

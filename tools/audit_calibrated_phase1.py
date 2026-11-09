@@ -472,7 +472,9 @@ def setup_window(args):
     from tools.run_iekf_scene import camera_specs, dataset_rgbd_frames, load_scene, state_from_gaussians
     _ds, _pipe, gs, sc = load_scene(args.model, str(Path(args.source) / "colmap"), camera_device="cpu",
                                     inference_only=True)
-    cams_all = sorted(sc.getTrainCameras() + sc.getTestCameras(), key=lambda c: c.image_name)
+    from utils.camera_selection import select_cameras
+    cams_all = select_cameras(sorted(sc.getTrainCameras() + sc.getTestCameras(), key=lambda c: c.image_name),
+                              getattr(args, "cameras", None))
     ncam = len(cams_all)
     truth = state_from_gaussians(gs)
     cfg = IEKFConfig()

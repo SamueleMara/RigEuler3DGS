@@ -258,7 +258,31 @@ def _resolve_depths_folder(path, depths):
         f"{os.path.join(os.path.dirname(os.path.abspath(path)), depths)}")
 
 
-def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, load_gt_parts=True):
+def _seed_points_of_cameras(pcd, path, cam_extrinsics, names):
+    """The seed points seen by the selected cameras, from the COLMAP tracks.
+
+    A fused cloud holds every camera's points. Dropping a camera from the loss
+    only would leave the points it alone saw in the model, where no remaining
+    view can correct them."""
+    from utils.camera_selection import camera_name
+    from utils.read_write_model import read_points3D_binary, read_points3D_text
+    keep_ids = {i for i, e in cam_extrinsics.items() if camera_name(e.name) in names}
+    bin_path = os.path.join(path, "sparse/0/points3D.bin")
+    pts = list((read_points3D_binary(bin_path) if os.path.exists(bin_path)
+                else read_points3D_text(os.path.join(path, "sparse/0/points3D.txt"))).values())
+    xyz = np.array([p.xyz for p in pts])
+    if xyz.shape != pcd.points.shape or not np.allclose(xyz, pcd.points, atol=1e-4):
+        raise ValueError(f"{path}: points3D.ply and the COLMAP points differ, so the seed "
+                         "points cannot be attributed to cameras")
+    keep = np.array([bool(keep_ids.intersection(p.image_ids.tolist())) for p in pts])
+    if not keep.any():
+        raise ValueError(f"{path}: no seed point has a track in the cameras {names}")
+    print(f"Seed points of cameras {names}: {int(keep.sum())} of {len(keep)}")
+    return pcd._replace(points=pcd.points[keep], colors=pcd.colors[keep], normals=pcd.normals[keep],
+                        part_indices=None if pcd.part_indices is None else pcd.part_indices[keep])
+
+
+def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, load_gt_parts=True, cameras=None):
     try:
         cameras_extrinsic_file = os.path.join(path, "sparse/0", "images.bin")
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -320,6 +344,11 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, 
         depths_folder=_resolve_depths_folder(path, depths),
         test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+    selected = None
+    if cameras:
+        from utils.camera_selection import camera_name, resolve
+        selected = resolve(cameras, sorted({camera_name(c.image_name) for c in cam_infos}))
+        cam_infos = [c for c in cam_infos if camera_name(c.image_name) in selected]
 
     train_cam_infos = [c for c in cam_infos if train_test_exp or not c.is_test]
     test_cam_infos = [c for c in cam_infos if c.is_test]
@@ -340,6 +369,10 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8, 
         pcd = fetchPly(ply_path, load_gt_parts=load_gt_parts)
     except:
         pcd = None
+    if selected is not None:
+        if pcd is None:
+            raise ValueError(f"{ply_path}: unreadable, so the seed points of {selected} cannot be selected")
+        pcd = _seed_points_of_cameras(pcd, path, cam_extrinsics, selected)
 
     scene_info = SceneInfo(point_cloud=pcd,
                            train_cameras=train_cam_infos,

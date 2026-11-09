@@ -41,6 +41,9 @@ import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from utils.camera_selection import resolve  # noqa: E402
+
 MANIFEST = "stage_manifest.json"
 EXT = (".png", ".jpg", ".jpeg")
 
@@ -110,7 +113,7 @@ def _code_version() -> dict:
 
 def compute(a) -> dict:
     src = Path(a.source)
-    cams = sorted(p.name for p in (src / "rgb").glob("cam_*") if p.is_dir())[: int(a.cameras)]
+    cams = resolve(a.cameras, sorted(p.name for p in (src / "rgb").glob("cam_*") if p.is_dir()))
     model = Path(a.model)
     ply = model / "point_cloud" / f"iteration_{a.iterations}" / "point_cloud.ply"
     mode = a.observation_mode

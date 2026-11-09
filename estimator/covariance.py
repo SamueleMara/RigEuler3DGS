@@ -22,6 +22,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from . import velocity_decay
+
 ERROR_DIM = 12
 POSE_DIM = 6
 
@@ -118,8 +120,13 @@ def make_process_noise(
     sigma_omega: ScalarLike,
     device: Optional[torch.device] = None,
     dtype: Optional[torch.dtype] = None,
+    tau: float = 0.0,
 ) -> torch.Tensor:
     """Per-Gaussian process noise ``Q`` for a step of real duration ``dt``.
+
+    ``tau > 0``: the acceleration densities drive a mean-reverting twist and the
+    triple below is replaced by its exact Ornstein-Uhlenbeck discretization
+    (estimator/velocity_decay.py); the pose random-walk part is unchanged.
 
     dt SCALING CHOICE (documented as required by the contract): all four sigmas
     are continuous-time noise DENSITIES in units of [value] / sqrt(second), and
@@ -181,6 +188,10 @@ def make_process_noise(
     phi_phi = s_rot * s_rot * dt1 + q_omg * dt3 / 3.0
     phi_w = q_omg * dt2 / 2.0
     w_w = q_omg * dt1
+    if velocity_decay.enabled(tau):
+        _, _, cxx, cxv, cvv = velocity_decay.terms_tensor(step, tau)
+        mu_mu, mu_v, v_v = s_pos * s_pos * dt1 + q_vel * cxx, q_vel * cxv, q_vel * cvv
+        phi_phi, phi_w, w_w = s_rot * s_rot * dt1 + q_omg * cxx, q_omg * cxv, q_omg * cvv
 
     eye3 = torch.eye(3, device=device, dtype=dtype).expand(n, 3, 3)
     Q = torch.zeros(n, ERROR_DIM, ERROR_DIM, device=device, dtype=dtype)

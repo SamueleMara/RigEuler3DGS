@@ -107,6 +107,9 @@ class IEKFConfig:
     process_noise_rot: float = 1e-3
     process_noise_vel: float = 1e-1
     process_noise_omega: float = 1e-1
+    # > 0: mean-reverting twist with this correlation time in seconds
+    # (estimator/velocity_decay.py); 0 = the constant twist above
+    velocity_tau: float = 0.0
     eps_depth: float = 1e-6
     antialiasing: bool = False
     # Section 27: a pixel with no coverage carries no depth measurement. This
@@ -562,16 +565,22 @@ def iekf_frame_step(
     from .process import error_state_transition
     from .process import process_predict as _proc_pred
 
-    _proc = process_predict or _proc_pred
     _cov = covariance_predict or _cov_pred
-    x_prior = _proc(state_prev_post, dt)
-    F = error_state_transition(state_prev_post, dt, mode="so3")
+    tau = float(getattr(cfg, "velocity_tau", 0.0) or 0.0)
+    if tau > 0:
+        if process_predict is not None or process_noise is not None:
+            raise ValueError("velocity_tau > 0 uses the built-in mean-reverting process; "
+                             "an injected process_predict / process_noise would ignore it")
+        x_prior = _proc_pred(state_prev_post, dt, tau=tau)
+    else:
+        x_prior = (process_predict or _proc_pred)(state_prev_post, dt)
+    F = error_state_transition(state_prev_post, dt, mode="so3", tau=tau)
     if process_noise is None:
         process_noise = make_process_noise(
             state_prev_post.num_gaussians, dt,
             cfg.process_noise_pos, cfg.process_noise_rot,
             cfg.process_noise_vel, cfg.process_noise_omega,
-            device=state_prev_post.mu.device, dtype=state_prev_post.mu.dtype)
+            device=state_prev_post.mu.device, dtype=state_prev_post.mu.dtype, tau=tau)
     P_prior = _cov(P_prev_post, F, process_noise)
     # The prior information must be PSD or the MAP objective is unbounded below
     # along the offending direction, and "minimizing" it is meaningless.
