@@ -29,6 +29,7 @@ No Adam, no autograd, no loss.backward() anywhere in this file (section 36).
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -106,6 +107,9 @@ class IEKFConfig:
     process_noise_rot: float = 1e-3
     process_noise_vel: float = 1e-1
     process_noise_omega: float = 1e-1
+    # > 0: mean-reverting twist with this correlation time in seconds
+    # (estimator/velocity_decay.py); 0 = the constant twist above
+    velocity_tau: float = 0.0
     eps_depth: float = 1e-6
     antialiasing: bool = False
     # Section 27: a pixel with no coverage carries no depth measurement. This
@@ -179,6 +183,20 @@ class IEKFConfig:
     supernode_count: int | None = None
     supernode_knn: int = 8
     supernode_seed: int = 0
+    # RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md section 5 E5: express the
+    # prior information in the tangent at the ACCEPTED state before adding the Fisher
+    # (Lambda_post = J^T Lambda_prior J + F, J = blockdiag(I, J_l(a)^-1, I, I),
+    # a = Log(R R_prior^T)). Off = the legacy Lambda_prior + F.
+    covariance_tangent_transport: bool = False
+    # RigEuler3DGS_CODEX_Phase1_FirstReturn_Implementation_2026-11-05.md section 4.2: recorded
+    # for the manifests; the observation itself is passed to iekf_frame_step(first_return=...)
+    # DIAGNOSTIC ONLY (wrong-camera audit, Gate C): {camera_name: ["rgb"|"depth"|"alpha", ...]}
+    # removes those channels of that camera from objective, RHS and curvature alike.
+    # None (default) = production.
+    debug_ablation: dict | None = None
+    first_return_mode: str = "off"
+    first_return_prior_path: str | None = None
+    first_return_posterior: str = "unavailable"
 
     # ---- V2 section 6: support inference before joint reduction --------
     # On a real scene only part of the cloud moves, so the joint must be fitted
@@ -222,6 +240,8 @@ class IEKFDiagnostics:
     # without re-parsing the log.
     trust_region: "TrustRegionHistory | None" = None
     observability: "object | None" = None
+    # first-return evaluation at the accepted state (audit / depth modes only)
+    first_return: "object | None" = None
 
     def add(self, **kw) -> None:
         self.rows.append(dict(kw))
@@ -407,11 +427,17 @@ def evaluate_true_map_energy(
     background: torch.Tensor | None = None,
     visibility=None,
     observation_model=None,
+    first_return=None,
 ) -> tuple[float, dict, FrameLinearization]:
     """Section 13's J(delta) = prior energy + measurement energy, evaluated on
     the TRUE nonlinear render -- this is what acceptance is judged on. With a
     negative-ray constraint the measurement term is on object-valid rays and the
-    trial's visible-alpha values are attached to the linearization for the audit."""
+    trial's visible-alpha values are attached to the linearization for the audit.
+
+    `first_return` in mode "depth" (estimator/first_return_observation.py): `cfg`
+    must already have use_depth=False (the caller's cfg_terms), so the legacy terms
+    carry RGB + alpha only, and the full nonlinear first-return depth likelihood of
+    THIS trial state (fresh contributor order) is added."""
     lin = build_linearization(state, cameras, background=background,
                               eps_depth=cfg.eps_depth,
                               antialiasing=cfg.antialiasing, debug=cfg.debug)
@@ -425,13 +451,22 @@ def evaluate_true_map_energy(
         lin.visibility_values = visibility.evaluate(lin)
     sm = summarize(terms)
     meas = sm["rgb"] + sm["depth"] + sm["alpha"]
+    fr_parts = {}
+    if first_return is not None and first_return.replaces_depth:
+        if cfg.use_depth:
+            raise AssertionError("first-return depth mode with the blended depth still enabled: "
+                                 "the depth evidence would be counted twice")
+        fr = first_return.evaluate(lin, rgbd_gt, cfg, diagnostics=False)
+        lin.first_return_evaluation = fr
+        meas += fr.measurement_energy
+        fr_parts = {"first_return_depth_energy": fr.measurement_energy}
     delta = boxminus(state, x_prior)
     prior = 0.5 * float((delta * apply_prior(Lambda_prior, delta)).sum())
     return meas + prior, {"measurement": meas, "prior": prior, "rgb_energy": sm["rgb"],
                           "depth_energy": sm["depth"], "alpha_energy": sm["alpha"],
                           "depth_observed_valid": sm["depth_observed_valid"],
                           "depth_used": sm["depth_used"],
-                          "depth_gated_by_alpha": sm["depth_gated_by_alpha"]}, lin
+                          "depth_gated_by_alpha": sm["depth_gated_by_alpha"], **fr_parts}, lin
 
 
 def iekf_frame_step(
@@ -450,6 +485,9 @@ def iekf_frame_step(
     information_observer: Callable | None = None,
     visibility=None,
     observation_model=None,
+    group_geometry: str = "canonical",
+    first_return=None,
+    iteration_observer: Callable | None = None,
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
@@ -462,7 +500,24 @@ def iekf_frame_step(
     the measurement is masked RGB + (expected mode) 1/2 kappa (A - M)^2 + depth on
     the object only -- in the energy, the RHS, the normal operator, the Fisher
     preconditioner and the posterior alike.
+
+    ``group_geometry`` (with a supplied ``partition``): "canonical" evaluates the
+    group tangent's lever arms mu_i - c_c on the partition's canonical means (the
+    original behaviour); "current" keeps the canonical MEMBERSHIP but evaluates the
+    lever arms on this frame's predicted means and member centroids, which is the
+    rigid-motion tangent of a group that has already rotated away from canonical.
     """
+    if group_geometry not in ("canonical", "current"):
+        raise ValueError(f"group_geometry must be 'canonical' or 'current', not {group_geometry!r}")
+    # First-return (opt-in): "depth" removes the blended depth from every legacy term
+    # (objective, RHS, normal operator, Fisher, posterior) and adds the per-contributor
+    # likelihood through `_meas_ops`; "audit" changes nothing in the update.
+    fr_depth = first_return is not None and first_return.replaces_depth
+    if first_return is not None and first_return.enabled and observation_model is None:
+        raise ValueError("first-return needs the masked observation model (M = 1 eligibility)")
+    if fr_depth and visibility is not None:
+        raise ValueError("first-return and the negative-ray constraint are different measurement models")
+    cfg_terms = dataclasses.replace(cfg, use_depth=False) if fr_depth else cfg
     cfg = cfg or IEKFConfig()
     if cfg.cache_derivative_basis:
         raise NotImplementedError(
@@ -510,16 +565,22 @@ def iekf_frame_step(
     from .process import error_state_transition
     from .process import process_predict as _proc_pred
 
-    _proc = process_predict or _proc_pred
     _cov = covariance_predict or _cov_pred
-    x_prior = _proc(state_prev_post, dt)
-    F = error_state_transition(state_prev_post, dt, mode="so3")
+    tau = float(getattr(cfg, "velocity_tau", 0.0) or 0.0)
+    if tau > 0:
+        if process_predict is not None or process_noise is not None:
+            raise ValueError("velocity_tau > 0 uses the built-in mean-reverting process; "
+                             "an injected process_predict / process_noise would ignore it")
+        x_prior = _proc_pred(state_prev_post, dt, tau=tau)
+    else:
+        x_prior = (process_predict or _proc_pred)(state_prev_post, dt)
+    F = error_state_transition(state_prev_post, dt, mode="so3", tau=tau)
     if process_noise is None:
         process_noise = make_process_noise(
             state_prev_post.num_gaussians, dt,
             cfg.process_noise_pos, cfg.process_noise_rot,
             cfg.process_noise_vel, cfg.process_noise_omega,
-            device=state_prev_post.mu.device, dtype=state_prev_post.mu.dtype)
+            device=state_prev_post.mu.device, dtype=state_prev_post.mu.dtype, tau=tau)
     P_prior = _cov(P_prev_post, F, process_noise)
     # The prior information must be PSD or the MAP objective is unbounded below
     # along the offending direction, and "minimizing" it is meaningless.
@@ -536,7 +597,7 @@ def iekf_frame_step(
         objective was evaluated with; alpha_terms is None unless expected-quad."""
         terms = getattr(L, "frame_terms", None)
         if terms is None:
-            terms = _frame_terms(L.views, rgbd_gt, cfg, visibility, observation_model)
+            terms = _frame_terms(L.views, rgbd_gt, cfg_terms, visibility, observation_model)
             L.frame_terms = terms
         prec = [t.as_prec4() for t in terms]
         if observation_model is not None and observation_model.alpha_term:
@@ -547,8 +608,28 @@ def iekf_frame_step(
     x = x_prior
     lm = float(cfg.lm_initial)
     energy, parts, lin = evaluate_true_map_energy(
-        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
-        observation_model)
+        x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
+        observation_model, first_return)
+
+    def _meas_ops(L, prec, alpha_terms):
+        """(rhs, normal, fisher) of the frame's measurement in the pose tangent. In
+        first-return depth mode: the legacy RGB + alpha operators (depth precision
+        is zero in cfg_terms) PLUS the first-return score / PSD local curvature /
+        its diagonal blocks, all read from the evaluation of THIS linearization."""
+        rhs0, normal0, fisher0 = measurement_operators(L, prec, alpha_terms)
+        if not fr_depth:
+            return rhs0, normal0, fisher0
+        fr = getattr(L, "first_return_evaluation", None)
+        if fr is None:
+            raise AssertionError("first-return evaluation missing on the linearization (stale cache)")
+        rhs = rhs0 + fr.score_pose().to(rhs0.dtype)
+
+        def normal(v):
+            return normal0(v) + fr.normal_pose(v)
+
+        def fisher():
+            return fisher0() + fr.fisher_pose().to(rhs0.dtype)
+        return rhs, normal, fisher
 
     # --- 2b. V2 section 4: the scaled trust region -------------------------
     # The metric is built ONCE per frame and never changes inside the loop, so
@@ -580,7 +661,17 @@ def iekf_frame_step(
             x_prior.mu, target_size=cfg.supernode_target_size,
             num_supernodes=cfg.supernode_count, knn=cfg.supernode_knn,
             seed=cfg.supernode_seed)
-        grouped = GroupedObservation(linearization=None, partition=part)
+        if partition is not None and group_geometry == "current":
+            sid = part.supernode_id.long()
+            if bool((sid < 0).any()):
+                raise ValueError("group_geometry='current' needs every Gaussian assigned to a group")
+            cnt = torch.bincount(sid, minlength=part.num_supernodes).clamp_min(1).to(x_prior.mu.dtype)
+            cent = torch.zeros((part.num_supernodes, 3), device=x_prior.mu.device, dtype=x_prior.mu.dtype)
+            cent.index_add_(0, sid, x_prior.mu)
+            grouped = GroupedObservation(linearization=None, partition=part, canonical_means=x_prior.mu,
+                                         centroids=cent / cnt[:, None])
+        else:
+            grouped = GroupedObservation(linearization=None, partition=part)
         group_metric = ScalingMetric.from_physical_scales(
             (part.num_supernodes, STATE_DIM), x.mu.device, x.mu.dtype,
             sigma_mu=cfg.scale_sigma_mu, sigma_phi=cfg.scale_sigma_phi,
@@ -654,7 +745,7 @@ def iekf_frame_step(
 
         # --- 5. RHS measurement information (section 22) -------------------
         # (+ H_A^T K (M - A), the exact background-expectation term, when masked)
-        rhs_pose, meas_normal, meas_fisher = measurement_operators(lin, prec, alpha_terms)
+        rhs_pose, meas_normal, meas_fisher = _meas_ops(lin, prec, alpha_terms)
         rhs = embed_pose_to_full_state(rhs_pose)
         delta_from_prior = boxminus(x, x_prior)
         b = rhs - apply_prior(Lambda_prior, delta_from_prior)
@@ -728,6 +819,15 @@ def iekf_frame_step(
         # ||b|| is the gradient of the true objective at this iterate; it is the
         # quantity that must go to zero for convergence to mean anything.
         grad_norm = float(solve_b.norm())
+        if iteration_observer is not None:
+            with torch.no_grad():
+                iteration_observer(
+                    iteration=j, x=x, x_prior=x_prior, P_prior=P_prior, Lambda_prior=Lambda_prior,
+                    lin=lin, prec=prec, alpha_terms=alpha_terms, terms=getattr(lin, "frame_terms", None),
+                    rhs_pose=rhs_pose, meas_normal=meas_normal, b=b, grouped=grouped, lm=lm,
+                    radius=radius, use_trust_region=cfg.use_trust_region, dt=dt, cfg=cfg_terms,
+                    M_blocks=M_blocks, first_return_depth=fr_depth, rgbd_gt=rgbd_gt, cameras=cameras,
+                    background=background, visibility=visibility, observation_model=observation_model)
         energy_before = energy
 
         # --- 8/9. Step control ---------------------------------------------
@@ -796,8 +896,8 @@ def iekf_frame_step(
                     step = expand_step(solve_step) if expand_step is not None else solve_step
                     x_try = boxplus(x, step)
                     e_try, parts_try, lin_try = evaluate_true_map_energy(
-                        x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
-                        observation_model)
+                        x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
+                        observation_model, first_return)
                     vis_new = visibility.row_values(lin_try.visibility_values)
                     vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
                     if vis_audit["ok"] or n_soc >= 2:
@@ -818,8 +918,8 @@ def iekf_frame_step(
             if visibility is None:
                 x_try = boxplus(x, step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
-                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
-                        observation_model)
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
+                        observation_model, first_return)
             actual = energy_before - e_try
             # Section 4.4's gain ratio. A predicted reduction at round-off is
             # not evidence of anything, so rho is NaN there and adapt_radius
@@ -881,8 +981,8 @@ def iekf_frame_step(
             while alpha >= cfg.alpha_min:
                 x_try = boxplus(x, alpha * step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
-                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg, background, visibility,
-                        observation_model)
+                    x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
+                        observation_model, first_return)
                 if e_try < energy:
                     x, energy, lin, parts = x_try, e_try, lin_try, parts_try
                     lm = max(cfg.lm_min, lm * cfg.lm_accept_scale)
@@ -990,8 +1090,27 @@ def iekf_frame_step(
 
     # --- 11. Approximate posterior marginals, ONCE (section 17) ------------
     prec, alpha_terms = _terms(lin)
-    fisher_pose = measurement_operators(lin, prec, alpha_terms)[2]()
-    Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
+    fisher_pose = _meas_ops(lin, prec, alpha_terms)[2]()
+    if first_return is not None and first_return.enabled:
+        # audit: evaluated at the ACCEPTED state with diagnostics; never fed back in audit mode
+        fr_final = first_return.evaluate(lin, rgbd_gt, cfg_terms, diagnostics=True)
+        diag.first_return = fr_final
+        diag.add(iteration=-2, event="first_return", mode=first_return.mode, **fr_final.summary())
+    transport_info = {"covariance_tangent_transport": bool(cfg.covariance_tangent_transport)}
+    if cfg.covariance_tangent_transport:
+        # Lambda_prior lives in the tangent at x_prior; the Fisher in the tangent at x.
+        # A left error e at x maps to the prior coordinate a + J_l(a)^-1 e (BCH, first
+        # order in e), so the prior information seen from x is J^T Lambda_prior J.
+        from .manifold import so3_left_jacobian_inverse
+        a = boxminus(x, x_prior)[:, 3:6].double()
+        J = torch.eye(STATE_DIM, dtype=torch.float64, device=a.device).repeat(a.shape[0], 1, 1)
+        J[:, 3:6, 3:6] = so3_left_jacobian_inverse(a)
+        Lp = J.transpose(1, 2) @ Lambda_prior.double() @ J
+        Lambda_prior_x = (0.5 * (Lp + Lp.transpose(1, 2))).to(Lambda_prior.dtype)
+        transport_info["max_rotation_rad"] = float(a.norm(dim=1).max()) if a.numel() else 0.0
+        Lambda_post = approximate_posterior_information(Lambda_prior_x, fisher_pose)
+    else:
+        Lambda_post = approximate_posterior_information(Lambda_prior, fisher_pose)
     # Invert in float64 and project back onto the PSD cone. The measurement
     # Fisher spans ~1e6 between a well-seen and an unseen direction, so the
     # block condition number is past what float32 can invert: without this the
@@ -1028,6 +1147,15 @@ def iekf_frame_step(
     P_post = P_post.to(Lambda_post.dtype)
 
     diag.add(iteration=-2, event="posterior",
+             # section 5 E1/E4: per-Gaussian (Lambda_prior,i + F_ii)^-1 blocks, not the exact
+             # marginal of the coupled problem; uncertified unless the solve converged
+             approximation="BLOCK_INFORMATION_APPROXIMATION",
+             posterior_status=("POSTERIOR_UNCERTIFIED" if fr_depth
+                               else "LOCAL_HESSIAN_AT_CONVERGED_STATE" if stop_reason == "converged"
+                               else "UNCERTIFIED_NOT_CONVERGED"),
+             curvature=("legacy RGB+alpha Fisher + first-return B_match + B_vis (empirical Fisher); "
+                        "missing-association information NOT subtracted" if fr_depth else "legacy Fisher"),
+             **transport_info,
              posterior_inverse_fallbacks=int(post_diag.n_fallback),
              mean_fisher_trace=float(fisher_pose.diagonal(dim1=1, dim2=2).sum(-1).mean()),
              posterior_psd_blocks_floored=psd_diag["blocks_floored"],

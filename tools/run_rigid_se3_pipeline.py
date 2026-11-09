@@ -105,6 +105,18 @@ def main() -> int:
                          "default. 'current' is the Otsu ablation. There is "
                          "no silent fallback between them.")
     ap.add_argument("--coherence-support", default=None)
+    ap.add_argument("--support-refine", choices=("off", "free-space"), default="off",
+                    help="free-space: after the first rigid solve, re-assign every Gaussian by the "
+                         "two-hypothesis free-space test against the observed depth "
+                         "(estimator/free_space_support.py) and solve again on that support")
+    ap.add_argument("--support-refine-rounds", type=int, default=1,
+                    help="refine -> re-solve rounds (each costs one rigid Phase-2 solve)")
+    ap.add_argument("--support-refine-tau", type=float, default=0.02,
+                    help="depth tolerance [m] of the consistent / violated / hidden test")
+    ap.add_argument("--support-refine-margin", type=float, default=4.0)
+    ap.add_argument("--support-refine-min-obs", type=int, default=6)
+    ap.add_argument("--support-refine-min-members", type=int, default=200,
+                    help="fewer Gaussians with moving evidence: keep the coherence support")
     ap.add_argument("--phase1-centers", default=None,
                     help="reuse an existing phase1/centers directory")
     ap.add_argument("--supernode-size", type=int, default=64)
@@ -324,7 +336,7 @@ def main() -> int:
         np.save(p1dir / "centers" / f"centers_frame_{t:04d}.npy",
                 torch.as_tensor(p).double().cpu().numpy())
     _json(p1dir / "phase1_info.json",
-          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v) and k != "rotations"})
+          {k: v for k, v in (p1_info or {}).items() if not torch.is_tensor(v) and k not in ("rotations", "partition_arrays")})
 
     # =====================================================================
     # 2. COHERENCE MOVING_RIGID SUPPORT (sections 1, 2)
@@ -350,22 +362,26 @@ def main() -> int:
     # =====================================================================
     print("\n  [3/7] Phase-1 Kabsch rigid initialization")
     stage(f"[3/7] {args.scene}: Phase-1 Kabsch")
-    init = kabsch_initialize(members, mu0.cpu(),
-                             [torch.as_tensor(p).double().cpu()
-                              for p in positions], times=time_s)
-    kab = init["part"]
-    kabsch_R, kabsch_p = kab.R.clone(), kab.p.clone()
-    unexp = init["unexplained_fraction_final"]
-    print(f"      max mean Kabsch residual {init['max_mean_residual']:.5f}"
-          f"   ({init['weighting']})")
-    print(f"      unexplained by ONE rigid motion, at the last frame: "
-          f"{100 * unexp:.0f}% of the displacement")
-    if unexp == unexp and unexp > 0.4:
-        print(f"      NOTE: a single rigid motion leaves {100 * unexp:.0f}% of "
-              f"this support's displacement unexplained. That is either a "
-              f"support spanning several bodies or a noisy Phase 1 over it -- "
-              f"gamma_1DOF below separates them. Phase 2 fits the best single "
-              f"rigid trajectory either way.")
+
+    def kabsch(members):
+        init = kabsch_initialize(members, mu0.cpu(),
+                                 [torch.as_tensor(p).double().cpu()
+                                  for p in positions], times=time_s)
+        kab = init["part"]
+        unexp = init["unexplained_fraction_final"]
+        print(f"      max mean Kabsch residual {init['max_mean_residual']:.5f}"
+              f"   ({init['weighting']})")
+        print(f"      unexplained by ONE rigid motion, at the last frame: "
+              f"{100 * unexp:.0f}% of the displacement")
+        if unexp == unexp and unexp > 0.4:
+            print(f"      NOTE: a single rigid motion leaves {100 * unexp:.0f}% of "
+                  f"this support's displacement unexplained. That is either a "
+                  f"support spanning several bodies or a noisy Phase 1 over it -- "
+                  f"gamma_1DOF below separates them. Phase 2 fits the best single "
+                  f"rigid trajectory either way.")
+        return init, kab.R.clone(), kab.p.clone()
+
+    init, kabsch_R, kabsch_p = kabsch(members)
 
     # =====================================================================
     # 4. RIGID SE(3) RGB-D PHASE 2 (sections 13-15, 18)
@@ -375,7 +391,8 @@ def main() -> int:
     rcfg = RigidIEKFConfig(max_iters=args.rigid_iters,
                            max_cg_iters=args.rigid_cg_iters,
                            sigma_vdot=args.sigma_vdot,
-                           sigma_wdot=args.sigma_wdot)
+                           sigma_wdot=args.sigma_wdot,
+                           velocity_tau=_rc.velocity_tau(args))
     state = RigidState(init["part"], rcfg)
 
     def linearize(st, frame):
@@ -395,10 +412,25 @@ def main() -> int:
                  for ob in obs_all]
     from estimator.visibility_constraint import from_args as _vis_from_args
     vis_seq = _vis_from_args(args, source, frames_raw, frame_ids)
-    res = run_rigid_window(state, mu0, R0, obs_pairs if mseq is None else prepared, _lin, precision_fn,
-                           times=time_s,
-                           cfg=rcfg, label="rigid", visibility=vis_seq,
-                           observation_model=None if mseq is None else mseq.model)
+
+    def solve(state):
+        return run_rigid_window(state, mu0, R0, obs_pairs if mseq is None else prepared, _lin, precision_fn,
+                                times=time_s,
+                                cfg=rcfg, label="rigid", visibility=vis_seq,
+                                observation_model=None if mseq is None else mseq.model)
+
+    res = solve(state)
+    if args.support_refine == "free-space":
+        members, ev, refined = _refine_support(args, out, mu0, members, ev, res, obs_all, cameras)
+        if refined is not None:
+            init, kabsch_R, kabsch_p = kabsch(members)
+            res = solve(RigidState(init["part"], rcfg))
+            for r in range(1, args.support_refine_rounds):
+                members, ev, refined = _refine_support(args, out, mu0, members, ev, res, obs_all, cameras, r)
+                if refined is None:
+                    break
+                init, kabsch_R, kabsch_p = kabsch(members)
+                res = solve(RigidState(init["part"], rcfg))
     if mseq is not None:
         _json(out / "phase2_rigid" / "masked_observation.json", {
             **mseq.model.to_dict(), "mask_root": mseq.mask_root, "cameras": mseq.cameras,
@@ -726,6 +758,52 @@ def _load_support(args, mu0, positions, truth):
                  "excluded: a false positive forces a truly static Gaussian "
                  "through the estimated transform and biases it directly, "
                  "while a false negative only removes evidence.")}
+
+
+def _refine_support(args, out, mu0, members, ev, res, obs_all, cameras, round_=0):
+    """One free-space round. Returns (members, ev, summary) -- summary None when the
+    support is unchanged or the refinement was refused (then members/ev are too)."""
+    from estimator import free_space_support as fss
+    n = mu0.shape[0]
+    prev = torch.zeros(n, dtype=torch.bool)
+    prev[members.cpu()] = True
+    part = res["part"]
+    print(f"\n  [4b/7] free-space support refinement, round {round_}")
+    fev = fss.evidence(mu0, part.R, part.p, obs_all, cameras, tau=args.support_refine_tau)
+    dec = fss.assign(fev, prev, margin=args.support_refine_margin, min_obs=args.support_refine_min_obs,
+                     min_members=args.support_refine_min_members)
+    sm = dec["summary"]
+    d = out / "support_refine"
+    d.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(d / f"round_{round_}.npz", label=dec["label"].numpy(), score=dec["score"].numpy(),
+                        counts=fev["counts"].numpy(), displacement_max=fev["displacement_max"].numpy(),
+                        previous=prev.numpy(), members=dec["members"].numpy())
+    _json(d / f"round_{round_}.json", {**sm, "labels_npz": f"round_{round_}.npz",
+                                        "label_codes": dict(enumerate(fss.LABELS))})
+    lab = sm["labels"]
+    print(f"      moving {lab['moving']['total']} ({lab['moving']['in_previous_support']} were support), "
+          f"static {lab['static']['total']} ({lab['static']['in_previous_support']} were support), "
+          f"undecided {lab['small_motion']['total'] + lab['unobserved']['total']}")
+    if not sm["accepted"]:
+        print(f"      REFUSED: {sm['reason']}")
+        return members, ev, None
+    print(f"      support {sm['previous_members']} -> {sm['members']} "
+          f"(+{sm['added']} / -{sm['removed']})")
+    if sm["added"] + sm["removed"] == 0:
+        return members, ev, None
+    sup = out / "support_coherence"
+    if round_ == 0:
+        (sup / "support.json").rename(sup / "support_before_refinement.json")
+    new = torch.nonzero(dec["members"]).reshape(-1)
+    ev = {**ev, "method": f"free_space_refined({ev['method'].split('(')[-1].rstrip(')')})",
+          "kept_fraction": float(new.numel()) / max(n, 1),
+          "refinement": [*ev.get("refinement", []), sm]}
+    _json(sup / "support.json", {
+        **ev, "num_members": int(new.numel()), "members": new.tolist(), "frozen_before_phase2": False,
+        "note": ("the coherence support was re-assigned by the free-space two-hypothesis test after the "
+                 "first rigid solve (support_refine/); Phase 2's outputs and Phase 3 use THIS set. The "
+                 "coherence set is support_before_refinement.json.")})
+    return new, ev, sm
 
 
 def _rigidity_gate(part, mu0, R0, T, max_pairs=4000, seed=0):

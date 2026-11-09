@@ -51,6 +51,9 @@ class JointIEKFConfig:
     # kept ONLY for the legacy joint-identification diagnostic estimator/prismatic_null.py
     # (not in the active pipeline; the repair spec does not change joint identification).
     acceptance: str = "map"
+    # > 0: mean-reverting qdot, correlation time in seconds (velocity_decay.py); passed to
+    # the state's predict only when set, so states without the option are untouched
+    velocity_tau: float = 0.0
 
     def __post_init__(self):
         if self.acceptance not in ("map", "pre_repair_legacy"):
@@ -633,10 +636,11 @@ def run_window(state, mu0: Tensor, R0, observations, linearize, precision_fn,
             continue
 
         dt = float(t_arr[frame] - t_arr[frame - 1])
+        decay = {"tau": cfg.velocity_tau} if cfg.velocity_tau > 0 else {}
         if hasattr(state, "predict"):
-            state.predict(frame - 1, dt, cfg.sigma_qddot)
+            state.predict(frame - 1, dt, cfg.sigma_qddot, **decay)
         else:
-            process_predict(state, frame - 1, dt, cfg.sigma_qddot)
+            process_predict(state, frame - 1, dt, cfg.sigma_qddot, **decay)
         prior_info = torch.linalg.inv(state.covariance)
         prior_info = 0.5 * (prior_info + prior_info.T)
 

@@ -1818,7 +1818,9 @@ class GaussianModel:
                     f"{tuple(gt_cpu.shape)} vs N={xyz.shape[0]}"
                 )
             gt_part = gt_cpu.numpy().astype(np.float32)[:, None]
-            gt_dynamic = (gt_cpu.numpy() > 0).astype(np.float32)[:, None]
+            # -1 = unlabelled (no labelled sample near the Gaussian): never "static"
+            gt_np = gt_cpu.numpy()
+            gt_dynamic = np.where(gt_np < 0, -1, gt_np > 0).astype(np.float32)[:, None]
             aux_arrays.extend([gt_part, gt_dynamic])
 
         # Embed semantic field directly in every Gaussian/PLY vertex.

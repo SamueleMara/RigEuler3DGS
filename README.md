@@ -26,14 +26,18 @@ Conformance of this implementation and where our datasets fail:
 raw-union experiments, `scripts/run_fused_phase1*.sh`) is not used. The two directions are never
 merged: each gives its own estimate.
 
-> **Status (2026-10-16).**
-> * Static, Phase 1, Phase 2 and joint identification are the stable pipeline. They produced
->   `results_11_10_26/ours/<scene>/bidirectional/` (tag `bidirectional-batch-2026-10-12`), and the
->   joint is correct in 16 of 20 scene×direction runs.
-> * Phase 3 keeps the identified joint fixed and refines only the per-frame displacement. On fridge
->   it reproduces the Phase-2 track to within 0.006 rad (report, §6).
-> * No stage chooses the joint type. Joint identification reports both P and R; give Phase 3 the type
->   to run with `--hypotheses`.
+> **Status (2026-11-09): [`STATUS.md`](STATUS.md).** The standard pipeline is the one that produced
+> the v5 synthetic and v6 real results:
+> * synthetic: [`run_standard_synthetic.sh`](run_standard_synthetic.sh)
+>   (ideal sensor, covariance-surface endpoint bootstrap, one direction, Phases 1-3);
+> * real: [`run_standard_real.sh`](run_standard_real.sh)
+>   (calibrated sensor, endpoint bootstrap, Phase-0 repair arms, Phases 1-3 with `--velocity-tau 0.5`
+>   and `--phase2-support-refine free-space`).
+>
+> Phase 3 keeps the identified joint fixed and refines only the per-frame displacement. No stage
+> chooses the joint type: joint identification reports both P and R; the type decision of the
+> evaluation (revolute axis radius / part scale > 10 → prismatic) is applied afterwards, in
+> `results/rigeuler_tables.py`. Older stable batch: tag `bidirectional-batch-2026-10-12`.
 
 ---
 
@@ -166,6 +170,17 @@ A scene that fails is skipped with the reason printed, and the rest of the batch
     cameras is refused.
   * A count, `--cameras 8`, means the first 8 cameras for Phase 1/2/3, with static training on all
     of them.
+* `--velocity-tau T` (default 0, off) makes the velocity of every phase mean-reverting, with
+  correlation time `T` seconds (`estimator/velocity_decay.py`). With the default constant-velocity
+  model, a velocity along a direction the RGB-D cannot see is never corrected, so a Gaussian sliding
+  on a uniform surface, a Gaussian hidden behind the moving part, or a rigid part whose steps are all
+  rejected keeps moving. With `T > 0` that drift stops after about `v T`.
+* `--phase2-support-refine free-space` (default off) re-assigns the moving support after the first
+  rigid Phase-2 solve and solves again (`estimator/free_space_support.py`). Each Gaussian is tested
+  against the observed depth as static and as moved by the rigid motion. A position more than 2 cm in
+  front of the observed surface is impossible; a position behind it is only hidden. "Moving" must be
+  earned by that evidence, so a static surface that the moving part hides stays static.
+  `--phase2-support-refine-rounds N` repeats refine and solve (default 1).
 
 **Example of a failing scene.** `real/fridge_plastic_20261016_163314` has an initial model
 (`colmap/sparse/0`) holding **984 images**, every frame of its 3 cameras, while `colmap_final` holds

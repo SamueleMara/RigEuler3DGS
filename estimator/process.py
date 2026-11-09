@@ -29,6 +29,7 @@ from typing import Tuple, Union
 
 import torch
 
+from . import velocity_decay
 from .manifold import so3_exp, so3_hat, so3_left_jacobian
 from .state import GaussianMotionState
 
@@ -110,18 +111,27 @@ def angular_increment(
     return Omega, so3_hat(Omega), so3_exp(Omega)
 
 
-def process_predict(state: GaussianMotionState, dt: DtLike) -> GaussianMotionState:
+def process_predict(state: GaussianMotionState, dt: DtLike, tau: float = 0.0) -> GaussianMotionState:
     """Propagate the nominal state one frame forward under a constant twist.
 
     Exactly spec section 5: linear part is Euclidean integration, rotational
     part is a LEFT group composition so that it commutes with the left
     retraction used by ``boxplus``.  Velocities are carried through unchanged;
     unmodelled acceleration is absorbed by the process noise ``Q`` instead.
+
+    ``tau > 0`` makes the twist mean-reverting (estimator/velocity_decay.py):
+    v, omega decay by phi = exp(-dt/tau) and the pose integrates them over
+    h = tau (1 - phi) instead of dt.
     """
     mu = state.mu
     if mu.dim() != 2 or mu.shape[-1] != 3:
         raise ValueError(f"state.mu must be [N, 3], got {tuple(mu.shape)}")
     step = _as_step(dt, mu.shape[0], mu.device, mu.dtype)
+
+    if velocity_decay.enabled(tau):
+        phi, h, _, _, _ = velocity_decay.terms_tensor(step, tau)
+        _, _, exp_omega = angular_increment(state.omega, h.reshape(-1))
+        return _rebuild_state(state, mu + state.v * h, exp_omega @ state.R, state.v * phi, state.omega * phi)
 
     mu_pred = mu + state.v * step
     _, _, exp_omega = angular_increment(state.omega, dt)
@@ -134,7 +144,7 @@ def process_predict(state: GaussianMotionState, dt: DtLike) -> GaussianMotionSta
 
 
 def error_state_transition(
-    state: GaussianMotionState, dt: DtLike, mode: str = SO3
+    state: GaussianMotionState, dt: DtLike, mode: str = SO3, tau: float = 0.0
 ) -> torch.Tensor:
     """Per-Gaussian 12x12 error-state transition ``F`` with ``delta^- = F delta^+``.
 
@@ -162,6 +172,9 @@ def error_state_transition(
 
     The translational row is exact in both modes (the position recursion is
     linear in mu and v), so only the rotational row differs.
+
+    ``tau > 0`` (mean-reverting twist): every ``dt`` coupling becomes
+    h = tau (1 - phi) and the velocity blocks become phi I.
     """
     if mode not in TRANSITION_MODES:
         raise ValueError(f"mode must be one of {TRANSITION_MODES}, got {mode!r}")
@@ -170,14 +183,18 @@ def error_state_transition(
     n = mu.shape[0]
     device, dtype = mu.device, mu.dtype
     step = _as_step(dt, n, device, dtype).unsqueeze(-1)  # [N, 1, 1] for block scaling
+    keep = torch.ones_like(step)
+    if velocity_decay.enabled(tau):
+        keep, step, _, _, _ = velocity_decay.terms_tensor(step, tau)
+        dt = step.reshape(-1)
 
     eye3 = torch.eye(3, device=device, dtype=dtype).expand(n, 3, 3)
     F = torch.zeros(n, ERROR_DIM, ERROR_DIM, device=device, dtype=dtype)
 
     F[:, MU_SLICE, MU_SLICE] = eye3
     F[:, MU_SLICE, V_SLICE] = step * eye3
-    F[:, V_SLICE, V_SLICE] = eye3
-    F[:, OMEGA_SLICE, OMEGA_SLICE] = eye3
+    F[:, V_SLICE, V_SLICE] = keep * eye3
+    F[:, OMEGA_SLICE, OMEGA_SLICE] = keep * eye3
 
     if mode == FIRST_ORDER:
         F[:, PHI_SLICE, PHI_SLICE] = eye3

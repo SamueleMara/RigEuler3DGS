@@ -16,6 +16,9 @@ by every IEKF phase, recorded with an explicit policy in each stage's outputs.
     --rgb-model-sigma s         DECLARED model-mismatch scale added in variance to the
     --depth-model-sigma s       sensor term (renderer / appearance error, not sensor
                                 noise); default 0
+    --velocity-tau T            > 0: every phase's velocity is mean-reverting with
+                                correlation time T seconds (estimator/velocity_decay.py);
+                                default 0 = constant velocity
 """
 from __future__ import annotations
 
@@ -40,6 +43,9 @@ def add_cli(ap, phase1: bool = False) -> None:
                     help="declared RGB model-mismatch sd added in variance (not a sensor statistic)")
     ap.add_argument("--depth-model-sigma", type=float, default=0.0,
                     help="declared depth model-mismatch sd [m] added in variance (not a sensor statistic)")
+    ap.add_argument("--velocity-tau", type=float, default=0.0,
+                    help="> 0: mean-reverting velocity with this correlation time [s] in the Phase 1/2/3 "
+                         "process models; 0 (default) = constant velocity")
     if phase1:
         ap.add_argument("--p0-geometry", default=None,
                         help="bootstrap geometry covariance npz (P0_geometry [N,6,6]) for the Phase-1 pose prior")
@@ -89,7 +95,15 @@ def configure(args, cfg, camera_names):
                              f"(calibrated: {sorted(model.cameras)}); cameras are never substituted")
     return dataclasses.replace(cfg, sensor_model=model if model.is_physical else None, camera_names=names,
                                rgb_model_sigma=float(getattr(args, "rgb_model_sigma", 0.0) or 0.0),
-                               depth_model_sigma=float(getattr(args, "depth_model_sigma", 0.0) or 0.0))
+                               depth_model_sigma=float(getattr(args, "depth_model_sigma", 0.0) or 0.0),
+                               velocity_tau=velocity_tau(args))
+
+
+def velocity_tau(args) -> float:
+    tau = float(getattr(args, "velocity_tau", 0.0) or 0.0)
+    if tau < 0:
+        raise SystemExit(f"--velocity-tau {tau} < 0")
+    return tau
 
 
 def manifest(args, cfg, frame_ids=None) -> dict:
@@ -111,10 +125,16 @@ def manifest(args, cfg, frame_ids=None) -> dict:
             "motion_interval": {"start": int(getattr(args, "motion_start_frame", 0) or 0),
                                 "end": getattr(args, "motion_end_frame", None)},
             "frame_timestamps": getattr(args, "frame_timestamps", "off"),
+            "velocity_model": _velocity_decay().describe(velocity_tau(args)),
             "frames_original_indices": [r.get("dataset_frame_index") for r in recs],
             "timestamps_s": [r.get("timestamp_s") for r in recs] if recs and "timestamp_s" in recs[0] else None,
             "covariance_note": ("independent per-pixel diagonal measurement model; shared-camera "
                                 "correlations (common-mode offset, calibration) are NOT represented")}
+
+
+def _velocity_decay():
+    from estimator import velocity_decay
+    return velocity_decay
 
 
 def write_manifest(path, args, cfg, frame_ids=None) -> dict:

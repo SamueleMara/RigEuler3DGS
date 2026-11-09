@@ -23,6 +23,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from . import velocity_decay
 from .joint_manifold import retract_joint_geometry
 from .joint_state import GEOMETRY_DIM, JOINT_ERROR_DIM
 
@@ -39,7 +40,7 @@ def _stride(state) -> int:
     return int(getattr(state, "error_dim", JOINT_ERROR_DIM))
 
 
-def process_matrix(state, dt: float) -> Tensor:
+def process_matrix(state, dt: float, tau: float = 0.0) -> Tensor:
     """F for one step, block diagonal over parts.
 
     Per part, in `[dq, dqdot, dtheta_J]` order:
@@ -51,17 +52,22 @@ def process_matrix(state, dt: float) -> Tensor:
     The `dt` in the corner is the entire coupling between position and
     velocity, and it is what carries image information about `q` back onto
     `qdot` over a window.
+
+    `tau > 0` (mean-reverting rate, estimator/velocity_decay.py): the corner is
+    `h = tau (1 - phi)` and the rate diagonal `phi = exp(-dt/tau)`.
     """
     n = state.dim
     F = torch.eye(n, dtype=torch.float64)
     d = _stride(state)
+    phi, h, _, _, _ = velocity_decay.terms(dt, tau)
     for k in range(state.num_parts):
         i = k * d
-        F[i, i + 1] = float(dt)
+        F[i, i + 1] = h
+        F[i + 1, i + 1] = phi
     return F
 
 
-def process_noise(state, dt: float, sigma_qddot: float = 1.0) -> Tensor:
+def process_noise(state, dt: float, sigma_qddot: float = 1.0, tau: float = 0.0) -> Tensor:
     """Q for one step: a white-acceleration model on qdot only.
 
     The geometry is static by construction (section 15), so its block is
@@ -72,25 +78,26 @@ def process_noise(state, dt: float, sigma_qddot: float = 1.0) -> Tensor:
     n = state.dim
     Q = torch.zeros((n, n), dtype=torch.float64)
     s2 = float(sigma_qddot) ** 2
-    dt = float(dt)
+    _, _, cxx, cxv, cvv = velocity_decay.terms(dt, tau)
     d = _stride(state)
     for k in range(state.num_parts):
         i = k * d
         # continuous white-acceleration, integrated once
-        Q[i, i] = s2 * dt ** 3 / 3.0
-        Q[i, i + 1] = Q[i + 1, i] = s2 * dt ** 2 / 2.0
-        Q[i + 1, i + 1] = s2 * dt
+        Q[i, i] = s2 * cxx
+        Q[i, i + 1] = Q[i + 1, i] = s2 * cxv
+        Q[i + 1, i + 1] = s2 * cvv
     return Q
 
 
-def predict(state, frame: int, dt: float, sigma_qddot: float = 1.0):
+def predict(state, frame: int, dt: float, sigma_qddot: float = 1.0, tau: float = 0.0):
     """Section 15: advance the nominal and its covariance by one frame."""
-    F = process_matrix(state, dt)
-    Q = process_noise(state, dt, sigma_qddot)
+    F = process_matrix(state, dt, tau)
+    Q = process_noise(state, dt, sigma_qddot, tau)
+    phi, h, _, _, _ = velocity_decay.terms(dt, tau)
     for p in state.parts:
         if frame + 1 < p.num_frames:
-            p.q[frame + 1] = p.q[frame] + dt * p.qdot[frame]
-            p.qdot[frame + 1] = p.qdot[frame]
+            p.q[frame + 1] = p.q[frame] + h * p.qdot[frame]
+            p.qdot[frame + 1] = p.qdot[frame] * phi
     state.covariance = F @ state.covariance @ F.T + Q
     return state
 

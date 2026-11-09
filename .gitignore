@@ -97,3 +97,4 @@ submodules/diff-gaussian-rasterization/build_vis/
 attic/
 # written by tests/test_exact_cached_structured_backend.py on every run
 docs/FUSED_PHASE1_EXACT_ACCELERATION_EQUIVALENCE_tests.json
+submodules/diff-gaussian-rasterization/.build_first_return/

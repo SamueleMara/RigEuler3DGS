@@ -22,6 +22,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from . import velocity_decay
 from .joint_process import process_matrix, process_noise
 
 DISPLACEMENT_DIM = 2
@@ -66,14 +67,15 @@ class DisplacementOnlyState:
         return self._full.gaussians(frame, mu0, R0)
 
     # -- process: constant rate, white acceleration on qdot ----------------
-    def predict(self, frame: int, dt: float, sigma_qddot: float = 1.0):
-        F = process_matrix(self, dt)
-        Q = process_noise(self, dt, sigma_qddot)
+    def predict(self, frame: int, dt: float, sigma_qddot: float = 1.0, tau: float = 0.0):
+        F = process_matrix(self, dt, tau)
+        Q = process_noise(self, dt, sigma_qddot, tau)
+        phi, h, _, _, _ = velocity_decay.terms(dt, tau)
         p = self.parts[0]
         if frame + 1 < p.num_frames:
             q, qd = p.q.clone(), p.qdot.clone()
-            q[frame + 1] = q[frame] + float(dt) * qd[frame]
-            qd[frame + 1] = qd[frame]
+            q[frame + 1] = q[frame] + h * qd[frame]
+            qd[frame + 1] = qd[frame] * phi
             p.q, p.qdot = q, qd
         self.covariance = F @ self.covariance @ F.T + Q
 

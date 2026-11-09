@@ -127,11 +127,22 @@ def main() -> int:
     ap.add_argument("--frames-on-cpu", action="store_true")
     from estimator.visibility_constraint import add_cli as _vis_cli
     _vis_cli(ap)
+    ap.add_argument("--phase1-partition", choices=("canonical", "per-frame"), default="canonical",
+                    help="canonical (DEFAULT): the IEKF supernode partition is built once from this "
+                         "direction's endpoint and held for the whole pass | per-frame: the legacy "
+                         "regrouping from each frame's predicted means (control)")
+    ap.add_argument("--phase1-covariance-transport", action="store_true",
+                    help="EXPERIMENTAL: express the prior information in the tangent at the accepted "
+                         "state (J^T Lambda_prior J) before adding the Fisher; off = legacy")
     ap.add_argument("--phase1-covariance-reset", action="store_true",
                     help="DIAGNOSTIC: re-initialise the Phase-1 covariance every frame instead of "
                          "carrying the previous posterior (the old behaviour; off by default)")
     from estimator.masked_observation import add_cli as _mask_obs_cli
     _mask_obs_cli(ap)
+    from estimator.first_return_observation import add_cli as _fr_cli
+    _fr_cli(ap)
+    ap.add_argument("--deterministic", action="store_true",
+                    help="order-independent (bitwise reproducible) IEKF reductions, estimator/deterministic_ops.py")
     from estimator.run_config import add_cli as _rc_cli
     _rc_cli(ap, phase1=True)
     ap.add_argument("--extractor", choices=("v2", "ncut"), default="v2",
@@ -173,6 +184,14 @@ def main() -> int:
     out = Path(args.out or f"output/motion_coherence_{args.scene}")
     from estimator.masked_observation import preflight as _obs_preflight
     _obs_preflight(args, source)            # masks ready? before any model load / GPU work
+    if getattr(args, "deterministic", False):
+        from estimator.deterministic_ops import enable as _det_enable
+        print(f"  deterministic reductions: {_det_enable()}")
+    if getattr(args, "first_return_mode", "off") != "off":
+        # prior schema + camera coverage BEFORE any GPU work (cameras from <source>/rgb/cam_*)
+        from estimator.first_return_observation import from_args as _fr_from_args
+        _cams = sorted(p.name for p in (Path(source) / "rgb").glob("cam_*") if p.is_dir())[:args.cameras]
+        _fr_from_args(args, _cams)
     (out / "numerical").mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     print(f"=== MOTION COHERENCE: {args.scene} ===")
@@ -266,6 +285,8 @@ def main() -> int:
             model_error_beta=1.0, model_error_blur=1)
 
         ns.phase1_covariance_reset = bool(args.phase1_covariance_reset)
+        ns.phase1_partition = args.phase1_partition
+        ns.phase1_covariance_transport = bool(args.phase1_covariance_transport)
         ns.frame_timestamps = args.frame_timestamps
         ns.p0_geometry = args.p0_geometry
         ns.p0_velocity_sigma = tuple(args.p0_velocity_sigma)
@@ -293,6 +314,15 @@ def main() -> int:
         ns.visibility_constraint = _vis_from_args(args, source, frames_raw, frame_ids)
         from estimator.masked_observation import from_args as _masked_from_args
         ns.masked_observation = _masked_from_args(args, source, frames_raw, frame_ids, cfg)
+        from estimator.first_return_observation import from_args as _fr_from_args
+        ns.first_return = _fr_from_args(args, list(cfg.camera_names))
+        if ns.first_return is not None:
+            cfg = __import__("dataclasses").replace(
+                cfg, first_return_mode=ns.first_return.mode, first_return_prior_path=ns.first_return.prior.path,
+                first_return_posterior="unavailable")
+            (out / "first_return.json").write_text(json.dumps(ns.first_return.to_manifest(), indent=1, default=str))
+            print(f"  first-return mode {ns.first_return.mode}: prior {ns.first_return.prior.model_id[:12]} "
+                  f"({ns.first_return.prior.status})")
         from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
         from estimator.renderer_bridge import build_linearization as _build_lin
         _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, ns.masked_observation)
@@ -354,6 +384,10 @@ def main() -> int:
         from estimator.mask_diagnostics import resources as _resources
         (out / "mask_diagnostics.json").write_text(json.dumps(
             ns.mask_diagnostics.report(), indent=1, default=str))
+        parts_arr = _info.pop("partition_arrays", None)
+        if parts_arr is not None:
+            # Gate B: the immutable canonical Phase-1 partition (membership, centres)
+            np.savez_compressed(out / "phase1_partition.npz", **parts_arr)
         (out / "phase1_frames.json").write_text(json.dumps(
             {k: v for k, v in _info.items() if k != "rotations"}, indent=1, default=str))
         (out / "stage_resources.json").write_text(json.dumps(
@@ -601,7 +635,8 @@ def main() -> int:
                                         load_optimized_gt, supernode_gt)
     # Sections 2-6: the optimized labelled 3DGS model is the PRIMARY GT.
     gt = load_optimized_gt(model, mu0)
-    sparse = load_static_dynamic_gt(source, mu0)
+    sparse = load_static_dynamic_gt(source, mu0,
+                                    endpoint="final" if args.direction == "backward" else "initial")
     if gt.get("status") == NOT_FOUND:
         # Section 5: do not silently call sparse-NN labels ground truth.
         write_json(out / "evaluation" / "optimized_3dgs_gt.json", gt)

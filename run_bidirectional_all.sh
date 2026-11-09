@@ -43,6 +43,22 @@
 # --bootstrap-p0            Phase-1 pose prior from static_bidi/<end>/geometry_information.npz
 #                           (tools/train_tracking_bootstrap.py), velocity prior from
 # --p0-velocity-sigma V W   (declared, m/s rad/s)
+# Phase 1 only (RigEuler3DGS_Phase1_Covariance_Velocity_Corrections_Codex.md):
+# --phase1-partition canonical|per-frame   supernodes fixed from the endpoint (default) or
+#                           the legacy per-frame regrouping (control)
+# --phase1-covariance-transport            EXPERIMENTAL Lie-tangent transport of the prior
+# --phase1-alpha-precision coupled|declared, --phase1-alpha-sd S,
+# --phase1-rgb-support full|foreground     EXPERIMENTAL likelihood arms (masked mode)
+# --phase1-deterministic    bitwise reproducible Phase-1 reductions (estimator/deterministic_ops.py)
+# --velocity-tau T          mean-reverting velocity (correlation time T s) in the Phase 1/2/3
+#                           process models (estimator/velocity_decay.py); default 0 = constant
+# --phase2-support-refine off|free-space   re-assign the coherence support by the free-space
+#                           two-hypothesis test after the first rigid solve, then solve again
+#                           (estimator/free_space_support.py); default off
+# --phase2-support-refine-rounds N   refine -> re-solve rounds (default 1; each is one
+#                           more rigid solve)
+# --phase1-first-return-mode off|audit|depth, --phase1-first-return-prior PATH
+#                           first-return depth likelihood (estimator/first_return_observation.py)
 # --cameras all|N|cam_001,cam_002   which cameras run (default all: every rgb/cam_*
 #                   folder). A name list applies to EVERY stage: static training
 #                   uses only those views and only the seed points they saw, and
@@ -127,6 +143,17 @@ while [ $# -gt 0 ]; do
     --depth-model-sigma)      DEPMS="$2"; shift 2;;
     --bootstrap-p0)           BOOTP0=1; shift;;
     --p0-velocity-sigma)      P0V=("$2" "$3"); shift 3;;
+    --phase1-partition)       P1PART="$2"; shift 2;;
+    --phase1-covariance-transport) P1TRANS=1; shift;;
+    --phase1-alpha-precision) P1ALPHA="$2"; shift 2;;
+    --phase1-alpha-sd)        P1ALPHASD="$2"; shift 2;;
+    --phase1-rgb-support)     P1RGBSUP="$2"; shift 2;;
+    --phase1-first-return-mode)  P1FR="$2"; shift 2;;
+    --phase1-deterministic)      P1DET=1; shift;;
+    --velocity-tau)              VTAU="$2"; shift 2;;
+    --phase2-support-refine)     P2REFINE="$2"; shift 2;;
+    --phase2-support-refine-rounds) P2ROUNDS="$2"; shift 2;;
+    --phase1-first-return-prior) P1FRP="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
   esac
@@ -161,9 +188,35 @@ RGBMS=${RGBMS:-0}; DEPMS=${DEPMS:-0}; BOOTP0=${BOOTP0:-0}
 if [ -n "$SENSOR" ] && [ ! -f "$SENSOR" ]; then echo "--sensor-model $SENSOR does not exist" >&2; exit 2; fi
 SENSOR_SHA=$( [ -n "$SENSOR" ] && sha256sum "$SENSOR" | cut -c1-64 || echo none )
 # shared by the three runners (estimator/run_config.py)
+P1PART=${P1PART:-canonical}; P1TRANS=${P1TRANS:-0}
+P1ALPHA=${P1ALPHA:-coupled}; P1ALPHASD=${P1ALPHASD:-}; P1RGBSUP=${P1RGBSUP:-full}
+case "$P1PART" in canonical|per-frame) ;; *) echo "--phase1-partition must be canonical|per-frame" >&2; exit 2;; esac
+case "$P1ALPHA" in coupled|declared) ;; *) echo "--phase1-alpha-precision must be coupled|declared" >&2; exit 2;; esac
+case "$P1RGBSUP" in full|foreground) ;; *) echo "--phase1-rgb-support must be full|foreground" >&2; exit 2;; esac
+P1ARGS=(--phase1-partition "$P1PART" --alpha-precision "$P1ALPHA" --rgb-support "$P1RGBSUP")
+[ -n "$P1ALPHASD" ] && P1ARGS+=(--alpha-sd "$P1ALPHASD")
+[ "$P1TRANS" = 1 ] && P1ARGS+=(--phase1-covariance-transport)
+P1DET=${P1DET:-0}
+[ "$P1DET" = 1 ] && P1ARGS+=(--deterministic)
+P1DET_SIG=""; [ "$P1DET" = 1 ] && P1DET_SIG="P1DET=1"     # absent by default: existing signatures still match
+VTAU=${VTAU:-0}; P2REFINE=${P2REFINE:-off}; P2ROUNDS=${P2ROUNDS:-1}
+case "$P2REFINE" in off|free-space) ;; *) echo "--phase2-support-refine must be off|free-space" >&2; exit 2;; esac
+VTAU_SIG=""; [ "$VTAU" != 0 ] && VTAU_SIG="VTAU=$VTAU"
+P2ARGS=(); P2REFINE_SIG=""
+[ "$P2REFINE" != off ] && { P2ARGS=(--support-refine "$P2REFINE" --support-refine-rounds "$P2ROUNDS")
+                             P2REFINE_SIG="P2REFINE=$P2REFINE/$P2ROUNDS"; }
+P1FR=${P1FR:-off}; P1FRP=${P1FRP:-}
+case "$P1FR" in off|audit|depth) ;; *) echo "--phase1-first-return-mode must be off|audit|depth" >&2; exit 2;; esac
+if [ "$P1FR" != off ]; then
+  [ -f "$P1FRP" ] || { echo "--phase1-first-return-mode $P1FR needs --phase1-first-return-prior FILE" >&2; exit 2; }
+  P1ARGS+=(--first-return-mode "$P1FR" --first-return-prior "$P1FRP")
+  P1FRSHA=$(sha256sum "$P1FRP" | cut -c1-64)
+else
+  P1FRSHA=none
+fi
 RCARGS=(--motion-start-frame "$MSTART" ${MEND:+--motion-end-frame "$MEND"} --frame-timestamps "$TSTAMPS"
         --sensor-policy "$SPOL" ${SENSOR:+--sensor-model "$SENSOR"}
-        --rgb-model-sigma "$RGBMS" --depth-model-sigma "$DEPMS")
+        --rgb-model-sigma "$RGBMS" --depth-model-sigma "$DEPMS" --velocity-tau "$VTAU")
 VISARGS=()
 if [ "$VIS_MODE" != "off" ]; then
   VISARGS=(--object-mask-constraint "$VIS_MODE" --mask-ray-semantics "${VIS_SEM:-trusted-full-ray}"
@@ -378,7 +431,10 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
     --config "BOOT=$BOOT" "IEKF_SN=$IEKF_SN" "KNN=$KNN" "SNCOUNT=$SNCOUNT" "FOLDS=$FOLDS" \
              "RIGID_ITERS=$RIGID_ITERS" "PHASE3_ITERS=$PHASE3_ITERS" "PHASE3_HYP=$PHASE3_HYP" \
              "MSTART=$MSTART" "MEND=$MEND" "TSTAMPS=$TSTAMPS" "SENSOR_SHA=$SENSOR_SHA" "SPOL=$SPOL" \
-             "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" > "$5"
+             "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" \
+             "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" \
+             "P1FR=$P1FR" "P1FRSHA=$P1FRSHA" ${P1DET_SIG:+"$P1DET_SIG"} \
+             ${VTAU_SIG:+"$VTAU_SIG"} ${P2REFINE_SIG:+"$P2REFINE_SIG"} > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
 decide() {
@@ -531,7 +587,7 @@ for S in $SCENES; do
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
             --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
-            "${P0ARGS[@]}" \
+            "${P0ARGS[@]}" "${P1ARGS[@]}" \
             --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then
@@ -577,7 +633,7 @@ for S in $SCENES; do
           --model "$OUT/static_bidi/$END" --source "$SRC" \
           --frames "$NF" --cameras "$NC_NAMES" \
           --rigid-iters "$RIGID_ITERS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
-          --coherence-support "$P1/predicted_support.json" \
+          --coherence-support "$P1/predicted_support.json" "${P2ARGS[@]}" \
           --phase1-centers "$P1/phase1_centers" \
           --out "$P2"
       RC=$?

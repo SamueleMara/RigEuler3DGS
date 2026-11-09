@@ -100,6 +100,7 @@ def load_optimized_gt(model_dir, phase1_frame0: Tensor,
                        dtype=torch.float64)
     part = torch.tensor(np.asarray(v["gt_part"]).astype(np.int64))
     dyn = torch.tensor(np.asarray(v["gt_dynamic"]).astype(np.int64)) > 0
+    unlabelled = part < 0                      # -1: no labelled sample near the Gaussian
     x1 = torch.as_tensor(phase1_frame0).double().cpu()
 
     if xyz.shape[0] != x1.shape[0]:
@@ -132,23 +133,32 @@ def load_optimized_gt(model_dir, phase1_frame0: Tensor,
                 a.numel() - torch.unique(a).numel())}
 
     labels = dyn[order].long()
+    labels[unlabelled[order]] = -1
+    import json as _json
+    bman = Path(model_dir) / "bootstrap_manifest.json"
+    boot_gt = (_json.loads(bman.read_text()).get("gt_labels") if bman.is_file() else None)
+    provenance = (("fixed-count Phase-0 bootstrap: each seed takes the part of the nearest labelled "
+                   "sample of the same endpoint (utils/gt_part_labels.py); ids fixed through the "
+                   "refinement -> serialized as gt_part/gt_dynamic (-1 = unlabelled)")
+                  if boot_gt is not None else
+                  ("sparse points3D_parts.ply -> BasicPointCloud."
+                   "part_indices -> GaussianModel._gt_part_labels "
+                   "(torch.long, never an nn.Parameter, never optimized) "
+                   "-> inherited by densify clone/split via "
+                   "old_gt_parts[sel].repeat(rep) -> index-selected by "
+                   "prune_points -> serialized as gt_part/gt_dynamic"))
     return {
         "status": "FOUND", "available": True,
         "source": found["path"], "iteration": found["iteration"],
         "mapping_method": method,
-        "provenance": ("sparse points3D_parts.ply -> BasicPointCloud."
-                       "part_indices -> GaussianModel._gt_part_labels "
-                       "(torch.long, never an nn.Parameter, never optimized) "
-                       "-> inherited by densify clone/split via "
-                       "old_gt_parts[sel].repeat(rep) -> index-selected by "
-                       "prune_points -> serialized as gt_part/gt_dynamic"),
+        "provenance": provenance, "bootstrap_gt_labels": boot_gt,
         "moving_rule": "gt_dynamic > 0, equivalently part != 0",
         "num_gaussians": int(labels.numel()),
         "num_static": int((labels == 0).sum()),
         "num_dynamic": int((labels == 1).sum()),
-        "num_unmapped": 0,
-        "coverage": 1.0,
-        "gt_dynamic_fraction": float((labels == 1).double().mean()),
+        "num_unmapped": int((labels < 0).sum()),
+        "coverage": float((labels >= 0).double().mean()),
+        "gt_dynamic_fraction": (float((labels == 1).sum()) / max(int((labels >= 0).sum()), 1)),
         "part_histogram": {int(k): int(c) for k, c in
                            zip(*np.unique(part.numpy(), return_counts=True))},
         "alignment": stats,
@@ -160,7 +170,7 @@ def compare_with_sparse_nn(optimized_labels: Tensor, sparse_labels: Tensor) -> d
     """Section 7: how wrong was the old sparse-NN pseudo-GT?"""
     o = torch.as_tensor(optimized_labels).long().reshape(-1)
     s = torch.as_tensor(sparse_labels).long().reshape(-1)
-    m = s >= 0
+    m = (s >= 0) & (o >= 0)
     agree = (o[m] == s[m])
     return {
         "num_compared": int(m.sum()),
@@ -168,7 +178,7 @@ def compare_with_sparse_nn(optimized_labels: Tensor, sparse_labels: Tensor) -> d
         "agreement_fraction": float(agree.double().mean()) if int(m.sum()) else float("nan"),
         "static_to_dynamic_disagreement": int(((o[m] == 0) & (s[m] == 1)).sum()),
         "dynamic_to_static_disagreement": int(((o[m] == 1) & (s[m] == 0)).sum()),
-        "optimized_dynamic_fraction": float((o == 1).double().mean()),
+        "optimized_dynamic_fraction": (float((o == 1).sum()) / max(int((o >= 0).sum()), 1)),
         "sparse_nn_dynamic_fraction": (float((s[m] == 1).double().mean())
                                        if int(m.sum()) else float("nan")),
         "note": ("section 7: the sparse-NN labels are a DIAGNOSTIC. The "
@@ -184,6 +194,7 @@ def supernode_gt(labels: Tensor, supernode_id: Tensor) -> dict:
     rows = []
     for s in range(n):
         mem = lab[sid == s]
+        mem = mem[mem >= 0]                    # unlabelled Gaussians are excluded
         if not mem.numel():
             continue
         p = float((mem == 1).double().mean())

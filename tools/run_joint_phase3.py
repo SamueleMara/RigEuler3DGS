@@ -201,6 +201,11 @@ def evaluate_gt(out: Path, source: Path, frame_ids, fits: dict) -> dict:
     return res
 
 
+def _velocity_model(args) -> dict:
+    from estimator import run_config, velocity_decay
+    return velocity_decay.describe(run_config.velocity_tau(args))
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     from estimator.joint_iekf import JointIEKFConfig
@@ -303,8 +308,9 @@ def main(argv=None) -> int:
 
     init = load_initialisation(p2, members, mu0, T, time_s=time_s.numpy())
     wanted = [h.strip() for h in args.hypotheses.split(",") if h.strip()]
+    from estimator import run_config as _rcv
     jcfg = JointIEKFConfig(max_iters=args.iters, max_cg_iters=args.cg_iters,
-                           sigma_qddot=args.sigma_qddot)
+                           sigma_qddot=args.sigma_qddot, velocity_tau=_rcv.velocity_tau(args))
     fits, summary_h = {}, {}
     for name in wanted:
         part = init["parts"].get(name)
@@ -410,6 +416,7 @@ def main(argv=None) -> int:
         "original_frames_processing_order": orig_frames,
         "support": {"file": str(p2 / "support_coherence" / "support.json"), "members": int(members.numel())},
         "config": {"iters": args.iters, "cg_iters": args.cg_iters, "sigma_qddot": args.sigma_qddot,
+                   "velocity_model": _velocity_model(args),
                    "sigma_qddot_units": "(m or rad)/s^(3/2), white-acceleration density",
                    "dt_s": (float(time_s[1] - time_s[0]) if T > 1 and bool(torch.allclose(
                        time_s[1:] - time_s[:-1], time_s[1:2] - time_s[:1], rtol=1e-9, atol=0)) else None),
