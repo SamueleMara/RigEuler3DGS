@@ -80,7 +80,7 @@ def main() -> int:
     ap.add_argument("--model", default=None)
     ap.add_argument("--source", default=None)
     ap.add_argument("--frames", type=int, default=60)
-    ap.add_argument("--cameras", type=int, default=8)
+    ap.add_argument("--cameras", default="all", help="all | first N | cam_001,cam_002 (utils/camera_selection.py)")
     ap.add_argument("--camera", type=int, default=0,
                     help="section 22: the camera rendered for EVERY frame")
     ap.add_argument("--max-gaussians", type=int, default=0,
@@ -170,8 +170,9 @@ def main() -> int:
 
     # ---- scene ----------------------------------------------------------
     dataset, pipe, gaussians, sc = load_scene(model, source, camera_device="cpu")
-    cams_all = sc.getTrainCameras()
-    ncam = min(args.cameras, len(cams_all))
+    from utils.camera_selection import select_cameras
+    cams_all = select_cameras(sc.getTrainCameras(), args.cameras)
+    ncam = len(cams_all)
     cameras = camera_specs(cams_all, ncam)
     truth = state_from_gaussians(gaussians)
     if args.max_gaussians and truth.mu.shape[0] > args.max_gaussians:

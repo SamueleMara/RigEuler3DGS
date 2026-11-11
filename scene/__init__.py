@@ -57,7 +57,7 @@ class Scene:
         colmap_source_path = infer_colmap_source_path(args.source_path)
         if os.path.exists(os.path.join(colmap_source_path, "sparse")):
             scene_info = sceneLoadTypeCallbacks["Colmap"](colmap_source_path, args.images, args.depths, args.eval, args.train_test_exp,
-                load_gt_parts=getattr(args, 'load_gt_parts', True))
+                load_gt_parts=getattr(args, 'load_gt_parts', True), cameras=getattr(args, 'cameras', None))
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.depths, args.eval)

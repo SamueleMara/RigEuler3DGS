@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 """Preflight for the masked observation modes: are the whole-object masks there?
 
-Checks, for the first N cameras (rgb/cam_* sorted, the loader's order) and the
+Checks, for the selected cameras (--cameras, utils/camera_selection.py) and the
 first F frames (or all), that mask/<cam>/frame_NNNNNN.{png,jpg,jpeg} exists
 exactly once, has the RGB image's size, and is binary (0/255 or 0/1). Reads
 only images; no GPU, no writes. Exit 0 = ready, 1 = not ready (each problem is
 listed). run_bidirectional_all.sh calls it before any training or output
 deletion when the observation mode needs masks.
 
-    python tools/check_masks.py --source <scene> [--mask-source DIR] [--cameras 8] [--frames 60]
+    python tools/check_masks.py --source <scene> [--mask-source DIR] [--cameras all|N|cam_001,cam_002] [--frames 60]
 """
 from __future__ import annotations
 
@@ -18,6 +18,10 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+from utils.camera_selection import resolve  # noqa: E402
 
 EXT = (".png", ".jpg", ".jpeg")
 
@@ -29,15 +33,18 @@ def _frame_no(p: Path) -> int:
         return 0
 
 
-def check(source: Path, mask_root: Path, cameras: int | None, frames: int | None, max_report: int = 12,
+def check(source: Path, mask_root: Path, cameras, frames: int | None, max_report: int = 12,
           start: int = 0):
     cams = sorted(p.name for p in (source / "rgb").glob("cam_*") if p.is_dir())
     if not cams:
         return [f"{source / 'rgb'}: no cam_* folders"], {}
     if cameras:
-        if cameras > len(cams):
+        if str(cameras).isdigit() and int(cameras) > len(cams):
             return [f"{cameras} cameras requested but {source / 'rgb'} has {len(cams)}"], {}
-        cams = cams[:cameras]
+        try:
+            cams = resolve(cameras, cams)
+        except ValueError as ex:
+            return [str(ex)], {}
     problems, checked = [], 0
     for c in cams:
         rgbs = sorted(q for q in (source / "rgb" / c).iterdir() if q.suffix.lower() in EXT)
@@ -75,7 +82,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--source", required=True)
     ap.add_argument("--mask-source", default=None, help="mask root (default <source>/mask)")
-    ap.add_argument("--cameras", type=int, default=None)
+    ap.add_argument("--cameras", default=None)
     ap.add_argument("--frames", type=int, default=None)
     ap.add_argument("--start", type=int, default=0, help="first frame ID of the window")
     a = ap.parse_args(argv)

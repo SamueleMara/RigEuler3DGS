@@ -188,6 +188,7 @@ def main(argv=None) -> int:
                     help="evidence frames with the object in the endpoint configuration (stationary)")
     ap.add_argument("--direction", choices=("forward", "backward"), default="forward",
                     help="backward for a FINAL endpoint (its window is read in reverse)")
+    ap.add_argument("--cameras", default="all", help="all | first N | cam_001,cam_002 (utils/camera_selection.py)")
     ap.add_argument("--k-sigma", type=float, default=3.0, help="depth-agreement width in units of sigma_eff")
     ap.add_argument("--report", required=True)
     ap.add_argument("--out-model", default=None, help="write the repaired model here (opt-in)")

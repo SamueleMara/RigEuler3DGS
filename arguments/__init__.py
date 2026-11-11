@@ -81,6 +81,10 @@ class ModelParams(ParamGroup):
         # it can be compared with what comes out. Without this a .npy holding
         # 3.5 metres is silently read as an inverse depth of 3.5.
         self.sapien_depth_is_metric = False
+        # Comma list of cameras to train on (utils/camera_selection.py). Empty
+        # means every camera of the COLMAP model. Saved in cfg_args, which is
+        # how a later stage learns what this model was fitted to.
+        self.cameras = ""
         self._resolution = -1
         self._white_background = False
         self.train_test_exp = False
