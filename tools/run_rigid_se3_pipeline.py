@@ -115,6 +115,9 @@ def main() -> int:
                     help="depth tolerance [m] of the consistent / violated / hidden test")
     ap.add_argument("--support-refine-margin", type=float, default=4.0)
     ap.add_argument("--support-refine-min-obs", type=int, default=6)
+    ap.add_argument("--support-refine-mode", choices=("replace", "intersect"), default="replace",
+                    help="replace (default): free-space labels decide every Gaussian; intersect (cautious): keep "
+                         "only coherence members the free-space test does not refute, never add")
     ap.add_argument("--support-refine-min-members", type=int, default=200,
                     help="fewer Gaussians with moving evidence: keep the coherence support")
     ap.add_argument("--phase1-centers", default=None,
@@ -771,7 +774,7 @@ def _refine_support(args, out, mu0, members, ev, res, obs_all, cameras, round_=0
     print(f"\n  [4b/7] free-space support refinement, round {round_}")
     fev = fss.evidence(mu0, part.R, part.p, obs_all, cameras, tau=args.support_refine_tau)
     dec = fss.assign(fev, prev, margin=args.support_refine_margin, min_obs=args.support_refine_min_obs,
-                     min_members=args.support_refine_min_members)
+                     min_members=args.support_refine_min_members, mode=args.support_refine_mode)
     sm = dec["summary"]
     d = out / "support_refine"
     d.mkdir(parents=True, exist_ok=True)

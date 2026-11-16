@@ -1,0 +1,60 @@
+{
+ "frozen": "2026-11-11 11:51:37",
+ "code": "recovery/material_completion.py (pre-correction)",
+ "columns": [
+  "total",
+  "rgb_l1",
+  "rgb_ssim_loss",
+  "depth_l1",
+  "mask_l1"
+ ],
+ "cases": {
+  "revolute_forward": {
+   "make_scene": {
+    "jtype": "revolute",
+    "direction": "forward",
+    "withhold_frac": 0.4,
+    "seed": 1
+   },
+   "seconds_old_4a": 110.70245838165283,
+   "n": 1248,
+   "status_counts": {
+    "ACCEPTED_MOVING": 135,
+    "ACCEPTED_STATIC": 786,
+    "CORE_MOVING": 230,
+    "UNRESOLVED": 97
+   },
+   "false_moving": 0,
+   "total_loss": {
+    "gt": 0.28348507173359394,
+    "old_result": 0.7141737537458539,
+    "core_only": 1.709387925453484,
+    "all_static": 3.754315576516092
+   }
+  },
+  "prismatic_backward": {
+   "make_scene": {
+    "jtype": "prismatic",
+    "direction": "backward",
+    "withhold_frac": 0.4,
+    "seed": 1
+   },
+   "seconds_old_4a": 146.50811314582825,
+   "n": 1106,
+   "status_counts": {
+    "ACCEPTED_MOVING": 89,
+    "ACCEPTED_STATIC": 849,
+    "CORE_MOVING": 145,
+    "SUSPECT_ORIGINAL": 3,
+    "UNRESOLVED": 20
+   },
+   "false_moving": 0,
+   "total_loss": {
+    "gt": 0.26189246121793985,
+    "old_result": 0.2686834568157792,
+    "core_only": 0.7908069407567382,
+    "all_static": 2.2315623434260488
+   }
+  }
+ }
+}

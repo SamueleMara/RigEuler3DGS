@@ -62,7 +62,11 @@ namespace CudaRasterizer
 			float* out_top_weights = nullptr,
 			float* out_top_depths = nullptr,
 			int top_L = 0,
-			float contributor_min_weight = 1e-4f);
+			float contributor_min_weight = 1e-4f,
+			// Phase 4/5 RGB-D outputs, [H*W] each: 1 - T_final and the
+			// weighted camera-space axial depth sum_i w_i z_i. Null = off.
+			float* out_alpha = nullptr,
+			float* out_zdepth = nullptr);
 
 		static int accumulateFlowStats(
 			std::function<char* (size_t)> geometryBuffer,
@@ -163,7 +167,10 @@ namespace CudaRasterizer
 			bool antialiasing,
 			bool debug,
 			const float* render_features = nullptr,
-			int render_feature_channels = 0);
+			int render_feature_channels = 0,
+			// Phase 4/5 RGB-D adjoints, [H*W] each; dL_dzdepth_pix needs dL_dinvdepth.
+			const float* dL_dalpha_pix = nullptr,
+			const float* dL_dzdepth_pix = nullptr);
 	};
 };
 

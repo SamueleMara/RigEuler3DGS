@@ -150,6 +150,15 @@ def main() -> int:
                          "(default); ncut = the superseded two-way normalized "
                          "cut, kept only for comparison")
     ap.add_argument("--cv-folds", type=int, default=5)
+    # OPT-IN cautious extraction (v2 only; defaults reproduce the threshold-free extractor exactly)
+    ap.add_argument("--coherence-min-eta-cv", type=float, default=0.0,
+                    help="seed candidate must have held-out complement-relative eta_cv >= this (0 = off); "
+                         "none -> NO_COHERENT_MOVING_COMPONENT")
+    ap.add_argument("--coherence-recruit-ratio", type=float, default=1.0,
+                    help="section-19 recruit only when E^M < ratio * E^I (1 = the threshold-free rule)")
+    ap.add_argument("--coherence-trim-k", type=float, default=0.0,
+                    help="trim the final set to one rigid body: drop nodes with RMS rigid residual > "
+                         "median + k MAD, iterated (0 = off)")
     ap.add_argument("--seed", type=int, default=0)
     # Bidirectional: additive, forward stays the default and is unchanged.
     ap.add_argument("--direction", choices=("forward", "backward"),
@@ -506,7 +515,9 @@ def main() -> int:
         traj_nodes = sn["trajectories"][:, res["node_ids"], :]
         ex = extract_moving_component(
             traj_nodes, res["edge_i"], res["edge_j"], res["C"],
-            res["num_supernodes"], folds=args.cv_folds, verbose=True)
+            res["num_supernodes"], folds=args.cv_folds, verbose=True,
+            min_eta_cv=args.coherence_min_eta_cv, recruit_ratio=args.coherence_recruit_ratio,
+            trim_k=args.coherence_trim_k)
         res["extraction"] = ex
         res["status"] = ex["status"]
         res["dynamic_nodes"] = res["node_ids"][ex["moving_nodes"]] \
@@ -560,6 +571,22 @@ def main() -> int:
                             for c in res["components"]],
         "identification": res["identification"],
         "cut": res["cut"],
+        # what the v2 extractor decided and with which strictness (added 2026-11-14; absent for ncut)
+        "extraction_summary": ({
+            "status": res["extraction"]["status"], "counts": res["extraction"]["counts"],
+            "selection": res["extraction"]["selection"],
+            "strictness": res["extraction"].get("strictness"),
+            "seed_core_nodes": res["extraction"]["seed_core_nodes"],
+            "refinement": res["extraction"]["refinement"], "trim": res["extraction"].get("trim"),
+            "selected_candidate": next(({k: c[k] for k in ("candidate_id", "num_members", "persistence",
+                                                           "rigidity", "rigidity_world") if k in c}
+                                        for c in res["extraction"]["candidates"]
+                                        if c["candidate_id"] == res["extraction"]["selection"].get("selected")),
+                                       None),
+            "qualified_eta_cv": sorted((c["rigidity"].get("eta_cv") for c in res["extraction"]["candidates"]
+                                        if c["candidate_id"] in set(res["extraction"]["selection"]
+                                                                    .get("qualified_ids", []))), reverse=True),
+        } if "extraction" in res else None),
         "note": ("sections 0, 40: inferred from trajectory metric coherence "
                  "ALONE. No Otsu, no displacement threshold, no RGB residual, "
                  "no semantics, no joint type, no GT."),

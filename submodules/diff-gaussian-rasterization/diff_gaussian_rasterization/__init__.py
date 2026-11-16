@@ -113,6 +113,103 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 4/5 RGB-D path (additive; rasterize_gaussians above is unchanged).
+#
+# One front-to-back pass returns
+#   color [3,H,W], radii [N], weighted_invdepth [1,H,W] (legacy semantics),
+#   alpha [1,H,W] = 1 - T_final, weighted_metric_depth [1,H,W] = sum_i w_i z_i
+# with z_i the camera-space AXIAL depth of Gaussian i. The normalized expected
+# depth D = Z / (A + eps) is formed in torch (metric_depth_from), so its
+# quotient derivative is ordinary autograd and CUDA only sees dL/dZ and dL/dA.
+# ---------------------------------------------------------------------------
+def rasterize_gaussians_rgbd(
+    means3D, means2D, sh, colors_precomp, opacities, scales, rotations,
+    cov3Ds_precomp, raster_settings,
+):
+    return _RasterizeGaussiansRGBD.apply(
+        means3D, means2D, sh, colors_precomp, opacities, scales, rotations,
+        cov3Ds_precomp, raster_settings,
+    )
+
+
+def metric_depth_from(weighted_metric_depth, alpha, eps=1e-6):
+    """Normalized expected camera-Z depth Z / (A + eps). Not a first return."""
+    return weighted_metric_depth / (alpha + eps)
+
+
+class _RasterizeGaussiansRGBD(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, means3D, means2D, sh, colors_precomp, opacities, scales,
+        rotations, cov3Ds_precomp, raster_settings,
+    ):
+        args = (
+            raster_settings.bg, means3D, colors_precomp, opacities, scales,
+            rotations, raster_settings.scale_modifier, cov3Ds_precomp,
+            raster_settings.viewmatrix, raster_settings.projmatrix,
+            raster_settings.tanfovx, raster_settings.tanfovy,
+            raster_settings.image_height, raster_settings.image_width, sh,
+            raster_settings.sh_degree, raster_settings.campos,
+            raster_settings.prefiltered, raster_settings.antialiasing,
+            raster_settings.debug,
+        )
+        try:
+            result = _C.rasterize_gaussians_rgbd(*args)
+        except Exception:
+            if raster_settings.debug:
+                torch.save(cpu_deep_copy_tuple(args), "snapshot_rgbd_fw.dump")
+            raise
+        num_rendered, color, radii, geom, binning, image, invdepth, alpha, zdepth = result
+        ctx.raster_settings = raster_settings
+        ctx.num_rendered = num_rendered
+        ctx.save_for_backward(
+            colors_precomp, means3D, opacities, scales, rotations,
+            cov3Ds_precomp, radii, sh, geom, binning, image,
+        )
+        ctx.mark_non_differentiable(radii)
+        return color, radii, invdepth, alpha, zdepth
+
+    @staticmethod
+    def backward(ctx, grad_color, _grad_radii, grad_invdepth, grad_alpha, grad_zdepth):
+        settings = ctx.raster_settings
+        (
+            colors, means3D, opacities, scales, rotations, cov3D, radii, sh,
+            geom, binning, image,
+        ) = ctx.saved_tensors
+        H, W = settings.image_height, settings.image_width
+        zeros = lambda: torch.zeros((1, H, W), device=means3D.device, dtype=means3D.dtype)
+        if grad_color is None:
+            grad_color = torch.zeros((3, H, W), device=means3D.device, dtype=means3D.dtype)
+        grad_invdepth = zeros() if grad_invdepth is None else grad_invdepth
+        grad_alpha = zeros() if grad_alpha is None else grad_alpha
+        grad_zdepth = zeros() if grad_zdepth is None else grad_zdepth
+        args = (
+            settings.bg, means3D, radii, colors, opacities, scales, rotations,
+            settings.scale_modifier, cov3D, settings.viewmatrix,
+            settings.projmatrix, settings.tanfovx, settings.tanfovy,
+            grad_color.contiguous(), grad_invdepth.contiguous(),
+            grad_alpha.contiguous(), grad_zdepth.contiguous(),
+            sh, settings.sh_degree, settings.campos,
+            geom, ctx.num_rendered, binning, image, settings.antialiasing,
+            settings.debug,
+        )
+        try:
+            grads = _C.rasterize_gaussians_rgbd_backward(*args)
+        except Exception:
+            if settings.debug:
+                torch.save(cpu_deep_copy_tuple(args), "snapshot_rgbd_bw.dump")
+            raise
+        (
+            grad_means2D, grad_colors, grad_opacity, grad_means3D, grad_cov3D,
+            grad_sh, grad_scales, grad_rotations,
+        ) = grads
+        return (
+            grad_means3D, grad_means2D, grad_sh, grad_colors, grad_opacity,
+            grad_scales, grad_rotations, grad_cov3D, None,
+        )
+
+
 def rasterize_gaussian_features(
     means3D, means2D, features, opacities, scales, rotations,
     cov3Ds_precomp, raster_settings,
@@ -348,6 +445,28 @@ class GaussianRasterizer(nn.Module):
         )
         empty = _empty(means3D)
         return rasterize_gaussians(
+            means3D, means2D,
+            empty if shs is None else shs,
+            empty if colors_precomp is None else colors_precomp,
+            opacities, scales, rotations, cov3D_precomp,
+            self.raster_settings,
+        )
+
+    def forward_rgbd(
+        self, means3D, means2D, opacities, shs=None, colors_precomp=None,
+        scales=None, rotations=None, cov3D_precomp=None, dc=None,
+    ):
+        """Phase 4/5 single pass: (color, radii, weighted_invdepth, alpha,
+        weighted_metric_depth). Same inputs as forward()."""
+        if dc is not None:
+            shs = dc if shs is None else torch.cat((dc, shs), dim=1)
+        if (shs is None) == (colors_precomp is None):
+            raise ValueError("Provide exactly one of shs or colors_precomp")
+        scales, rotations, cov3D_precomp = self._geometry_inputs(
+            means3D, scales, rotations, cov3D_precomp
+        )
+        empty = _empty(means3D)
+        return rasterize_gaussians_rgbd(
             means3D, means2D,
             empty if shs is None else shs,
             empty if colors_precomp is None else colors_precomp,

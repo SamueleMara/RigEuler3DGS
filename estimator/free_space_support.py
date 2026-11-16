@@ -103,8 +103,14 @@ def evidence(mu0: torch.Tensor, R: torch.Tensor, p: torch.Tensor, observations, 
             if any(g is not None for g in gate) else torch.zeros(n, dtype=torch.long)}
 
 
-def assign(ev: dict, previous: torch.Tensor, margin: float = 4.0, min_obs: int = 6, min_members: int = 200) -> dict:
-    """Membership from the evidence. previous: bool [N] (the coherence support)."""
+def assign(ev: dict, previous: torch.Tensor, margin: float = 4.0, min_obs: int = 6, min_members: int = 200,
+           mode: str = "replace") -> dict:
+    """Membership from the evidence. previous: bool [N] (the coherence support).
+    mode "replace" (default): the free-space labels decide every Gaussian (it can ADD members).
+    mode "intersect" (OPT-IN, cautious): a member must be in the coherence support AND not refuted here -- labelled
+    moving, or too little motion to test (small_motion keeps the coherence verdict); nothing is ever added."""
+    if mode not in ("replace", "intersect"):
+        raise ValueError(f"mode must be replace|intersect, not {mode}")
     c = ev["counts"].long()
     cs, vs, cm, vm = c[:, 0, CONSISTENT], c[:, 0, VIOLATED], c[:, 1, CONSISTENT], c[:, 1, VIOLATED]
     score = 2 * (vs - vm) + (cm - cs)
@@ -115,6 +121,8 @@ def assign(ev: dict, previous: torch.Tensor, margin: float = 4.0, min_obs: int =
     label[small] = 2
     prev = previous.bool().cpu()
     members = torch.where(label == 2, prev, label == 0)
+    if mode == "intersect":
+        members = members & prev
     accepted = bool((label == 0).sum() >= min_members)
     if not accepted:
         members = prev.clone()
@@ -131,7 +139,9 @@ def assign(ev: dict, previous: torch.Tensor, margin: float = 4.0, min_obs: int =
             "previous_members": int(prev.sum()), "members": int(members.sum()),
             "added": int((members & ~prev).sum()), "removed": int((prev & ~members).sum()),
             "labels": table,
-            "rule": f"L = 2 (V_static - V_moving) + (C_moving - C_static) > {margin}: moving; else static "
+            "mode": mode,
+            "rule": ("intersect with the coherence support (nothing added); " if mode == "intersect" else "") +
+                    f"L = 2 (V_static - V_moving) + (C_moving - C_static) > {margin}: moving; else static "
                     f"(null hypothesis), including fewer than {min_obs} observations; max displacement < 2 tau: "
                     "keep the previous label",
             "tau_m": ev["tau"], "frames_used": len(ev["frames"])}}

@@ -226,7 +226,9 @@ int CudaRasterizer::Rasterizer::forward(
 	float* out_top_weights,
 	float* out_top_depths,
 	int top_L,
-	float contributor_min_weight)
+	float contributor_min_weight,
+	float* out_alpha,
+	float* out_zdepth)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
@@ -334,6 +336,8 @@ int CudaRasterizer::Rasterizer::forward(
 	const int feature_channels = render_feature_channels > 0 ? render_feature_channels : NUM_CHANNELS;
 	if (render_features != nullptr && feature_channels == 4)
 	{
+		if (out_alpha != nullptr || out_zdepth != nullptr)
+			throw std::runtime_error("alpha / metric-depth outputs are not available on the homogeneous-position path");
 		CHECK_CUDA(FORWARD::render_homogeneous_positions(
 			tile_grid, block,
 			imgState.ranges,
@@ -370,7 +374,9 @@ int CudaRasterizer::Rasterizer::forward(
 			out_top_weights,
 			out_top_depths,
 			top_L,
-			contributor_min_weight), debug)
+			contributor_min_weight,
+			out_alpha,
+			out_zdepth), debug)
 	}
 
 	return num_rendered;
@@ -650,9 +656,13 @@ void CudaRasterizer::Rasterizer::backward(
 	bool antialiasing,
 	bool debug,
 	const float* render_features,
-	int render_feature_channels)
+	int render_feature_channels,
+	const float* dL_dalpha_pix,
+	const float* dL_dzdepth_pix)
 {
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
+	if (dL_dzdepth_pix != nullptr && dL_dinvdepth == nullptr)
+		throw std::runtime_error("metric-depth adjoint needs the per-Gaussian depth-gradient buffer");
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
 
@@ -673,6 +683,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const int feature_channels = render_feature_channels > 0 ? render_feature_channels : NUM_CHANNELS;
 	if (render_features != nullptr && feature_channels == 4)
 	{
+		if (dL_dalpha_pix != nullptr || dL_dzdepth_pix != nullptr)
+			throw std::runtime_error("alpha / metric-depth adjoints are not available on the homogeneous-position path");
 		CHECK_CUDA(BACKWARD::render_homogeneous_positions(
 			tile_grid,
 			block,
@@ -716,7 +728,9 @@ void CudaRasterizer::Rasterizer::backward(
 			(float4*)dL_dconic,
 			dL_dopacity,
 			dL_dcolor,
-			dL_dinvdepth), debug);
+			dL_dinvdepth,
+			dL_dalpha_pix,
+			dL_dzdepth_pix), debug);
 	}
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance

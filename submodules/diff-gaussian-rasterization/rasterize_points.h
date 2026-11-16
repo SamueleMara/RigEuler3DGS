@@ -88,6 +88,62 @@ RasterizeGaussiansBackwardCUDA(
     const bool antialiasing,
     const bool debug);
 
+// Phase 4/5 RGB-D path (additive; the legacy bindings above are unchanged).
+// Forward returns (rendered, color[3,H,W], radii, geom, binning, image,
+// weighted_invdepth[1,H,W], alpha[1,H,W] = 1 - T_final,
+// weighted_metric_depth[1,H,W] = sum_i w_i z_i, z_i = camera-space axial depth).
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansRGBDCUDA(
+    const torch::Tensor& background,
+    const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacity,
+    const torch::Tensor& scales,
+    const torch::Tensor& rotations,
+    const float scale_modifier,
+    const torch::Tensor& cov3D_precomp,
+    const torch::Tensor& viewmatrix,
+    const torch::Tensor& projmatrix,
+    const float tan_fovx,
+    const float tan_fovy,
+    const int image_height,
+    const int image_width,
+    const torch::Tensor& sh,
+    const int degree,
+    const torch::Tensor& campos,
+    const bool prefiltered,
+    const bool antialiasing,
+    const bool debug);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+RasterizeGaussiansRGBDBackwardCUDA(
+    const torch::Tensor& background,
+    const torch::Tensor& means3D,
+    const torch::Tensor& radii,
+    const torch::Tensor& colors,
+    const torch::Tensor& opacities,
+    const torch::Tensor& scales,
+    const torch::Tensor& rotations,
+    const float scale_modifier,
+    const torch::Tensor& cov3D_precomp,
+    const torch::Tensor& viewmatrix,
+    const torch::Tensor& projmatrix,
+    const float tan_fovx,
+    const float tan_fovy,
+    const torch::Tensor& dL_dout_color,
+    const torch::Tensor& dL_dout_invdepth,
+    const torch::Tensor& dL_dout_alpha,
+    const torch::Tensor& dL_dout_zdepth,
+    const torch::Tensor& sh,
+    const int degree,
+    const torch::Tensor& campos,
+    const torch::Tensor& geomBuffer,
+    const int R,
+    const torch::Tensor& binningBuffer,
+    const torch::Tensor& imageBuffer,
+    const bool antialiasing,
+    const bool debug);
+
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussianFeaturesCUDA(
     const torch::Tensor& background,

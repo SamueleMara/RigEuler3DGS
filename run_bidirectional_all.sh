@@ -57,6 +57,12 @@
 #                           (estimator/free_space_support.py); default off
 # --phase2-support-refine-rounds N   refine -> re-solve rounds (default 1; each is one
 #                           more rigid solve)
+# --phase2-support-refine-mode replace|intersect   replace (default) lets the free-space labels add
+#                           members; intersect (cautious) only removes coherence members it refutes
+# Cautious coherence extraction (OPT-IN; defaults = the threshold-free extractor, unchanged):
+# --coherence-min-eta-cv E  seed candidate must have held-out eta_cv >= E (0 = off)
+# --coherence-recruit-ratio R   recruit a node only if E^M < R E^I (1 = off)
+# --coherence-trim-k K      trim the support to one rigid body, median + K MAD (0 = off)
 # --phase1-first-return-mode off|audit|depth, --phase1-first-return-prior PATH
 #                           first-return depth likelihood (estimator/first_return_observation.py)
 # --cameras all|N|cam_001,cam_002   which cameras run (default all: every rgb/cam_*
@@ -153,6 +159,10 @@ while [ $# -gt 0 ]; do
     --velocity-tau)              VTAU="$2"; shift 2;;
     --phase2-support-refine)     P2REFINE="$2"; shift 2;;
     --phase2-support-refine-rounds) P2ROUNDS="$2"; shift 2;;
+    --phase2-support-refine-mode)   P2RMODE="$2"; shift 2;;
+    --coherence-min-eta-cv)      COH_ETA="$2"; shift 2;;
+    --coherence-recruit-ratio)   COH_RECRUIT="$2"; shift 2;;
+    --coherence-trim-k)          COH_TRIM="$2"; shift 2;;
     --phase1-first-return-prior) P1FRP="$2"; shift 2;;
     -h|--help)    usage; exit 0;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2;;
@@ -205,6 +215,15 @@ VTAU_SIG=""; [ "$VTAU" != 0 ] && VTAU_SIG="VTAU=$VTAU"
 P2ARGS=(); P2REFINE_SIG=""
 [ "$P2REFINE" != off ] && { P2ARGS=(--support-refine "$P2REFINE" --support-refine-rounds "$P2ROUNDS")
                              P2REFINE_SIG="P2REFINE=$P2REFINE/$P2ROUNDS"; }
+P2RMODE=${P2RMODE:-replace}
+case "$P2RMODE" in replace|intersect) ;; *) echo "--phase2-support-refine-mode must be replace|intersect" >&2; exit 2;; esac
+if [ "$P2RMODE" != replace ] && [ "$P2REFINE" != off ]; then P2ARGS+=(--support-refine-mode "$P2RMODE"); P2REFINE_SIG+="/$P2RMODE"; fi
+COH_ETA=${COH_ETA:-0}; COH_RECRUIT=${COH_RECRUIT:-1}; COH_TRIM=${COH_TRIM:-0}
+COHARGS=(); COH_SIG=""     # absent by default: existing signatures still match
+if [ "$COH_ETA" != 0 ] || [ "$COH_RECRUIT" != 1 ] || [ "$COH_TRIM" != 0 ]; then
+  COHARGS=(--coherence-min-eta-cv "$COH_ETA" --coherence-recruit-ratio "$COH_RECRUIT" --coherence-trim-k "$COH_TRIM")
+  COH_SIG="COH=eta$COH_ETA/recruit$COH_RECRUIT/trim$COH_TRIM"
+fi
 P1FR=${P1FR:-off}; P1FRP=${P1FRP:-}
 case "$P1FR" in off|audit|depth) ;; *) echo "--phase1-first-return-mode must be off|audit|depth" >&2; exit 2;; esac
 if [ "$P1FR" != off ]; then
@@ -434,7 +453,7 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
              "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" \
              "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" \
              "P1FR=$P1FR" "P1FRSHA=$P1FRSHA" ${P1DET_SIG:+"$P1DET_SIG"} \
-             ${VTAU_SIG:+"$VTAU_SIG"} ${P2REFINE_SIG:+"$P2REFINE_SIG"} > "$5"
+             ${VTAU_SIG:+"$VTAU_SIG"} ${P2REFINE_SIG:+"$P2REFINE_SIG"} ${COH_SIG:+"$COH_SIG"} > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse
 decide() {
@@ -587,7 +606,7 @@ for S in $SCENES; do
             --iekf-supernode-size "$IEKF_SN" \
             --coherence-knn "$KNN" --supernode-count "$SNCOUNT" \
             --cv-folds "$FOLDS" --frames-on-cpu "${VISARGS[@]}" "${OBSARGS[@]}" "${VISSRC[@]}" "${RCARGS[@]}" \
-            "${P0ARGS[@]}" "${P1ARGS[@]}" \
+            "${P0ARGS[@]}" "${P1ARGS[@]}" "${COHARGS[@]}" \
             --out "$P1"
         RC=$?
         if [ "$DRY" != "1" ] && [ $RC -ne 0 ]; then

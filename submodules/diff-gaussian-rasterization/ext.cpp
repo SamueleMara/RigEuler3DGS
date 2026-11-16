@@ -12,6 +12,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("rasterize_gaussians_contributors", &RasterizeGaussiansContributorsCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
+  // Phase 4/5: RGB + alpha + weighted metric depth, one pass (additive).
+  m.def("rasterize_gaussians_rgbd", &RasterizeGaussiansRGBDCUDA);
+  m.def("rasterize_gaussians_rgbd_backward", &RasterizeGaussiansRGBDBackwardCUDA);
   m.def("rasterize_gaussian_features", &RasterizeGaussianFeaturesCUDA);
   m.def("rasterize_gaussian_features_backward", &RasterizeGaussianFeaturesBackwardCUDA);
   m.def("rasterize_gaussian_positions", &RasterizeGaussianPositionsCUDA);

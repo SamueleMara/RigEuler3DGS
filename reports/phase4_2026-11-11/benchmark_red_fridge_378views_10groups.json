@@ -1,0 +1,137 @@
+{
+ "NOT_FINAL": true,
+ "argv": [
+  "tools/benchmark_phase4a.py",
+  "--source",
+  "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/final_red_fridge_episode_000000",
+  "--direction",
+  "forward",
+  "--model",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/static_bidi/initial",
+  "--phase2-dir",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/bidirectional/forward_rigid",
+  "--phase3-dir",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/bidirectional/forward_joint",
+  "--joint-type",
+  "revolute",
+  "--cameras",
+  "cam_001,cam_002",
+  "--groups",
+  "10",
+  "--view-subset",
+  "0",
+  "--reference",
+  "0",
+  "--output",
+  "/tmp/claude-1000/-home-samuelemara-Joint3DGS-RigEuler3DGS/90323ff0-f6c6-454e-a004-5e28e27daa35/scratchpad/bench_fridge378"
+ ],
+ "prepare": {
+  "seconds": 3.968750238418579,
+  "source": "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/final_red_fridge_episode_000000",
+  "views": 378,
+  "storage": "host_ram",
+  "bytes_unpacked": 1045094400,
+  "rss_gb_after_prepare": 1.9370307922363281,
+  "counters": {
+   "view_get": 0,
+   "gpu_uploads": 0,
+   "gpu_upload_bytes": 0,
+   "files_opened": 1134,
+   "image_decodes": 378,
+   "npy_loads": 378,
+   "mask_decodes": 378,
+   "bytes_read": 556704150,
+   "decode_seconds": 3.445272649638355
+  },
+  "combined_sha256": "25fb8314098c97546d1e567df65a5fed7df05909c50abcac0ecfe99be56ec457",
+  "valid_depth_pixels_total": 17413504
+ },
+ "prepared_two_sweeps": {
+  "seconds": 0.5942280292510986,
+  "counters_after": {
+   "view_get": 756,
+   "gpu_uploads": 756,
+   "gpu_upload_bytes": 2090188800,
+   "files_opened": 1134,
+   "image_decodes": 378,
+   "npy_loads": 378,
+   "mask_decodes": 378,
+   "bytes_read": 556704150,
+   "decode_seconds": 3.445272649638355
+  }
+ },
+ "old_viewstore_cache64_two_sweeps": {
+  "seconds": 7.80584716796875,
+  "counters": {
+   "get": 756,
+   "hits": 0,
+   "misses": 756,
+   "decodes": 756
+  },
+  "views": 378
+ },
+ "groups": {
+  "n": 160,
+  "candidates": 24615,
+  "core": 3474,
+  "size_quantiles": [
+   1.0,
+   191.0,
+   192.0,
+   192.0,
+   192.0,
+   192.0
+  ],
+  "singletons": 27,
+  "link_factor": 3.0
+ },
+ "footprints_seconds": 1.7853724956512451,
+ "exact_roi": {
+  "seconds": 18.95314073562622,
+  "item_views_scored": 3760,
+  "item_views_per_s": 198.38400676951275,
+  "seconds_per_100_groups_all_selected_views": 189.5314073562622,
+  "skip_counts": {
+   "0": 3760,
+   "1": 0,
+   "2": 20
+  },
+  "counters": {
+   "sweeps": 1,
+   "views_uploaded": 378,
+   "baseline_renders": 378,
+   "footprint_renders": 380,
+   "hypothesis_renders": 3760,
+   "omit_renders": 0,
+   "group_view_scored": 3760,
+   "group_view_skipped_offscreen": 0,
+   "group_view_skipped_identity": 20,
+   "roi_boxes": 4307,
+   "roi_pixels": 81527216,
+   "gpu_to_cpu_copies": 5,
+   "gpu_to_cpu_bytes": 223776,
+   "commits": 0,
+   "batches": 0,
+   "seconds_footprints": 1.7698016166687012,
+   "seconds_sweeps": 18.933940649032593
+  }
+ },
+ "extrapolation_from_measured": {
+  "all_groups": 160,
+  "all_views": 378,
+  "measured_scored_fraction": 0.9947089947089947,
+  "measured_rate_per_s": 198.38400676951275,
+  "one_full_sweep_item_views": 60160.0,
+  "one_full_sweep_minutes_at_measured_rate": 5.054170862833659,
+  "note": "4A needs >= 2 full sweeps (initial + final verification with OMIT ~ 2x renders) plus batch re-scores of interacting groups; the batch count is data-dependent and is logged by the real run"
+ },
+ "resources": {
+  "wall_s": 42.23042678833008,
+  "cpu_s": 164.10672005,
+  "rss_gb": 2.6744956970214844,
+  "alloc_mb": 98.03955078125,
+  "peak_alloc_mb": 284.408203125,
+  "reserved_mb": 376.0,
+  "peak_reserved_mb": 376.0
+ }
+}

@@ -286,7 +286,7 @@ def cross_validated_rigidity(traj: Tensor, members, folds: int = 5) -> dict:
 # Section 17: sequential selection
 # ---------------------------------------------------------------------------
 
-def select_moving_component(cands: list) -> dict:
+def select_moving_component(cands: list, min_eta_cv: float = 0.0) -> dict:
     """Among graph-persistent candidates, the strongest held-out non-identity
     rigid evidence. No weighted sum of persistence, eta and motion.
 
@@ -337,6 +337,25 @@ def select_moving_component(cands: list) -> dict:
           and c["rigidity"].get("relative_motion_ratio", 0.0) > motion_floor
           and c["rigidity"]["eta_cv"] > 0.0
           and c["rigidity"]["delta_rss_cv"] > 0.0]
+    # OPT-IN strictness (default 0 = the threshold-free rule above, unchanged). With min_eta_cv > 0 a candidate
+    # must ALSO have a common rigid trajectory that predicts at least this fraction of the held-out displacement
+    # BOTH relative to its complement AND in the world frame (fixed cameras). The world condition is essential:
+    # relative motion is symmetric, so the large STATIC side is just as rigid relative to the part; a gate on the
+    # relative eta alone selected near-whole static components (2026-11-14 preview on the 8 real captures).
+    # The static side barely moves in the world, so identity explains it and its world eta_cv is small.
+    weak = []
+    if min_eta_cv > 0.0:
+        def _eta(c):
+            return min(c["rigidity"]["eta_cv"], c["rigidity_world"].get("eta_cv", float("nan")))
+        weak = [c for c in ok if not _eta(c) >= min_eta_cv]
+        ok = [c for c in ok if _eta(c) >= min_eta_cv]
+    if not ok and weak:
+        best_weak = max((_eta(c) for c in weak), default=float("nan"))
+        return {"status": NO_MOVING, "selected": None, "num_qualified": 0, "min_eta_cv": min_eta_cv,
+                "num_below_min_eta_cv": len(weak), "best_eta_cv_below_min": best_weak,
+                "reason": (f"{len(weak)} candidates move rigidly relative to their complement, but none has held-out "
+                           f"eta_cv >= {min_eta_cv} both relative and in the world (best {best_weak:.3f}): no "
+                           f"confidently rigid moving body")}
     if not ok:
         whole = [c for c in cands if c["edges"]["num_boundary_edges"] == 0]
         why = ("no candidate is explained by a common non-identity rigid "
@@ -374,6 +393,7 @@ def select_moving_component(cands: list) -> dict:
     return {"status": "RESOLVED", "selected": best["candidate_id"],
             "num_qualified": len(ok),
             "qualified_ids": [c["candidate_id"] for c in ok],
+            "min_eta_cv": min_eta_cv, "num_below_min_eta_cv": len(weak),
             "rule": ("section 17: qualify on held-out COMPLEMENT-RELATIVE "
                      "rigid evidence (does articulation exist at all), then "
                      "name the moving side by world-frame held-out delta_RSS "
@@ -387,7 +407,8 @@ def select_moving_component(cands: list) -> dict:
 # Section 19: optional refinement
 # ---------------------------------------------------------------------------
 
-def refine_from_core(traj: Tensor, core, candidates_pool, sigma_k: float = 3.0) -> dict:
+def refine_from_core(traj: Tensor, core, candidates_pool, sigma_k: float = 3.0,
+                     recruit_ratio: float = 1.0) -> dict:
     """Recruit nodes that the CORE's own rigid trajectory explains (section 19).
 
     `T_t` is fitted from the core ONLY and never refitted per node, so this
@@ -445,15 +466,46 @@ def refine_from_core(traj: Tensor, core, candidates_pool, sigma_k: float = 3.0) 
                 "core_residual_scale": scale, "num_considered": 0,
                 "num_recruited": 0}
     em, ei = moved(pool), stayed(pool)
-    keep = em < ei
+    # recruit_ratio 1.0 (default) is the threshold-free rule; < 1 is the OPT-IN cautious form: the core's motion
+    # must explain at least (1 - recruit_ratio) of the node's displacement (E^M < r E^I)
+    keep = em < recruit_ratio * ei
     return {"recruited": pool[keep],
             "core_residual_scale": scale,
             "num_considered": int(pool.numel()),
             "num_recruited": int(keep.sum()),
             "num_rejected_static": int((~keep).sum()),
+            "recruit_ratio": recruit_ratio,
             "rule": ("section 19: recruit node i when E_i^M < E_i^I under the "
                      "core's own T_t. Held-out per node, no threshold, no "
-                     "scale, no displacement amplitude")}
+                     "scale, no displacement amplitude" if recruit_ratio == 1.0 else
+                     f"cautious section 19: recruit node i when E_i^M < {recruit_ratio} E_i^I under the core's own T_t")}
+
+
+def rigid_trim(traj: Tensor, members, k: float, max_rounds: int = 10) -> dict:
+    """OPT-IN: keep only the nodes ONE rigid trajectory explains. Fit T_t on the current set (Kabsch per frame),
+    score each node by its RMS residual, drop nodes above median + k * 1.4826 * MAD, repeat until nothing drops.
+    A support spanning two bodies (part + gripper, part + drifting static) loses the minority body."""
+    X = torch.as_tensor(traj).double()
+    idx = torch.as_tensor(members).long().reshape(-1)
+    T = X.shape[0]
+    dropped, rounds = [], 0
+    while idx.numel() >= 4 and rounds < max_rounds:
+        rounds += 1
+        x0 = X[0, idx]
+        e = torch.zeros(idx.numel(), dtype=torch.float64)
+        for t in range(T):
+            R, p = _kabsch(x0, X[t, idx])
+            e += (X[t, idx] - x0 @ R.T - p).pow(2).sum(1)
+        r = (e / T).sqrt()
+        med = r.median()
+        cut = float(med + k * 1.4826 * (r - med).abs().median())
+        bad = r > cut
+        if not bool(bad.any()) or int((~bad).sum()) < 4:
+            break
+        dropped.extend(idx[bad].tolist())
+        idx = idx[~bad]
+    return {"kept": idx, "dropped": sorted(dropped), "rounds": rounds, "k": k,
+            "rule": f"iterative: drop nodes whose RMS rigid residual > median + {k} x 1.4826 MAD of the set's own fit"}
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +516,14 @@ def extract_moving_component(traj: Tensor, edge_i: Tensor, edge_j: Tensor,
                              C: Tensor, n: int, *, min_nodes: int = 3,
                              folds: int = 5, max_candidates: int = 48,
                              min_merge_support: int = 2,
-                             refine: bool = True, verbose: bool = True) -> dict:
-    """Sections 11-19 end to end. Returns per-node labels in three classes."""
+                             refine: bool = True, verbose: bool = True,
+                             min_eta_cv: float = 0.0, recruit_ratio: float = 1.0,
+                             trim_k: float = 0.0) -> dict:
+    """Sections 11-19 end to end. Returns per-node labels in three classes.
+
+    min_eta_cv / recruit_ratio / trim_k: OPT-IN cautious selection (defaults = the threshold-free extractor,
+    bit-identical): seed must have held-out eta_cv >= min_eta_cv, recruits need E^M < recruit_ratio E^I, and the
+    final set is trimmed to one rigid body (rigid_trim, k = trim_k; 0 = off)."""
     cands = candidate_hierarchy(edge_i, edge_j, C, n, min_nodes=min_nodes,
                                 min_merge_support=min_merge_support)
     # Section 17 evaluates "graph-persistent candidates": the hierarchy has
@@ -540,10 +598,14 @@ def extract_moving_component(traj: Tensor, edge_i: Tensor, edge_j: Tensor,
     if verbose:
         print(f"    {len(cands)} merge candidates, {len(pool)} evaluated")
 
-    sel = select_moving_component(pool)
+    sel = select_moving_component(pool, min_eta_cv=min_eta_cv)
+    if verbose and min_eta_cv > 0.0:
+        print(f"    cautious selection: eta_cv >= {min_eta_cv}: {sel.get('num_qualified', 0)} qualify, "
+              f"{sel.get('num_below_min_eta_cv', 0)} rigid-but-weaker candidates refused")
     labels = [INCOHERENT] * n
     core = torch.zeros(0, dtype=torch.long)
     recruit = None
+    trim = None
     if sel["status"] == "RESOLVED":
         chosen = next(c for c in pool if c["candidate_id"] == sel["selected"])
         core = torch.tensor(chosen["members"], dtype=torch.long)
@@ -555,8 +617,14 @@ def extract_moving_component(traj: Tensor, edge_i: Tensor, edge_j: Tensor,
             # moving body at this point, so the reference frame is contaminated
             # by exactly the nodes the refinement exists to recruit.
             rest = torch.tensor([v for v in range(n)], dtype=torch.long)
-            recruit = refine_from_core(traj, core, rest)
+            recruit = refine_from_core(traj, core, rest, recruit_ratio=recruit_ratio)
             core = torch.unique(torch.cat([core, recruit["recruited"]]))
+        if trim_k > 0.0:
+            trim = rigid_trim(traj, core, trim_k)
+            core = torch.unique(trim["kept"])
+            if verbose:
+                print(f"    rigid trim (k {trim_k}): dropped {len(trim['dropped'])} nodes in {trim['rounds']} "
+                      f"rounds, {core.numel()} kept")
         for v in core.tolist():
             labels[v] = MOVING_RIGID
         # Everything else that sits inside a coherent, near-identity candidate
@@ -589,5 +657,7 @@ def extract_moving_component(traj: Tensor, edge_i: Tensor, edge_j: Tensor,
                            if recruit else None),
             "seed_core_nodes": (sorted(chosen["members"])
                                 if sel["status"] == "RESOLVED" else []),
+            "strictness": {"min_eta_cv": min_eta_cv, "recruit_ratio": recruit_ratio, "trim_k": trim_k},
+            "trim": ({k: v for k, v in trim.items() if k != "kept"} if trim else None),
             "num_merge_candidates": len(cands),
             "method": "coherence_single_linkage_heldout_rigid"}

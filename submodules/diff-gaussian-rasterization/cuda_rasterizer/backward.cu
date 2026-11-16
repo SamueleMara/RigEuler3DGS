@@ -473,7 +473,9 @@ renderCUDA(
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
 	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dinvdepths
+	float* __restrict__ dL_dinvdepths,
+	const float* __restrict__ dL_dalpha_pix,
+	const float* __restrict__ dL_dzdepth_pix
 )
 {
 	auto block = cg::this_thread_block();
@@ -507,17 +509,28 @@ renderCUDA(
 	float dL_dpixel[C] = { 0 };
 	float dL_invdepth = 0.0f;
 	float accum_invdepth_rec = 0;
+	// Phase 4/5 RGB-D path (null for every legacy caller). Z = sum_i w_i z_i is
+	// one more front-to-back composited channel (feature z_i, background 0);
+	// A = 1 - T_final gives dA/dalpha_i = T_final / (1 - alpha_i).
+	float dL_dZ = 0.0f;
+	float dL_dA = 0.0f;
+	float accum_z_rec = 0;
 	if (inside)
 	{
 		for (int i = 0; i < C; i++)
 			dL_dpixel[i] = dL_dpixels[(channel_offset + i) * H * W + pix_id];
 		if (dL_invdepths)
 			dL_invdepth = dL_invdepths[pix_id];
+		if (dL_dzdepth_pix)
+			dL_dZ = dL_dzdepth_pix[pix_id];
+		if (dL_dalpha_pix)
+			dL_dA = dL_dalpha_pix[pix_id];
 	}
 
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 	float last_invdepth = 0;
+	float last_z = 0;
 
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
@@ -532,7 +545,7 @@ renderCUDA(
 			collected_id[block.thread_rank()] = coll_id;
 			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
 			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
-			if(dL_invdepths)
+			if(dL_invdepths || dL_dzdepth_pix)
 				collected_depths[block.thread_rank()] = depths[coll_id];
 		}
 		block.sync();
@@ -578,6 +591,17 @@ renderCUDA(
 				dL_dalpha += (invd - accum_invdepth_rec) * dL_invdepth;
 				atomicAdd(&(dL_dinvdepths[global_id]), dchannel_dcolor * dL_invdepth);
 			}
+			if (dL_dzdepth_pix)
+			{
+				const float z = collected_depths[j];
+				accum_z_rec = last_alpha * last_z + (1.f - last_alpha) * accum_z_rec;
+				last_z = z;
+				dL_dalpha += (z - accum_z_rec) * dL_dZ;
+				// dL/dz_i = w_i dL/dZ, carried in the per-Gaussian inverse-depth
+				// buffer (d invd / d z = -1/z^2, so dL/dinvd = -z^2 dL/dz); the
+				// existing computeCov2DCUDA maps it onto the mean exactly.
+				atomicAdd(&(dL_dinvdepths[global_id]), -dchannel_dcolor * dL_dZ * z * z);
+			}
 
 			dL_dalpha *= T;
 			last_alpha = alpha;
@@ -586,6 +610,8 @@ renderCUDA(
 			for (int i = 0; i < C; i++)
 				bg_dot_dpixel += bg_color[channel_offset + i] * dL_dpixel[i];
 			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+			if (dL_dalpha_pix)
+				dL_dalpha += (T_final / (1.f - alpha)) * dL_dA;
 
 			const float dL_dG = con_o.w * dL_dalpha;
 			const float gdx = G * d.x;
@@ -627,7 +653,9 @@ static void launchBackwardRenderChunk(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dinvdepths)
+	float* dL_dinvdepths,
+	const float* dL_dalpha_pix = nullptr,
+	const float* dL_dzdepth_pix = nullptr)
 {
 	renderCUDA<C> << <grid, block >> >(
 		ranges,
@@ -648,7 +676,9 @@ static void launchBackwardRenderChunk(
 		dL_dconic2D,
 		dL_dopacity,
 		dL_dcolors,
-		dL_dinvdepths);
+		dL_dinvdepths,
+		dL_dalpha_pix,
+		dL_dzdepth_pix);
 }
 
 static void dispatchBackwardRenderChunk(
@@ -672,42 +702,44 @@ static void dispatchBackwardRenderChunk(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dinvdepths)
+	float* dL_dinvdepths,
+	const float* dL_dalpha_pix,
+	const float* dL_dzdepth_pix)
 {
 	switch (channels)
 	{
-	case 1: launchBackwardRenderChunk<1>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 2: launchBackwardRenderChunk<2>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 3: launchBackwardRenderChunk<3>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 4: launchBackwardRenderChunk<4>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 5: launchBackwardRenderChunk<5>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 6: launchBackwardRenderChunk<6>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 7: launchBackwardRenderChunk<7>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 8: launchBackwardRenderChunk<8>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 9: launchBackwardRenderChunk<9>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 10: launchBackwardRenderChunk<10>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 11: launchBackwardRenderChunk<11>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 12: launchBackwardRenderChunk<12>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 13: launchBackwardRenderChunk<13>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 14: launchBackwardRenderChunk<14>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 15: launchBackwardRenderChunk<15>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 16: launchBackwardRenderChunk<16>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 17: launchBackwardRenderChunk<17>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 18: launchBackwardRenderChunk<18>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 19: launchBackwardRenderChunk<19>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 20: launchBackwardRenderChunk<20>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 21: launchBackwardRenderChunk<21>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 22: launchBackwardRenderChunk<22>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 23: launchBackwardRenderChunk<23>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 24: launchBackwardRenderChunk<24>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 25: launchBackwardRenderChunk<25>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 26: launchBackwardRenderChunk<26>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 27: launchBackwardRenderChunk<27>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 28: launchBackwardRenderChunk<28>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 29: launchBackwardRenderChunk<29>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 30: launchBackwardRenderChunk<30>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 31: launchBackwardRenderChunk<31>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
-	case 32: launchBackwardRenderChunk<32>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths); break;
+	case 1: launchBackwardRenderChunk<1>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 2: launchBackwardRenderChunk<2>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 3: launchBackwardRenderChunk<3>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 4: launchBackwardRenderChunk<4>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 5: launchBackwardRenderChunk<5>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 6: launchBackwardRenderChunk<6>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 7: launchBackwardRenderChunk<7>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 8: launchBackwardRenderChunk<8>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 9: launchBackwardRenderChunk<9>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 10: launchBackwardRenderChunk<10>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 11: launchBackwardRenderChunk<11>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 12: launchBackwardRenderChunk<12>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 13: launchBackwardRenderChunk<13>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 14: launchBackwardRenderChunk<14>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 15: launchBackwardRenderChunk<15>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 16: launchBackwardRenderChunk<16>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 17: launchBackwardRenderChunk<17>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 18: launchBackwardRenderChunk<18>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 19: launchBackwardRenderChunk<19>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 20: launchBackwardRenderChunk<20>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 21: launchBackwardRenderChunk<21>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 22: launchBackwardRenderChunk<22>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 23: launchBackwardRenderChunk<23>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 24: launchBackwardRenderChunk<24>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 25: launchBackwardRenderChunk<25>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 26: launchBackwardRenderChunk<26>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 27: launchBackwardRenderChunk<27>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 28: launchBackwardRenderChunk<28>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 29: launchBackwardRenderChunk<29>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 30: launchBackwardRenderChunk<30>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 31: launchBackwardRenderChunk<31>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
+	case 32: launchBackwardRenderChunk<32>(grid, block, ranges, point_list, W, H, bg_color, means2D, conic_opacity, colors, total_channels, channel_offset, depths, final_Ts, n_contrib, dL_dpixels, dL_invdepths, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dinvdepths, dL_dalpha_pix, dL_dzdepth_pix); break;
 	default:
 		throw std::runtime_error("Unsupported backward render chunk size. This should never happen.");
 	}
@@ -849,7 +881,9 @@ void BACKWARD::render(
 	float4* dL_dconic2D,
 	float* dL_dopacity,
 	float* dL_dcolors,
-	float* dL_dinvdepths)
+	float* dL_dinvdepths,
+	const float* dL_dalpha_pix,
+	const float* dL_dzdepth_pix)
 {
 	constexpr int MAX_CHUNK = 32;
 	for (int channel_offset = 0; channel_offset < feature_channels; channel_offset += MAX_CHUNK)
@@ -878,6 +912,8 @@ void BACKWARD::render(
 			dL_dconic2D,
 			dL_dopacity,
 			dL_dcolors,
-			dL_dinvdepths);
+			dL_dinvdepths,
+			channel_offset == 0 ? dL_dalpha_pix : nullptr,
+			channel_offset == 0 ? dL_dzdepth_pix : nullptr);
 	}
 }

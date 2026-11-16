@@ -297,7 +297,9 @@ renderCUDA(
 	float* __restrict__ out_top_weights,
 	float* __restrict__ out_top_depths,
 	int top_L,
-	float contributor_min_weight)
+	float contributor_min_weight,
+	float* __restrict__ out_alpha,
+	float* __restrict__ out_zdepth)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -325,6 +327,10 @@ renderCUDA(
 	float C[CHANNELS] = { 0 };
 
 	float expected_invdepth = 0.0f;
+	// Phase 4/5 RGB-D path (opt-in, null for every legacy caller): weighted
+	// camera-space axial depth Z = sum_i w_i z_i and accumulated opacity
+	// A = 1 - T_final, both from the same front-to-back loop.
+	float expected_z = 0.0f;
 
 	// Pixel-mediated matching (spec section 4/5): keep the top-L contributors
 	// ranked by COMPOSITING RESPONSIBILITY rho = T_before * alpha, not raw alpha,
@@ -381,6 +387,8 @@ renderCUDA(
 
 			if (invdepth)
 				expected_invdepth += (1 / depths[gid]) * alpha * T;
+			if (out_zdepth)
+				expected_z += depths[gid] * alpha * T;
 
 			if (collect_top)
 			{
@@ -415,6 +423,10 @@ renderCUDA(
 
 		if (invdepth)
 			invdepth[pix_id] = expected_invdepth;
+		if (out_alpha)
+			out_alpha[pix_id] = 1.0f - T;
+		if (out_zdepth)
+			out_zdepth[pix_id] = expected_z;
 
 		if (collect_top)
 		{
@@ -739,7 +751,9 @@ static void launchRenderChunk(
 	float* out_top_weights,
 	float* out_top_depths,
 	int top_L,
-	float contributor_min_weight)
+	float contributor_min_weight,
+	float* out_alpha = nullptr,
+	float* out_zdepth = nullptr)
 {
 	renderCUDA<CHANNELS> << <grid, block >> > (
 		ranges,
@@ -760,7 +774,9 @@ static void launchRenderChunk(
 		out_top_weights,
 		out_top_depths,
 		top_L,
-		contributor_min_weight);
+		contributor_min_weight,
+		out_alpha,
+		out_zdepth);
 }
 
 static void dispatchRenderChunk(
@@ -784,42 +800,44 @@ static void dispatchRenderChunk(
 	float* out_top_weights,
 	float* out_top_depths,
 	int top_L,
-	float contributor_min_weight)
+	float contributor_min_weight,
+	float* out_alpha,
+	float* out_zdepth)
 {
 	switch (channels)
 	{
-	case 1: launchRenderChunk<1>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 2: launchRenderChunk<2>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 3: launchRenderChunk<3>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 4: launchRenderChunk<4>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 5: launchRenderChunk<5>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 6: launchRenderChunk<6>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 7: launchRenderChunk<7>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 8: launchRenderChunk<8>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 9: launchRenderChunk<9>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 10: launchRenderChunk<10>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 11: launchRenderChunk<11>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 12: launchRenderChunk<12>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 13: launchRenderChunk<13>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 14: launchRenderChunk<14>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 15: launchRenderChunk<15>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 16: launchRenderChunk<16>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 17: launchRenderChunk<17>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 18: launchRenderChunk<18>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 19: launchRenderChunk<19>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 20: launchRenderChunk<20>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 21: launchRenderChunk<21>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 22: launchRenderChunk<22>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 23: launchRenderChunk<23>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 24: launchRenderChunk<24>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 25: launchRenderChunk<25>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 26: launchRenderChunk<26>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 27: launchRenderChunk<27>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 28: launchRenderChunk<28>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 29: launchRenderChunk<29>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 30: launchRenderChunk<30>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 31: launchRenderChunk<31>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
-	case 32: launchRenderChunk<32>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight); break;
+	case 1: launchRenderChunk<1>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 2: launchRenderChunk<2>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 3: launchRenderChunk<3>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 4: launchRenderChunk<4>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 5: launchRenderChunk<5>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 6: launchRenderChunk<6>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 7: launchRenderChunk<7>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 8: launchRenderChunk<8>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 9: launchRenderChunk<9>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 10: launchRenderChunk<10>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 11: launchRenderChunk<11>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 12: launchRenderChunk<12>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 13: launchRenderChunk<13>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 14: launchRenderChunk<14>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 15: launchRenderChunk<15>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 16: launchRenderChunk<16>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 17: launchRenderChunk<17>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 18: launchRenderChunk<18>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 19: launchRenderChunk<19>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 20: launchRenderChunk<20>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 21: launchRenderChunk<21>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 22: launchRenderChunk<22>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 23: launchRenderChunk<23>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 24: launchRenderChunk<24>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 25: launchRenderChunk<25>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 26: launchRenderChunk<26>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 27: launchRenderChunk<27>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 28: launchRenderChunk<28>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 29: launchRenderChunk<29>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 30: launchRenderChunk<30>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 31: launchRenderChunk<31>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
+	case 32: launchRenderChunk<32>(grid, block, ranges, point_list, W, H, means2D, colors, total_channels, channel_offset, conic_opacity, final_T, n_contrib, bg_color, out_color, depths, depth, out_top_ids, out_top_weights, out_top_depths, top_L, contributor_min_weight, out_alpha, out_zdepth); break;
 	default:
 		throw std::runtime_error("Unsupported render chunk size. This should never happen.");
 	}
@@ -880,7 +898,9 @@ void FORWARD::render(
 	float* out_top_weights,
 	float* out_top_depths,
 	int top_L,
-	float contributor_min_weight)
+	float contributor_min_weight,
+	float* out_alpha,
+	float* out_zdepth)
 {
 	constexpr int MAX_CHUNK = 32;
 	for (int channel_offset = 0; channel_offset < feature_channels; channel_offset += MAX_CHUNK)
@@ -911,7 +931,10 @@ void FORWARD::render(
 			channel_offset == 0 ? out_top_weights : nullptr,
 			channel_offset == 0 ? out_top_depths : nullptr,
 			channel_offset == 0 ? top_L : 0,
-			contributor_min_weight);
+			contributor_min_weight,
+			// alpha and Z do not depend on the channel chunk either
+			channel_offset == 0 ? out_alpha : nullptr,
+			channel_offset == 0 ? out_zdepth : nullptr);
 	}
 }
 

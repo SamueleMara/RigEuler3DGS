@@ -1,0 +1,30 @@
+{
+ "stage": "4c",
+ "complete": true,
+ "counts": {
+  "ACCEPTED_MOVING": 4,
+  "REJECTED_OCCLUSION_CONTRADICTION": 6,
+  "AMBIGUOUS_MATERIAL": 1,
+  "REJECTED_DUPLICATE": 2,
+  "REJECTED_TOO_SMALL": 10
+ },
+ "n_original": 28089,
+ "n_accepted": 38,
+ "E_before": 0.5849497512792713,
+ "E_after": 0.5780797176921029,
+ "joint_files_sha256": {
+  "geometry": "d8135e00228d5da11b8be7fcd2191e8a7f9b86383558e0d42d5c917af9655d9d",
+  "trajectory": "ae2d4819063202c5c6291338d788e0ae18a6ea579eecf33b4cf12b16528d988b"
+ },
+ "resources": {
+  "wall_s": 100.8469569683075,
+  "cpu_s": 110.354086132,
+  "rss_gb": 1.6796798706054688,
+  "alloc_mb": 15.3857421875,
+  "peak_alloc_mb": 228.92578125,
+  "reserved_mb": 296.0,
+  "peak_reserved_mb": 296.0
+ },
+ "time": "2026-11-11 12:46:36",
+ "NOT_FINAL": true
+}

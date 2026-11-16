@@ -1,0 +1,144 @@
+{
+ "NOT_FINAL": true,
+ "argv": [
+  "tools/benchmark_phase4a.py",
+  "--source",
+  "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/final_red_fridge_episode_000000",
+  "--direction",
+  "forward",
+  "--model",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/static_bidi/initial",
+  "--phase2-dir",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/bidirectional/forward_rigid",
+  "--phase3-dir",
+  "/media/samuelemara/Extreme SSD/Samuele/results_11_10_26/ours_v6_two_cams/final_red_fridge_episode_000000/unanimous/pipeline/final_red_fridge_episode_000000/bidirectional/forward_joint",
+  "--joint-type",
+  "revolute",
+  "--cameras",
+  "cam_001,cam_002",
+  "--groups",
+  "50",
+  "--view-subset",
+  "12",
+  "--output",
+  "/tmp/claude-1000/-home-samuelemara-Joint3DGS-RigEuler3DGS/90323ff0-f6c6-454e-a004-5e28e27daa35/scratchpad/bench_fridge12"
+ ],
+ "prepare": {
+  "seconds": 0.6931126117706299,
+  "source": "/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real/final_red_fridge_episode_000000",
+  "views": 24,
+  "storage": "host_ram",
+  "bytes_unpacked": 66355200,
+  "rss_gb_after_prepare": 0.9251480102539062,
+  "counters": {
+   "view_get": 0,
+   "gpu_uploads": 0,
+   "gpu_upload_bytes": 0,
+   "files_opened": 72,
+   "image_decodes": 24,
+   "npy_loads": 24,
+   "mask_decodes": 24,
+   "bytes_read": 35310692,
+   "decode_seconds": 0.25653756340034306
+  },
+  "combined_sha256": "c16dff8157713c05578cee8a5a452a0345eda00d98d2bef2297784cfa3a1b492",
+  "valid_depth_pixels_total": 1114065
+ },
+ "prepared_two_sweeps": {
+  "seconds": 0.042281150817871094,
+  "counters_after": {
+   "view_get": 48,
+   "gpu_uploads": 48,
+   "gpu_upload_bytes": 132710400,
+   "files_opened": 72,
+   "image_decodes": 24,
+   "npy_loads": 24,
+   "mask_decodes": 24,
+   "bytes_read": 35310692,
+   "decode_seconds": 0.25653756340034306
+  }
+ },
+ "old_viewstore_cache64_two_sweeps": {
+  "seconds": 0.4339582920074463,
+  "counters": {
+   "get": 48,
+   "hits": 24,
+   "misses": 24,
+   "decodes": 24
+  },
+  "views": 24
+ },
+ "groups": {
+  "n": 160,
+  "candidates": 24615,
+  "core": 3474,
+  "size_quantiles": [
+   1.0,
+   191.0,
+   192.0,
+   192.0,
+   192.0,
+   192.0
+  ],
+  "singletons": 27,
+  "link_factor": 3.0
+ },
+ "footprints_seconds": 0.21199655532836914,
+ "exact_roi": {
+  "seconds": 3.5218183994293213,
+  "item_views_scored": 1100,
+  "item_views_per_s": 312.3386487441388,
+  "seconds_per_100_groups_all_selected_views": 7.043636798858642,
+  "skip_counts": {
+   "0": 1100,
+   "1": 0,
+   "2": 100
+  },
+  "counters": {
+   "sweeps": 1,
+   "views_uploaded": 24,
+   "baseline_renders": 24,
+   "footprint_renders": 26,
+   "hypothesis_renders": 1100,
+   "omit_renders": 0,
+   "group_view_scored": 1100,
+   "group_view_skipped_offscreen": 0,
+   "group_view_skipped_identity": 100,
+   "roi_boxes": 1221,
+   "roi_pixels": 25088856,
+   "gpu_to_cpu_copies": 5,
+   "gpu_to_cpu_bytes": 67968,
+   "commits": 0,
+   "batches": 0,
+   "seconds_footprints": 0.19865703582763672,
+   "seconds_sweeps": 3.4963772296905518
+  }
+ },
+ "full_reference": {
+  "seconds": 23.929487943649292,
+  "max_abs_diff": 8.673617379884035e-19,
+  "max_abs_reference": 0.006430527083769752,
+  "max_rel_diff": 1.3488190418753858e-16,
+  "decisions_agree": 50,
+  "groups": 50,
+  "speedup_exact_vs_reference": 6.794639935871437
+ },
+ "extrapolation_from_measured": {
+  "all_groups": 160,
+  "all_views": 378,
+  "measured_scored_fraction": 0.9166666666666666,
+  "measured_rate_per_s": 312.3386487441388,
+  "one_full_sweep_item_views": 55440.0,
+  "one_full_sweep_minutes_at_measured_rate": 2.9583274555206303,
+  "note": "4A needs >= 2 full sweeps (initial + final verification with OMIT ~ 2x renders) plus batch re-scores of interacting groups; the batch count is data-dependent and is logged by the real run"
+ },
+ "resources": {
+  "wall_s": 37.6868953704834,
+  "cpu_s": 49.166312651999995,
+  "rss_gb": 1.4909629821777344,
+  "alloc_mb": 74.32666015625,
+  "peak_alloc_mb": 218.81103515625,
+  "reserved_mb": 318.0,
+  "peak_reserved_mb": 318.0
+ }
+}

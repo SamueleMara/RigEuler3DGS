@@ -89,7 +89,9 @@ namespace FORWARD
 		float* out_top_weights = nullptr,
 		float* out_top_depths = nullptr,
 		int top_L = 0,
-		float contributor_min_weight = 1e-4f);
+		float contributor_min_weight = 1e-4f,
+		float* out_alpha = nullptr,     // [H*W] 1 - T_final (Phase 4/5 RGB-D path)
+		float* out_zdepth = nullptr);   // [H*W] sum_i w_i z_i, camera-space axial depth
 
 	// Rendering-consistent optical-flow inversion primitive. Each observed
 	// source pixel contributes its standard 3DGS T*alpha ownership weight to the

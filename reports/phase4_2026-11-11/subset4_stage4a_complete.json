@@ -1,0 +1,50 @@
+{
+ "stage": "4a",
+ "complete": true,
+ "aborted": false,
+ "stop_reason": null,
+ "counts": {
+  "CORE_MOVING": 3474,
+  "MOVING": 2224,
+  "STATIC": 17946,
+  "UNRESOLVED": 4416,
+  "SUSPECT_ORIGINAL": 29,
+  "UPSTREAM_JOINT_INVALID": 0,
+  "UNTESTED_RESOURCE_LIMIT": 0
+ },
+ "seconds": 48.129541873931885,
+ "counters": {
+  "sweeps": 23,
+  "views_uploaded": 184,
+  "baseline_renders": 184,
+  "footprint_renders": 110,
+  "hypothesis_renders": 10344,
+  "omit_renders": 1824,
+  "group_view_scored": 10344,
+  "group_view_skipped_offscreen": 0,
+  "group_view_skipped_identity": 3448,
+  "roi_boxes": 11218,
+  "roi_pixels": 217886128,
+  "gpu_to_cpu_copies": 115,
+  "gpu_to_cpu_bytes": 778240,
+  "commits": 39,
+  "batches": 4,
+  "seconds_footprints": 0.7660629749298096,
+  "seconds_sweeps": 38.22888112068176
+ },
+ "resources": {
+  "wall_s": 48.77512049674988,
+  "cpu_s": 54.381182843000005,
+  "rss_gb": 1.363250732421875,
+  "alloc_mb": 17.51025390625,
+  "peak_alloc_mb": 210.09130859375,
+  "reserved_mb": 296.0,
+  "peak_reserved_mb": 296.0
+ },
+ "joint_files_sha256": {
+  "geometry": "d8135e00228d5da11b8be7fcd2191e8a7f9b86383558e0d42d5c917af9655d9d",
+  "trajectory": "ae2d4819063202c5c6291338d788e0ae18a6ea579eecf33b4cf12b16528d988b"
+ },
+ "NOT_FINAL": true,
+ "time": "2026-11-11 12:45:44"
+}

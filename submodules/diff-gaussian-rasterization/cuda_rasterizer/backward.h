@@ -62,7 +62,9 @@ namespace BACKWARD
 		float4* dL_dconic2D,
 		float* dL_dopacity,
 		float* dL_dcolors,
-		float* dL_dinvdepths);
+		float* dL_dinvdepths,
+		const float* dL_dalpha_pix = nullptr,    // [H*W] dL/dA (Phase 4/5 RGB-D path)
+		const float* dL_dzdepth_pix = nullptr);  // [H*W] dL/dZ; needs dL_dinvdepths non-null
 
 	void preprocess(
 		int P, int D, int M,
