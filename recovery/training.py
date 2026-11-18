@@ -257,7 +257,8 @@ def write_comparisons(out_dir, idx, views, init, final, get_view):
 
 
 def train_phase5(g: GaussianTensors, joint, views, cameras, cfg: Phase5Config, out_dir=None, device="cuda",
-                 log=print, manifest=None) -> dict:
+                 log=print, manifest=None, progress=True) -> dict:
+    from .progress import line_tqdm
     t0 = time.time()
     if cfg.mode not in ("gaussian_rgbd", "sh_only"):
         raise ValueError(cfg.mode)
@@ -319,6 +320,7 @@ def train_phase5(g: GaussianTensors, joint, views, cameras, cfg: Phase5Config, o
         else:
             names = {"f_dc", "f_rest"}
         set_trainable(g, opt, names)
+        bar = line_tqdm(n_it, f"  phase5 stage {stage}", unit="it") if progress else None
         for k in range(n_it):
             deg = 0 if stage == "A" else (min(deg_final, k // max(1, cfg.sh_interval)) if stage == "B" else deg_final)
             if cfg.mode == "sh_only":
@@ -356,6 +358,9 @@ def train_phase5(g: GaussianTensors, joint, views, cameras, cfg: Phase5Config, o
                               "sh_degree": deg, "gaussians": len(g),
                               **{kk: (float(x) if torch.is_tensor(x) else x) for kk, x in terms.items()}})
             it += 1
+            if bar is not None:
+                bar.set_postfix_str(f"{len(g)} Gaussians, loss {loss_rows[-1]['total']:.4f}", refresh=False)
+                bar.update(1)
             if stage == "B" and cfg.densify and cfg.densify_from <= k <= cfg.densify_until and k % cfg.densify_every == 0 \
                     and k > 0:
                 gn = grad_acc / denom.clamp_min(1)
@@ -374,6 +379,8 @@ def train_phase5(g: GaussianTensors, joint, views, cameras, cfg: Phase5Config, o
                 assert joint_fingerprint(joint, transport) == fp0, "joint changed"
                 g.save_ply(out / "checkpoints" / f"iter_{it:06d}" / "point_cloud.ply")
                 g.save_lineage(out / "checkpoints" / f"iter_{it:06d}")
+        if bar is not None:
+            bar.close()
         log(f"  stage {stage}: {n_it} iterations, {len(g)} Gaussians, last-100 mean loss "
             f"{np.mean([r['total'] for r in loss_rows[-100:]]) if loss_rows else float('nan'):.5f}")
     final_rows, _ = sweep(views, g, transport, moving_of(), cfg, deg_final, get_view, device)
