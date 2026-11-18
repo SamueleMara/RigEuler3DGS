@@ -19,7 +19,8 @@ set -u
 cd "$(dirname "$(readlink -f "$0")")" || exit 2
 HERE=$(pwd)
 PY=${PY:-~/miniconda3/envs/rigeuler3dgs/bin/python}
-P45=${P45:-"$HOME/Joint3DGS/RigEuler3DGS-p45"}
+if [ -f "$HERE/tools/export_phase5_sim_asset.py" ]; then P45=${P45:-"$HERE"}   # merged tree
+else P45=${P45:-"$HOME/Joint3DGS/RigEuler3DGS-p45"}; fi
 REAL=${REAL:-"/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"}
 RES=${RES:-"/media/samuelemara/Extreme SSD/Samuele/results_11_10_26"}
 BACKUP="$RES/robot_base_registration_applied_20261112/backups"
