@@ -164,6 +164,7 @@ while [ $# -gt 0 ]; do
     --phase1-deterministic)      P1DET=1; shift;;
     --phase1-likelihood)         P1LIK="$2"; shift 2;;
     --phase1-group-update)       P1GRP="$2"; shift 2;;
+    --negative-ray-reliability)  P1REL="$2"; shift 2;;
     --velocity-tau)              VTAU="$2"; shift 2;;
     --phase2-support-refine)     P2REFINE="$2"; shift 2;;
     --phase2-support-refine-rounds) P2ROUNDS="$2"; shift 2;;
@@ -220,10 +221,17 @@ P1DET_SIG=""; [ "$P1DET" = 1 ] && P1DET_SIG="P1DET=1"     # absent by default: e
 P1LIK=${P1LIK:-legacy-masked}; P1GRP=${P1GRP:-legacy}
 case "$P1LIK" in legacy-masked|occlusion-consistent) ;; *) echo "--phase1-likelihood must be legacy-masked|occlusion-consistent" >&2; exit 2;; esac
 case "$P1GRP" in legacy|observable) ;; *) echo "--phase1-group-update must be legacy|observable" >&2; exit 2;; esac
+P1REL=${P1REL:-calibrated}
+case "$P1REL" in calibrated|certified|none) ;; *) echo "--negative-ray-reliability must be calibrated|certified|none" >&2; exit 2;; esac
+[ "$P1LIK" = legacy-masked ] && [ "$P1REL" != calibrated ] && { echo "--negative-ray-reliability needs --phase1-likelihood occlusion-consistent" >&2; exit 2; }
 P1OCC_SIG=""     # absent by default: existing signatures still match
 if [ "$P1LIK" != legacy-masked ] || [ "$P1GRP" != legacy ]; then
   P1ARGS+=(--phase1-likelihood "$P1LIK" --phase1-group-update "$P1GRP")
   P1OCC_SIG="P1OCC=$P1LIK/$P1GRP"
+  if [ "$P1LIK" = occlusion-consistent ]; then
+    P1ARGS+=(--negative-ray-reliability "$P1REL")
+    P1OCC_SIG="$P1OCC_SIG/q=$P1REL"
+  fi
 fi
 VTAU=${VTAU:-0}; P2REFINE=${P2REFINE:-off}; P2ROUNDS=${P2ROUNDS:-1}
 case "$P2REFINE" in off|free-space) ;; *) echo "--phase2-support-refine must be off|free-space" >&2; exit 2;; esac

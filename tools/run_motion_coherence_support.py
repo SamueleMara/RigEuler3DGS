@@ -347,6 +347,18 @@ def main() -> int:
         ns.occlusion_likelihood = _occ_from_args(args)
         if ns.occlusion_likelihood is not None and ns.masked_observation is None:
             raise SystemExit("--phase1-likelihood occlusion-consistent needs the masked observation")
+        if ns.occlusion_likelihood is not None and ns.occlusion_likelihood.reliability == "calibrated":
+            # per-camera negative-ray reliability from THIS run's masks and raw depth (no GT)
+            import time as _time
+            from estimator.occlusion_likelihood import calibrate_reliability as _cal_rel
+            _t = _time.time()
+            ns.occlusion_likelihood.calibration = _cal_rel(
+                ns.occlusion_likelihood, cfg, list(cfg.camera_names), [ob for ob, _s, _d in frames_raw],
+                ns.masked_observation.masks)
+            for _c, _r in ns.occlusion_likelihood.calibration.items():
+                print(f"  negative-ray reliability {_c}: d_far {_r.d_far} px, r_inf {_r.r_inf:.3f}, contamination "
+                      f"c(2..6) = {[round(float(x), 2) for x in _r.contamination[2:7]]}, depth-edge fraction "
+                      f"{_r.stats['depth_edge_fraction_of_m0_valid']:.3f} ({_time.time() - _t:.0f} s)")
         cfg = __import__("dataclasses").replace(cfg, group_update=args.phase1_group_update,
                                                 group_update_map=args.phase1_group_update_map)
         if ns.occlusion_likelihood is not None or args.phase1_group_update != "legacy":

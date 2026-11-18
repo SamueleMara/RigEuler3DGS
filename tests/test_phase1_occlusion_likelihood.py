@@ -105,7 +105,7 @@ def main() -> int:
     from tests.test_unified_cuda_renderer_jvp_vjp import make_cameras
     torch.manual_seed(0)
     cams = make_cameras(n_cam=3, H=96, W=96, radius=2.2)
-    occ = OcclusionLikelihood()
+    occ = OcclusionLikelihood("certified")
     c = cfg()
     obj = blob()
     stray = blob(n=6, seed=3, centre=(0.33, 0.05, 0.0), spread=0.08)

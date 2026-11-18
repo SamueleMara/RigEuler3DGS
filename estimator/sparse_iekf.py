@@ -895,7 +895,8 @@ def iekf_frame_step(
                     rhs_pose=rhs_pose, meas_normal=meas_normal, b=b, grouped=grouped, lm=lm,
                     radius=radius, use_trust_region=cfg.use_trust_region, dt=dt, cfg=cfg_terms,
                     M_blocks=M_blocks, first_return_depth=fr_depth, rgbd_gt=rgbd_gt, cameras=cameras,
-                    background=background, visibility=visibility, observation_model=observation_model)
+                    background=background, visibility=visibility, observation_model=observation_model,
+                    solve_b=solve_b, observable_map=omap, expand_step=expand_step, occlusion=occlusion)
         energy_before = energy
 
         # --- 8/9. Step control ---------------------------------------------

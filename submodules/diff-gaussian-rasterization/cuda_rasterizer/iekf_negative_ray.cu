@@ -18,15 +18,17 @@
  *   E_q[T_front] = 1 - A_p,     A_p = sum_k w_k s_k,     s_k = Phi((D - z_k) / sigma_p)
  *
  * (Abel summation of sum_k T_k [F(z_{k+1}) - F(z_k)] with the contributors in depth
- * order; exact for the Gaussian depth marginal, no quadrature.)  With a declared
- * negative-mask reliability pi in (0, 1] (pi = 1: every KNOWN_NONOBJECT ray is
- * certified), the per-pixel negative log-likelihood is
+ * order; exact for the Gaussian depth marginal, no quadrature.)  Each pixel carries a
+ * reliability q_p in [0, 1] (estimator/negative_ray_reliability.py): the probability that
+ * the ray is a clean non-object measurement; with probability 1 - q_p it is contaminated
+ * (mask false negative / indistinguishable surface) and carries no information. The
+ * per-pixel negative log-likelihood of that two-component observation model is
  *
- *   L_p = -log(1 - pi A_p).
+ *   L_p = -log((1 - q_p) + q_p E[T_front]) = -log(1 - q_p A_p).
  *
- * Positivity: A_p <= sum_k w_k = 1 - T_end <= 1 - T_STOP, so 1 - pi A_p >= T_STOP > 0
- * by the renderer's own termination rule; a 1e-12 floor guards round-off only and every
- * use is counted.
+ * q_p = 0 gives L_p = 0 and zero derivatives (UNKNOWN). Positivity: A_p <= sum_k w_k =
+ * 1 - T_end <= 1 - T_STOP, so 1 - q_p A_p >= T_STOP > 0 by the renderer's own termination
+ * rule; a 1e-12 floor guards round-off only and every use is counted.
  *
  * Exact partials at frozen contributor order (the 0.99 clamp has d alpha = 0, as in
  * dAlphaOf):
@@ -89,7 +91,7 @@ struct NRCamera
 	const float* D;
 	const float* sig;
 	const uint8_t* status;
-	double pi;
+	const float* q;      // per-pixel reliability q_p in [0, 1]
 };
 
 struct DetAcc
@@ -245,7 +247,7 @@ nrEvalCUDA(NRCamera c, int diag, double* __restrict__ out_A, double* __restrict_
 	{
 		const double D = (double)c.D[pix_id], sd = (double)c.sig[pix_id];
 		const double A = softFrontAlpha(c, pixf, D, sd, total, id_at);
-		double E = 1.0 - c.pi * A;
+		double E = 1.0 - (double)c.q[pix_id] * A;
 		if (E < E_FLOOR) { E = E_FLOOR; atomicAdd(floor_hits, 1); }
 		out_A[pix_id] = A;
 		out_L[pix_id] = -log(E);
@@ -347,15 +349,16 @@ NRCamera makeCamera(
 	const torch::Tensor& Jp, const torch::Tensor& sigma_c, const torch::Tensor& conic,
 	const torch::Tensor& opacity, const torch::Tensor& depth, const torch::Tensor& clamp,
 	const torch::Tensor& viewmatrix, const torch::Tensor& projmatrix, float tanfovx, float tanfovy,
-	const torch::Tensor& D, const torch::Tensor& sig, const torch::Tensor& status, double pi)
+	const torch::Tensor& D, const torch::Tensor& sig, const torch::Tensor& status, const torch::Tensor& q)
 {
 	check(ranges, torch::kInt32, "ranges"); check(point_list, torch::kInt32, "point_list");
 	for (auto* p : {&means3D, &mu_c, &u, &Jp, &sigma_c, &conic, &opacity, &depth, &viewmatrix, &projmatrix, &D, &sig})
 		check(*p, torch::kFloat32, "float input");
 	check(clamp, torch::kInt32, "clamp_flags"); check(status, torch::kUInt8, "status");
-	TORCH_CHECK(D.numel() == (int64_t)W * H && sig.numel() == D.numel() && status.numel() == D.numel(),
-	            "observation maps must be [H,W]");
-	TORCH_CHECK(pi > 0.0 && pi <= 1.0, "negative-ray reliability must be in (0, 1]");
+	check(q, torch::kFloat32, "reliability q");
+	TORCH_CHECK(D.numel() == (int64_t)W * H && sig.numel() == D.numel() && status.numel() == D.numel()
+	            && q.numel() == D.numel(), "observation maps must be [H,W]");
+	TORCH_CHECK(q.min().item<float>() >= 0.f && q.max().item<float>() <= 1.f, "reliability q must be in [0, 1]");
 	NRCamera c;
 	c.ranges = reinterpret_cast<const uint2*>(ranges.data_ptr<int>());
 	c.point_list = reinterpret_cast<const uint32_t*>(point_list.data_ptr<int>());
@@ -366,7 +369,7 @@ NRCamera makeCamera(
 	c.viewmatrix = viewmatrix.data_ptr<float>(); c.projmatrix = projmatrix.data_ptr<float>();
 	c.focal_x = W / (2.0f * tanfovx); c.focal_y = H / (2.0f * tanfovy);
 	c.D = D.data_ptr<float>(); c.sig = sig.data_ptr<float>(); c.status = status.data_ptr<uint8_t>();
-	c.pi = pi;
+	c.q = q.data_ptr<float>();
 	return c;
 }
 
@@ -414,9 +417,9 @@ torch::Tensor accumulate(int64_t n, bool deterministic, const torch::TensorOptio
 	const torch::Tensor& Jp, const torch::Tensor& sigma_c, const torch::Tensor& conic,                   \
 	const torch::Tensor& opacity, const torch::Tensor& depth, const torch::Tensor& clamp,                \
 	const torch::Tensor& viewmatrix, const torch::Tensor& projmatrix, float tanfovx, float tanfovy,       \
-	const torch::Tensor& D, const torch::Tensor& sig, const torch::Tensor& status, double pi
+	const torch::Tensor& D, const torch::Tensor& sig, const torch::Tensor& status, const torch::Tensor& q
 #define NR_CAM makeCamera(ranges, point_list, W, H, means3D, mu_c, u, Jp, sigma_c, conic, opacity, depth,  \
-	                      clamp, viewmatrix, projmatrix, tanfovx, tanfovy, D, sig, status, pi)
+	                      clamp, viewmatrix, projmatrix, tanfovx, tanfovy, D, sig, status, q)
 
 std::vector<torch::Tensor> nrEval(NR_ARGS, int diag)
 {

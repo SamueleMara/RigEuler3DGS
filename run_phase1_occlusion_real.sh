@@ -18,7 +18,7 @@
 #
 #   bash run_phase1_occlusion_real.sh 2>&1 | tee -a ~/phase1_occlusion_real.log
 #   PARTS="A D" ...            skip the repeat;   SCENE_FILTER="robot_dog wooden_box" ...;   DRY=1 ... (plan only)
-# Env: OUT, PARTS, SCENE_FILTER, VTAU, ROUNDS, PY, DRY, P1LIK, P1GRP
+# Env: OUT, PARTS, SCENE_FILTER, VTAU, ROUNDS, PY, DRY, P1LIK, P1GRP, P1REL (calibrated|certified|none)
 set -u
 cd "$(dirname "$(readlink -f "$0")")" || exit 2
 PY=${PY:-~/miniconda3/envs/rigeuler3dgs/bin/python}
@@ -32,7 +32,8 @@ OUT=${OUT:-"$RES/ours_v9_phase1_occlusion_real"}
 PARTS=${PARTS:-"A R D"}
 SCENE_FILTER=${SCENE_FILTER:-}
 VTAU=${VTAU:-0.5}; ROUNDS=${ROUNDS:-1}
-P1LIK=${P1LIK:-occlusion-consistent}; P1GRP=${P1GRP:-observable}
+P1LIK=${P1LIK:-occlusion-consistent}; P1GRP=${P1GRP:-observable}; P1REL=${P1REL:-calibrated}
+RELARGS=(); [ "$P1LIK" = occlusion-consistent ] && RELARGS=(--negative-ray-reliability "$P1REL")
 DRY=${DRY:-0}
 ARM=unanimous
 MIS=(--rgb-model-sigma 0.04 --depth-model-sigma 0.003)
@@ -84,7 +85,7 @@ run13() {   # run13 DRAWROOT SCENE STAGES
     --direction "$dir" --frame-timestamps auto --sensor-model "$CAL" --bootstrap-p0 \
     --p0-velocity-sigma 1.0 0.316227766 --phase1-partition canonical "${MIS[@]}" \
     --velocity-tau "$VTAU" --phase2-support-refine free-space --phase2-support-refine-rounds "$ROUNDS" \
-    --phase1-likelihood "$P1LIK" --phase1-group-update "$P1GRP" --phase1-deterministic \
+    --phase1-likelihood "$P1LIK" --phase1-group-update "$P1GRP" "${RELARGS[@]}" --phase1-deterministic \
     < /dev/null 2>&1 | tail -4
   STATUS+=("$2 $(basename "$1") [$3] rc=${PIPESTATUS[0]}")
   local PS="$PO/$name/bidirectional/$dir/predicted_support.json"
@@ -102,7 +103,7 @@ print('  ray status totals:', st)" "$OB" < /dev/null
 }
 
 echo "phase1 occlusion real: $(pwd) ($(git rev-parse --short HEAD) on $(git branch --show-current)$(git diff --quiet HEAD -- . ':!submodules' || echo ' + uncommitted'))"
-echo "  parts: $PARTS, Phase 1: --phase1-likelihood $P1LIK --phase1-group-update $P1GRP --phase1-deterministic -> $OUT"
+echo "  parts: $PARTS, Phase 1: --phase1-likelihood $P1LIK --phase1-group-update $P1GRP ${RELARGS[*]} --phase1-deterministic -> $OUT"
 if [ "$DRY" != 1 ]; then
   mkdir -p "$OUT"
   { echo "date $(date -Is)"; echo "worktree $(pwd)"; echo "commit $(git rev-parse HEAD) branch $(git branch --show-current)"

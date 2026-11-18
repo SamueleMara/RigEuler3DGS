@@ -268,7 +268,7 @@ def cuda_tests():
             return iekf_frame_step(canon, P0(canon.mu.shape[0]), obs, cams, 1 / 30, base, observation_model=model)
         cfg = dataclasses.replace(base, group_update="observable")
         return iekf_frame_step(canon, P0(canon.mu.shape[0]), obs, cams, 1 / 30, cfg, observation_model=model,
-                               occlusion=OcclusionLikelihood())
+                               occlusion=OcclusionLikelihood("certified"))
 
     print("\n[7] visible part moves 12 mm, a static part is hidden behind a front occluder (one supernode)")
     res = {m: run(m) for m in ("legacy", "new")}
@@ -325,7 +325,7 @@ def cuda_tests():
     from estimator.deterministic_ops import enable
     info = enable()
     cfg = dataclasses.replace(base, group_update="observable")
-    occ = OcclusionLikelihood(deterministic=True)
+    occ = OcclusionLikelihood("certified", deterministic=True)
     outs = [iekf_frame_step(canon, P0(canon.mu.shape[0]), obs, cams, 1 / 30, cfg, observation_model=model,
                             occlusion=occ) for _ in range(2)]
     check("[8] mu, R and P bitwise equal across two runs",

@@ -15,8 +15,9 @@ ray likelihood in which every pixel belongs to exactly one status:
                           pi p_obj + (1 - pi) p_unknown of spec I.A (no calibrated
                           p_unknown / ownership prior exists); an end-effector inside
                           M = 1 is therefore still explained as object, as in v6.
-  KNOWN_NONOBJECT_DEPTH   M = 0 with valid raw sensor depth D, not on the mask edge:
-                          L_p = -log(1 - pi A_p),
+  KNOWN_NONOBJECT_DEPTH   M = 0 with valid raw sensor depth D, not on the mask edge, and
+                          (reliability "calibrated") not a depth edge, with q_p > 0:
+                          L_p = -log((1 - q_p) + q_p E[T_front]) = -log(1 - q_p A_p),
                           A_p = sum_k w_k Phi((D - z_k)/sigma_p) = 1 - E_{Z~N(D,sigma_p^2)}[T_front(Z)]
                           (iekf_negative_ray.cu). An object Gaussian far BEHIND the
                           observed surface (an occluder in front of it) has s_k -> 0:
@@ -24,10 +25,13 @@ ray likelihood in which every pixel belongs to exactly one status:
                           pushed out exactly as a free-space ray says.
                           sigma_p = the calibrated sensor sd at the OBSERVED depth
                           (+ the declared depth_model_sigma in variance), fixed per pixel.
-                          pi = the declared negative-mask reliability (default 1).
-  UNKNOWN                 M = 0 with invalid / missing raw depth, or an M = 0 pixel with
-                          an M = 1 pixel in its 3x3 neighbourhood (mask-edge mixed
-                          returns: the sensor model is not calibrated there). No term.
+                          q_p = the per-pixel reliability (estimator/negative_ray_reliability.py):
+                          "calibrated" (DEFAULT of the CLI) from the run's own masks and depth;
+                          "certified" q = 1 (the first implementation, kept as an ablation arm);
+                          "none" q = 0 everywhere (no negative evidence).
+  UNKNOWN                 M = 0 with invalid / missing raw depth, an M = 0 pixel with an
+                          M = 1 pixel in its 3x3 neighbourhood (mask-edge mixed returns), or
+                          ("calibrated") a depth-edge pixel or q_p = 0. No term.
   TRUSTED_EMPTY           never assigned: no independently established empty-ray
                           measurement exists in these datasets.
 
@@ -36,10 +40,12 @@ zero off M = 1, depth is V_raw AND M as before, and the negative-ray term lives 
 KNOWN_NONOBJECT pixels. The trial objective (every trust-region trial), the RHS (exact
 score), the Gauss-Newton normal operator and the per-Gaussian Fisher blocks are all
 derived from the same L_p:
-    rhs     = -sum_p (pi / E_p) dA_p/dx                      (exact -grad L)
-    normal  = sum_p (pi / E_p)^2 J_p^T J_p                   (GN: drops (pi/E) d2A)
+    rhs     = -sum_p (q_p / E_p) dA_p/dx                     (exact -grad L)
+    normal  = sum_p (q_p / E_p)^2 J_p^T J_p                  (GN: drops (q/E) d2A)
     fisher  = per-Gaussian diagonal blocks of `normal`
-with E_p = 1 - pi A_p >= T_STOP by the renderer's termination rule.
+with E_p = 1 - q_p A_p >= T_STOP by the renderer's termination rule. q_p and the status
+depend only on the observation, are computed once per (camera, frame) and reused by every
+trial, RHS, operator and posterior evaluation of that frame.
 """
 from __future__ import annotations
 
@@ -48,23 +54,81 @@ from dataclasses import dataclass, field
 import torch
 
 from . import negative_ray_operators as no
+from . import negative_ray_reliability as nrr
 
 LIKELIHOODS = ("legacy-masked", "occlusion-consistent")
 MASK_EDGE = ("unknown", "nonobject")
+RELIABILITY = ("calibrated", "certified", "none")
 
 
-@dataclass(frozen=True)
+@dataclass
 class OcclusionLikelihood:
-    """The declared negative-ray model. Immutable for a run."""
-    negative_reliability: float = 1.0
+    """The declared negative-ray model. The model is fixed for a run; the per-(camera, frame)
+    pixel maps are cached because they depend on the observation only.
+
+    reliability: "calibrated" (needs `calibration`, {camera: CameraReliability}),
+                 "certified" (q = 1, the first implementation), "none" (q = 0), or a float
+                 in [0, 1] (tests only: a constant q, no depth-edge test)."""
+    reliability: object = "calibrated"
     mask_edge: str = "unknown"
     deterministic: bool = False
+    calibration: dict | None = field(default=None, compare=False, repr=False)
+    level: float = nrr.LEVEL
+    _cache: dict = field(default_factory=dict, compare=False, repr=False)
 
     def __post_init__(self):
-        if not (0.0 < float(self.negative_reliability) <= 1.0):
-            raise ValueError("negative-ray reliability must be in (0, 1]")
+        r = self.reliability
+        if isinstance(r, str):
+            if r not in RELIABILITY:
+                raise ValueError(f"reliability must be one of {RELIABILITY} or a float in [0, 1]")
+        elif not (0.0 <= float(r) <= 1.0):
+            raise ValueError("a constant reliability must be in [0, 1]")
         if self.mask_edge not in MASK_EDGE:
             raise ValueError(f"mask_edge must be one of {MASK_EDGE}")
+        if r == "calibrated" and self.calibration is not None:
+            missing = [k for k, v in self.calibration.items() if v is None]
+            if missing:
+                raise ValueError(f"no reliability calibration for {missing}")
+
+    @property
+    def negative_reliability(self):                    # manifest / backward-compatible name
+        return self.reliability
+
+    def pixel_model(self, ob, camera: str, sigma: torch.Tensor):
+        """(status [H,W] uint8, q [H,W] float32) of one prepared camera; cached per frame."""
+        if getattr(ob, "depth_valid_raw", None) is None:
+            raise ValueError("the occlusion-consistent likelihood needs the raw depth validity "
+                             "(PreparedRGBD.depth_valid_raw); refusing to treat masked validity as raw")
+        D, Mc = ob.depth_observed, ob.object_coverage
+        key = (camera, int(getattr(ob, "original_frame", -1)), D.data_ptr(), Mc.data_ptr(), tuple(D.shape),
+               float(torch.nan_to_num(D.double(), nan=0.0, posinf=0.0, neginf=0.0).sum()), float(Mc.sum()))
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+        M = Mc > 0.5
+        raw = ob.depth_valid_raw.bool() & torch.isfinite(D) & (D > 0)
+        st = torch.full(M.shape, no.ST_UNKNOWN, dtype=torch.uint8, device=M.device)
+        st[M] = no.ST_SUPPORTED
+        r = self.reliability
+        if r == "none":
+            q = torch.zeros(M.shape, dtype=torch.float32, device=M.device)
+        elif r == "calibrated":
+            if not self.calibration or camera not in self.calibration:
+                raise ValueError(f"reliability 'calibrated' but no calibration for camera {camera!r}")
+            f = nrr.features(M, D, raw, sigma, self.level, self.mask_edge)
+            q = self.calibration[camera].q_map(f).to(M.device)
+            st[f.candidate & (q > 0)] = no.ST_NONOBJECT
+        else:
+            neg = ray_status(ob, self.mask_edge) == no.ST_NONOBJECT
+            qv = 1.0 if r == "certified" else float(r)
+            q = torch.where(neg, torch.full_like(D, qv, dtype=torch.float32), torch.zeros_like(D, dtype=torch.float32))
+            if qv > 0:
+                st[neg] = no.ST_NONOBJECT
+        q = torch.where(st == no.ST_NONOBJECT, q, torch.zeros_like(q))
+        if len(self._cache) > 16:
+            self._cache.clear()
+        self._cache[key] = (st, q)
+        return st, q
 
     def to_manifest(self) -> dict:
         return {
@@ -75,21 +139,28 @@ class OcclusionLikelihood:
                          + (" (mask-edge pixels included)" if self.mask_edge == "nonobject" else ""),
                          "UNKNOWN": "M = 0 with invalid depth" + (", or on the mask edge" if self.mask_edge == "unknown" else ""),
                          "TRUSTED_EMPTY": "never assigned (no independent empty-ray measurement)"},
-            "negative_ray": "L = -log(1 - pi A), A = sum_k w_k Phi((D - z_k)/sigma), exact Gaussian depth marginal",
-            "negative_reliability_pi": float(self.negative_reliability),
-            "negative_reliability_source": ("declared: every KNOWN_NONOBJECT ray certified (pi = 1)"
-                                            if float(self.negative_reliability) == 1.0
-                                            else "declared mask-reliability prior (not calibrated)"),
+            "negative_ray": "L = -log((1 - q_p) + q_p E[T_front]) = -log(1 - q_p A_p), "
+                            "A = sum_k w_k Phi((D - z_k)/sigma), exact Gaussian depth marginal",
+            "reliability": (self.reliability if isinstance(self.reliability, str) else float(self.reliability)),
+            "reliability_source": {"calibrated": "estimator/negative_ray_reliability.py, per camera from this run's "
+                                                 "masks and raw depth (no GT); depth edges UNKNOWN",
+                                   "certified": "q = 1 on every KNOWN_NONOBJECT ray (first implementation)",
+                                   "none": "q = 0: no negative evidence"}.get(self.reliability,
+                                                                             "constant q (tests only)"),
+            "reliability_calibration": ({k: v.to_manifest() for k, v in self.calibration.items()}
+                                        if self.calibration else None),
+            "test_level": self.level,
             "sigma": "calibrated sensor sd at the OBSERVED depth (+ declared depth_model_sigma in variance)",
             "contributors": "production evalAlpha (skip < 1/255, clamp 0.99) and T_STOP termination; "
                             "z = camera centre depth (the renderer's sort key)",
             "positive_model": "legacy expected-quad RGB + alpha restricted to M = 1, blended-depth Student-t "
                               "on V_raw AND M (UNCHANGED from v6 on those pixels)",
-            "curvature": "Gauss-Newton (pi/E)^2 J^T J; the (pi/E) d2A term is dropped (PSD)",
+            "curvature": "Gauss-Newton (q/E)^2 J^T J; the (q/E) d2A term is dropped (PSD)",
             "deterministic_reductions": bool(self.deterministic),
             "not_implemented": ["positive-ray RGB-D ownership mixture (end-effector inside M = 1)",
                                 "first-return association on M = 1 (blended depth kept)",
-                                "TRUSTED_EMPTY rays", "calibrated mask false-negative rate"],
+                                "TRUSTED_EMPTY rays",
+                                "reliability of depth-edge (mixed-return) pixels: UNKNOWN, not modelled"],
         }
 
 
@@ -166,8 +237,8 @@ class _Cam:
     name: str
     args: tuple
     A: torch.Tensor
-    c1: torch.Tensor          # pi / E   (score weight)
-    c2: torch.Tensor          # (pi / E)^2 (GN weight)
+    c1: torch.Tensor          # q / E   (score weight)
+    c2: torch.Tensor          # (q / E)^2 (GN weight)
     status: torch.Tensor
     energy: float
     floor_hits: int
@@ -187,21 +258,22 @@ class NegativeRayEvaluation:
     def build(cls, model: OcclusionLikelihood, lin, prepared, cfg):
         from .observation_terms import camera_name
         cams, energy = [], 0.0
-        pi = float(model.negative_reliability)
         for k, (view, ob) in enumerate(zip(lin.views, prepared, strict=True)):
             dev = view.depth.device
             ob = ob.to(dev)
             name = camera_name(cfg, k)
-            st = ray_status(ob, model.mask_edge)
             D = ob.depth_observed.to(dev).float()
+            raw = ob.depth_valid_raw.to(dev).bool() & torch.isfinite(D) & (D > 0)
+            sd = depth_sigma_map(cfg, name, D, raw)
+            st, q = model.pixel_model(ob, name if name is not None else f"#{k}", sd)
             neg = st == no.ST_NONOBJECT
-            sd = depth_sigma_map(cfg, name, D, neg)
-            args = no.camera_args(view.cache, torch.where(neg, D, torch.zeros_like(D)), sd, st, pi)
+            args = no.camera_args(view.cache, torch.where(neg, D, torch.zeros_like(D)), sd, st, q)
             r = no.nr_eval(args, diagnostics=False)
             A, L = r["A"], r["L"]
-            E = (1.0 - pi * A).clamp_min(1e-12)
-            c1 = torch.where(neg, pi / E, torch.zeros_like(E)).float()
-            c2 = torch.where(neg, (pi / E) ** 2, torch.zeros_like(E)).float()
+            qd = q.double()
+            E = (1.0 - qd * A).clamp_min(1e-12)
+            c1 = torch.where(neg, qd / E, torch.zeros_like(E)).float()
+            c2 = torch.where(neg, (qd / E) ** 2, torch.zeros_like(E)).float()
             e = float(L[neg].sum())
             energy += e
             cams.append(_Cam(name, args, A, c1, c2, st, e, r["floor_hits"]))
@@ -218,8 +290,12 @@ class NegativeRayEvaluation:
             self._score = -s
         return self._score
 
+    def score_pose_by_camera(self) -> list:
+        """[(camera, -grad L of that camera [N,6])] (diagnostics; same kernels as score_pose)."""
+        return [(c.name, -no.nr_vjp(c.args, c.A, c.c1, self.deterministic)) for c in self.cams]
+
     def normal_pose(self, v: torch.Tensor) -> torch.Tensor:
-        """sum_p (pi/E_p)^2 J_p^T J_p v (PSD), [N,6]."""
+        """sum_p (q_p/E_p)^2 J_p^T J_p v (PSD), [N,6]."""
         vf = v.float().contiguous()
         out = None
         for c in self.cams:
@@ -272,9 +348,10 @@ def add_cli(ap) -> None:
                          "raw depth carry -log E[T_front(D)] instead of the grey-background RGB and "
                          "alpha -> 0 pushes; M = 0 without depth carries nothing "
                          "(estimator/occlusion_likelihood.py)")
-    ap.add_argument("--negative-ray-reliability", type=float, default=1.0,
-                    help="declared probability that a KNOWN_NONOBJECT ray is truly non-object (0, 1]; "
-                         "1 = certified (default)")
+    ap.add_argument("--negative-ray-reliability", choices=RELIABILITY, default="calibrated",
+                    help="per-pixel reliability q of the M = 0 negative rays: calibrated (DEFAULT; "
+                         "estimator/negative_ray_reliability.py, from this run's masks and raw depth, depth "
+                         "edges UNKNOWN) | certified (q = 1, the first implementation; ablation) | none (q = 0)")
     ap.add_argument("--negative-ray-mask-edge", choices=MASK_EDGE, default="unknown",
                     help="M = 0 pixels touching M = 1 (3x3): unknown (default; mixed returns, no term) "
                          "| nonobject")
@@ -283,7 +360,7 @@ def add_cli(ap) -> None:
 def from_args(args) -> OcclusionLikelihood | None:
     mode = getattr(args, "phase1_likelihood", "legacy-masked") or "legacy-masked"
     if mode == "legacy-masked":
-        if float(getattr(args, "negative_ray_reliability", 1.0)) != 1.0 or \
+        if getattr(args, "negative_ray_reliability", "calibrated") != "calibrated" or \
                 getattr(args, "negative_ray_mask_edge", "unknown") != "unknown":
             raise SystemExit("--negative-ray-* given with --phase1-likelihood legacy-masked")
         return None
@@ -298,8 +375,23 @@ def from_args(args) -> OcclusionLikelihood | None:
     if (getattr(args, "rgb_support", "full") or "full") != "full":
         raise SystemExit("--phase1-likelihood occlusion-consistent sets the RGB support itself (M = 1)")
     try:
-        return OcclusionLikelihood(float(getattr(args, "negative_ray_reliability", 1.0)),
+        return OcclusionLikelihood(getattr(args, "negative_ray_reliability", "calibrated"),
                                    getattr(args, "negative_ray_mask_edge", "unknown"),
                                    bool(getattr(args, "deterministic", False)))
     except ValueError as ex:
         raise SystemExit(f"occlusion likelihood: {ex}")
+
+
+def calibrate_reliability(model: OcclusionLikelihood, cfg, camera_names, frame_obs, masks) -> dict:
+    """{camera: CameraReliability} from the run's own frames (observation data only).
+    frame_obs[k][c] = (rgb, depth, valid) as loaded; masks[k][c] = bool [H,W]."""
+    out = {}
+    for c, name in enumerate(camera_names):
+        def frames(c=c, name=name):
+            for obs_k, m_k in zip(frame_obs, masks):
+                d = obs_k[c][1].float()
+                v = obs_k[c][2] if len(obs_k[c]) > 2 and obs_k[c][2] is not None else (d > 0)
+                raw = v.bool() & torch.isfinite(d) & (d > 0)
+                yield m_k[c].bool(), d, raw, depth_sigma_map(cfg, name, d, raw)
+        out[name] = nrr.calibrate(name, frames(), model.level, model.mask_edge)
+    return out

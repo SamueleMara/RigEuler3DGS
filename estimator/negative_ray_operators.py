@@ -8,9 +8,9 @@ production `_C` / `_C_vis` modules are never rebuilt. Every call reads the froze
 of ONE linearization.
 
 Per camera, given the observation maps (raw sensor depth D, sigma at the observed
-depth, the per-pixel status of estimator/occlusion_likelihood.py) and the declared
-negative-mask reliability pi:
-    nr_eval    A_p = sum_k w_k Phi((D - z_k)/sigma), L_p = -log(1 - pi A_p) (float64)
+depth, the per-pixel status of estimator/occlusion_likelihood.py) and the per-pixel
+reliability q_p in [0, 1] (estimator/negative_ray_reliability.py):
+    nr_eval    A_p = sum_k w_k Phi((D - z_k)/sigma), L_p = -log(1 - q_p A_p) (float64)
                on KNOWN_NONOBJECT pixels; diagnostics: per-Gaussian weights / counts
     nr_vjp     sum_p c_p dA_p / d pose            [P,6]
     nr_jvp     dA_p / d pose . v                   [H,W]
@@ -61,14 +61,19 @@ def ext():
     return _EXT
 
 
-def camera_args(cache, D, sig, status, pi):
+def camera_args(cache, D, sig, status, q):
+    """q: [H,W] per-pixel reliability in [0, 1] (a python float is broadcast; tests only)."""
     f = lambda t: t.contiguous().float()                                       # noqa: E731
+    if not torch.is_tensor(q):
+        q = torch.full_like(D, float(q))
+    if tuple(q.shape) != tuple(D.shape):
+        raise ValueError(f"reliability map {tuple(q.shape)} vs depth {tuple(D.shape)}")
     return (cache.ranges.contiguous().int(), cache.point_list.contiguous().int(),
             int(cache.image_width), int(cache.image_height),
             f(cache.means3D), f(cache.mu_c), f(cache.u), f(cache.Jp), f(cache.sigma_c), f(cache.conic),
             f(cache.opacity.reshape(-1)), f(cache.depth), cache.clamp_flags.contiguous().int(),
             f(cache.viewmatrix), f(cache.projmatrix), float(cache.tanfovx), float(cache.tanfovy),
-            f(D), f(sig), status.contiguous().to(torch.uint8), float(pi))
+            f(D), f(sig), status.contiguous().to(torch.uint8), f(q.to(D.device)))
 
 
 def nr_eval(args, diagnostics=False):
