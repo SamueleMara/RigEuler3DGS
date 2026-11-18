@@ -227,6 +227,11 @@ class IEKFConfig:
     # and defaults to 0 so nothing changes unless it is set and recorded.
     rgb_model_sigma: float = 0.0
     depth_model_sigma: float = 0.0
+    # RigEuler3DGS_PHASE1_COHERENCE_CODEX_IMPLEMENTATION_SPEC_2026-11-16.md section I.D
+    # (estimator/observable_group.py): "legacy" = the 12-DoF group twist expanded to every
+    # member (default); "observable" = dx = [I; K] Q G du, Q zero on unmeasured directions.
+    group_update: str = "legacy"
+    group_update_map: str = "smooth"
 
 
 @dataclass
@@ -264,12 +269,17 @@ def _object_valid(prec, visibility):
     return out
 
 
-def _frame_terms(views, rgbd_gt, cfg: IEKFConfig, visibility=None, observation_model=None):
+def _frame_terms(views, rgbd_gt, cfg: IEKFConfig, visibility=None, observation_model=None, occlusion=None):
     """Per-camera `CameraTerms` (estimator/observation_terms.py): the precisions
     the solver uses AND the objective acceptance is judged on, from the same
     residual, sigma and validity. Original mode: Student-t on RGB (when
     cfg.robust_measurement) and depth; masked modes: estimator/masked_observation.py.
     With a negative-ray constraint (visibility) RGB-D is restricted to M = 1."""
+    if occlusion is not None:
+        # occlusion-consistent likelihood: the legacy positive terms on M = 1 only; the
+        # M = 0 evidence is the negative-ray term added by evaluate_true_map_energy
+        from .occlusion_likelihood import positive_camera_terms
+        return positive_camera_terms(views, rgbd_gt, cfg, observation_model)
     if observation_model is not None:
         from .masked_observation import phase1_camera_terms
         return phase1_camera_terms(views, rgbd_gt, cfg, observation_model)
@@ -428,6 +438,7 @@ def evaluate_true_map_energy(
     visibility=None,
     observation_model=None,
     first_return=None,
+    occlusion=None,
 ) -> tuple[float, dict, FrameLinearization]:
     """Section 13's J(delta) = prior energy + measurement energy, evaluated on
     the TRUE nonlinear render -- this is what acceptance is judged on. With a
@@ -445,7 +456,7 @@ def evaluate_true_map_energy(
     # and -- when the trial is accepted -- the next iteration's GN system, read
     # from the same cache (`lin.frame_terms`)
     from .observation_terms import summarize
-    terms = _frame_terms(lin.views, rgbd_gt, cfg, visibility, observation_model)
+    terms = _frame_terms(lin.views, rgbd_gt, cfg, visibility, observation_model, occlusion)
     lin.frame_terms = terms
     if visibility is not None:
         lin.visibility_values = visibility.evaluate(lin)
@@ -460,6 +471,13 @@ def evaluate_true_map_energy(
         lin.first_return_evaluation = fr
         meas += fr.measurement_energy
         fr_parts = {"first_return_depth_energy": fr.measurement_energy}
+    if occlusion is not None:
+        # the full nonlinear KNOWN_NONOBJECT term of THIS trial state (fresh contributors)
+        from .occlusion_likelihood import evaluate as _nr_evaluate
+        nr = _nr_evaluate(occlusion, lin, rgbd_gt, cfg)
+        lin.negative_ray_evaluation = nr
+        meas += nr.energy
+        fr_parts["negative_ray_energy"] = nr.energy
     delta = boxminus(state, x_prior)
     prior = 0.5 * float((delta * apply_prior(Lambda_prior, delta)).sum())
     return meas + prior, {"measurement": meas, "prior": prior, "rgb_energy": sm["rgb"],
@@ -488,6 +506,7 @@ def iekf_frame_step(
     group_geometry: str = "canonical",
     first_return=None,
     iteration_observer: Callable | None = None,
+    occlusion=None,
 ) -> tuple[GaussianMotionState, torch.Tensor, IEKFDiagnostics]:
     """One video frame. Section 24's reference algorithm, semantics preserved.
 
@@ -519,6 +538,21 @@ def iekf_frame_step(
         raise ValueError("first-return and the negative-ray constraint are different measurement models")
     cfg_terms = dataclasses.replace(cfg, use_depth=False) if fr_depth else cfg
     cfg = cfg or IEKFConfig()
+    # Occlusion-consistent likelihood (opt-in, estimator/occlusion_likelihood.py)
+    if occlusion is not None:
+        if observation_model is None or not observation_model.alpha_term:
+            raise ValueError("the occlusion-consistent likelihood needs the masked expected-quad observation")
+        if visibility is not None:
+            raise ValueError("the occlusion-consistent likelihood and the hard negative-ray constraint are "
+                             "different measurement models")
+        if first_return is not None and first_return.enabled:
+            raise ValueError("the occlusion-consistent likelihood with first-return: no joint model derived")
+    observable_update = str(getattr(cfg, "group_update", "legacy")) == "observable"
+    if str(getattr(cfg, "group_update", "legacy")) not in ("legacy", "observable"):
+        raise ValueError(f"group_update must be 'legacy' or 'observable', not {cfg.group_update!r}")
+    if observable_update and (visibility is not None or not cfg.use_trust_region):
+        raise ValueError("the observable group update is implemented on the trust-region step without the "
+                         "hard negative-ray constraint")
     if cfg.cache_derivative_basis:
         raise NotImplementedError(
             "cache_derivative_basis selects section 20.2's Mode B (precomputed "
@@ -597,7 +631,7 @@ def iekf_frame_step(
         objective was evaluated with; alpha_terms is None unless expected-quad."""
         terms = getattr(L, "frame_terms", None)
         if terms is None:
-            terms = _frame_terms(L.views, rgbd_gt, cfg_terms, visibility, observation_model)
+            terms = _frame_terms(L.views, rgbd_gt, cfg_terms, visibility, observation_model, occlusion)
             L.frame_terms = terms
         prec = [t.as_prec4() for t in terms]
         if observation_model is not None and observation_model.alpha_term:
@@ -609,7 +643,7 @@ def iekf_frame_step(
     lm = float(cfg.lm_initial)
     energy, parts, lin = evaluate_true_map_energy(
         x, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
-        observation_model, first_return)
+        observation_model, first_return, occlusion=occlusion)
 
     def _meas_ops(L, prec, alpha_terms):
         """(rhs, normal, fisher) of the frame's measurement in the pose tangent. In
@@ -617,6 +651,18 @@ def iekf_frame_step(
         is zero in cfg_terms) PLUS the first-return score / PSD local curvature /
         its diagonal blocks, all read from the evaluation of THIS linearization."""
         rhs0, normal0, fisher0 = measurement_operators(L, prec, alpha_terms)
+        if occlusion is not None:
+            nr = getattr(L, "negative_ray_evaluation", None)
+            if nr is None:
+                raise AssertionError("negative-ray evaluation missing on the linearization (stale cache)")
+            rhs_n = rhs0 + nr.score_pose().to(rhs0.dtype)
+
+            def normal_n(v):
+                return normal0(v) + nr.normal_pose(v).to(v.dtype)
+
+            def fisher_n():
+                return fisher0() + nr.fisher_pose().to(rhs0.dtype)
+            return rhs_n, normal_n, fisher_n
         if not fr_depth:
             return rhs0, normal0, fisher0
         fr = getattr(L, "first_return_evaluation", None)
@@ -792,7 +838,29 @@ def iekf_frame_step(
         # Velocity is grouped by the SAME map: a rigid group's velocity field
         # has the identical structure, dv_i = dv_c + domega_c x (mu_i^0 - c_c^0)
         # and domega_i = domega_c, so G acts blockwise on [pose | velocity].
-        if grouped is not None:
+        omap = None
+        if observable_update:
+            # Section I.D: dx = [I; K] Q G du, Q from THIS linearization's Fisher, frozen
+            # for this iteration; the same B / B^T in the RHS, operator, preconditioner,
+            # trust-region model and the expanded trial.
+            from .observable_group import build_map, operators, reduced_preconditioner
+            omap = build_map(P_prior, fisher_pose, cfg.group_update_map)
+            _B, _BT = operators(omap, grouped)
+            solve_b = _BT(b)
+            _A_full = A_mv
+
+            def A_solve(v: torch.Tensor) -> torch.Tensor:
+                return _BT(_A_full(_B(v)))
+
+            solve_precond = reduced_preconditioner(M_blocks, omap, grouped, _B, _BT)
+            solve_metric = ScalingMetric.from_physical_scales(
+                ((grouped.num_supernodes if grouped is not None else x.num_gaussians), POSE_DIM),
+                x.mu.device, x.mu.dtype, sigma_mu=cfg.scale_sigma_mu, sigma_phi=cfg.scale_sigma_phi,
+                sigma_v=cfg.scale_sigma_v, sigma_omega=cfg.scale_sigma_omega)
+            expand_step = _B
+            if j == 0:
+                diag.add(iteration=j, event="observable_group_map", **omap.stats())
+        elif grouped is not None:
             def _G(vg: torch.Tensor) -> torch.Tensor:
                 return torch.cat([grouped.expand(vg[:, :POSE_DIM]),
                                   grouped.expand(vg[:, POSE_DIM:])], dim=1)
@@ -897,7 +965,7 @@ def iekf_frame_step(
                     x_try = boxplus(x, step)
                     e_try, parts_try, lin_try = evaluate_true_map_energy(
                         x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
-                        observation_model, first_return)
+                        observation_model, first_return, occlusion=occlusion)
                     vis_new = visibility.row_values(lin_try.visibility_values)
                     vis_audit = visibility.audit(vis_ref, vis_cur, vis_new)
                     if vis_audit["ok"] or n_soc >= 2:
@@ -919,7 +987,7 @@ def iekf_frame_step(
                 x_try = boxplus(x, step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
                     x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
-                        observation_model, first_return)
+                        observation_model, first_return, occlusion=occlusion)
             actual = energy_before - e_try
             # Section 4.4's gain ratio. A predicted reduction at round-off is
             # not evidence of anything, so rho is NaN there and adapt_radius
@@ -982,7 +1050,7 @@ def iekf_frame_step(
                 x_try = boxplus(x, alpha * step)
                 e_try, parts_try, lin_try = evaluate_true_map_energy(
                     x_try, x_prior, Lambda_prior, rgbd_gt, cameras, cfg_terms, background, visibility,
-                        observation_model, first_return)
+                        observation_model, first_return, occlusion=occlusion)
                 if e_try < energy:
                     x, energy, lin, parts = x_try, e_try, lin_try, parts_try
                     lm = max(cfg.lm_min, lm * cfg.lm_accept_scale)
@@ -1154,7 +1222,13 @@ def iekf_frame_step(
                                else "LOCAL_HESSIAN_AT_CONVERGED_STATE" if stop_reason == "converged"
                                else "UNCERTIFIED_NOT_CONVERGED"),
              curvature=("legacy RGB+alpha Fisher + first-return B_match + B_vis (empirical Fisher); "
-                        "missing-association information NOT subtracted" if fr_depth else "legacy Fisher"),
+                        "missing-association information NOT subtracted" if fr_depth
+                        else "legacy RGB+alpha+depth Fisher on M = 1 + negative-ray GN (pi/E)^2 J^T J"
+                        if occlusion is not None else "legacy Fisher"),
+             group_update=str(getattr(cfg, "group_update", "legacy")),
+             posterior_note=(None if not observable_update else
+                             "block (Lambda^- + F_ii)^-1; NOT the Joseph covariance of the observable "
+                             "restricted update (uncertified; tests/test_phase1_observable_group.py)"),
              **transport_info,
              posterior_inverse_fallbacks=int(post_diag.n_fallback),
              mean_fisher_trace=float(fisher_pose.diagonal(dim1=1, dim2=2).sum(-1).mean()),
@@ -1170,6 +1244,10 @@ def iekf_frame_step(
             raise AssertionError(
                 "section 3 violated: the estimator modified frozen appearance "
                 "(colour / opacity / scales) during a motion update")
+    if occlusion is not None or observable_update:
+        # Section I.E: the per-Gaussian observability evidence of this frame (export only)
+        diag.observability_export = _observability_export(
+            x, x_prior, state_prev_post, P_prior, fisher_pose, lin, occlusion, diag, stop_reason)
     diag.certificate = certificate
     diag.trust_region = tr_history if cfg.use_trust_region else None
     diag.observability = obs_report
@@ -1177,6 +1255,34 @@ def iekf_frame_step(
         # Read-only diagnostics; no change to the prediction or update.
         information_observer(Lambda_prior[:, :3, :3], fisher_pose[:, :3, :3])
     return x, P_post, diag
+
+
+@torch.no_grad()
+def _observability_export(x, x_prior, x_prev, P_prior, fisher_pose, lin, occlusion, diag, stop_reason) -> dict:
+    """Per-Gaussian, per-frame observability statistics (spec section I.E). Evaluation
+    only: nothing here feeds back into the filter."""
+    from .observable_group import build_map
+    omap = build_map(P_prior, fisher_pose, "smooth")
+    innov = boxminus(x, x_prior)
+    proc = boxminus(x_prior, x_prev)
+    per = {"lam_max": omap.lam.max(dim=1).values, "lam_sum": omap.lam.sum(dim=1),
+           "q_max": omap.q.max(dim=1).values,
+           "innovation_translation": innov[:, :3].norm(dim=1).float(),
+           "innovation_rotation": innov[:, 3:6].norm(dim=1).float(),
+           "process_translation": proc[:, :3].norm(dim=1).float(),
+           "velocity": x.v.norm(dim=1).float() if hasattr(x, "v") else innov.new_zeros(innov.shape[0]),
+           "pose_sd_translation": P_prior[:, :3, :3].diagonal(dim1=1, dim2=2).sum(-1).clamp_min(0).sqrt().float()}
+    frame = {"stop_reason": stop_reason,
+             "accepted": sum(1 for r in diag.rows if r.get("event") == "accepted"),
+             "rejected": sum(1 for r in diag.rows if r.get("event") == "rejected"),
+             "prediction_only_members": int((per["q_max"] < 1e-3).sum()),
+             "prediction_only_rule": "q_max < 1e-3 (reporting threshold only; not used by the filter)"}
+    nr = getattr(lin, "negative_ray_evaluation", None)
+    if nr is not None:
+        per.update(nr.per_gaussian())
+        frame["ray_status"] = nr.status_counts()
+        frame["negative_ray_energy"] = nr.energy
+    return {"per_gaussian": {k: v.detach().float().cpu() for k, v in per.items()}, "frame": frame}
 
 
 def config_from_args(args) -> IEKFConfig:

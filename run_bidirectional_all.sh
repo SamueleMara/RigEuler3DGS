@@ -50,6 +50,12 @@
 # --phase1-alpha-precision coupled|declared, --phase1-alpha-sd S,
 # --phase1-rgb-support full|foreground     EXPERIMENTAL likelihood arms (masked mode)
 # --phase1-deterministic    bitwise reproducible Phase-1 reductions (estimator/deterministic_ops.py)
+# --phase1-likelihood legacy-masked|occlusion-consistent   (default legacy-masked = v6)
+#                           occlusion-consistent: M = 0 pixels with valid raw depth carry
+#                           -log E[T_front(D)], M = 0 without depth carries nothing
+#                           (estimator/occlusion_likelihood.py)
+# --phase1-group-update legacy|observable   (default legacy = v6) observable: no update along
+#                           directions no camera measured (estimator/observable_group.py)
 # --velocity-tau T          mean-reverting velocity (correlation time T s) in the Phase 1/2/3
 #                           process models (estimator/velocity_decay.py); default 0 = constant
 # --phase2-support-refine off|free-space   re-assign the coherence support by the free-space
@@ -156,6 +162,8 @@ while [ $# -gt 0 ]; do
     --phase1-rgb-support)     P1RGBSUP="$2"; shift 2;;
     --phase1-first-return-mode)  P1FR="$2"; shift 2;;
     --phase1-deterministic)      P1DET=1; shift;;
+    --phase1-likelihood)         P1LIK="$2"; shift 2;;
+    --phase1-group-update)       P1GRP="$2"; shift 2;;
     --velocity-tau)              VTAU="$2"; shift 2;;
     --phase2-support-refine)     P2REFINE="$2"; shift 2;;
     --phase2-support-refine-rounds) P2ROUNDS="$2"; shift 2;;
@@ -209,6 +217,14 @@ P1ARGS=(--phase1-partition "$P1PART" --alpha-precision "$P1ALPHA" --rgb-support 
 P1DET=${P1DET:-0}
 [ "$P1DET" = 1 ] && P1ARGS+=(--deterministic)
 P1DET_SIG=""; [ "$P1DET" = 1 ] && P1DET_SIG="P1DET=1"     # absent by default: existing signatures still match
+P1LIK=${P1LIK:-legacy-masked}; P1GRP=${P1GRP:-legacy}
+case "$P1LIK" in legacy-masked|occlusion-consistent) ;; *) echo "--phase1-likelihood must be legacy-masked|occlusion-consistent" >&2; exit 2;; esac
+case "$P1GRP" in legacy|observable) ;; *) echo "--phase1-group-update must be legacy|observable" >&2; exit 2;; esac
+P1OCC_SIG=""     # absent by default: existing signatures still match
+if [ "$P1LIK" != legacy-masked ] || [ "$P1GRP" != legacy ]; then
+  P1ARGS+=(--phase1-likelihood "$P1LIK" --phase1-group-update "$P1GRP")
+  P1OCC_SIG="P1OCC=$P1LIK/$P1GRP"
+fi
 VTAU=${VTAU:-0}; P2REFINE=${P2REFINE:-off}; P2ROUNDS=${P2ROUNDS:-1}
 case "$P2REFINE" in off|free-space) ;; *) echo "--phase2-support-refine must be off|free-space" >&2; exit 2;; esac
 VTAU_SIG=""; [ "$VTAU" != 0 ] && VTAU_SIG="VTAU=$VTAU"
@@ -452,7 +468,7 @@ stage_sig() {   # stage_sig STAGE DIR MODEL UPSTREAM_DIR OUTFILE
              "MSTART=$MSTART" "MEND=$MEND" "TSTAMPS=$TSTAMPS" "SENSOR_SHA=$SENSOR_SHA" "SPOL=$SPOL" \
              "RGBMS=$RGBMS" "DEPMS=$DEPMS" "BOOTP0=$BOOTP0" "P0V=${P0V[*]}" "P0_SHA=$p0sha" \
              "P1PART=$P1PART" "P1TRANS=$P1TRANS" "P1ALPHA=$P1ALPHA" "P1ALPHASD=$P1ALPHASD" "P1RGBSUP=$P1RGBSUP" \
-             "P1FR=$P1FR" "P1FRSHA=$P1FRSHA" ${P1DET_SIG:+"$P1DET_SIG"} \
+             "P1FR=$P1FR" "P1FRSHA=$P1FRSHA" ${P1DET_SIG:+"$P1DET_SIG"} ${P1OCC_SIG:+"$P1OCC_SIG"} \
              ${VTAU_SIG:+"$VTAU_SIG"} ${P2REFINE_SIG:+"$P2REFINE_SIG"} ${COH_SIG:+"$COH_SIG"} > "$5"
 }
 # decide STAGE_DIR SIGFILE LABEL -> DECISION in reuse | run | refuse

@@ -1888,7 +1888,21 @@ def bootstrap_positions(truth, cameras, frames, cfg, partition, args,
                                              iteration_observer=getattr(args, "phase1_iteration_observer", None),
                                              information_observer=capture_information if observer else None,
                                              visibility=None if vis_seq is None else vis_seq.for_frame(ti),
-                                             observation_model=None if mseq is None else mseq.model)
+                                             observation_model=None if mseq is None else mseq.model,
+                                             occlusion=getattr(args, "occlusion_likelihood", None))
+        _obs_dir = getattr(args, "phase1_observability_dir", None)
+        _oex = getattr(diag, "observability_export", None)
+        if _obs_dir is not None and _oex is not None:
+            # spec section I.E: per original frame, compact per-Gaussian statistics (export only)
+            import json as _json
+            import numpy as _np
+            _of = (fid.get("original_frame_index", fid.get("dataset_frame_index", ti))
+                   if isinstance(fid, dict) else fid)
+            _np.savez_compressed(Path(_obs_dir) / f"obs_{int(_of):06d}.npz",
+                                 **{k: v.numpy().astype(_np.float32) for k, v in _oex["per_gaussian"].items()})
+            with open(Path(_obs_dir) / "frames.jsonl", "a") as _fh:
+                _fh.write(_json.dumps({"processing_index": ti, "original_frame": int(_of), **_oex["frame"]},
+                                      default=str) + "\n")
         audit = getattr(args, "phase1_audit", None)
         if audit is not None:
             # READ-ONLY diagnostic (tools/audit_calibrated_phase1.py): it receives clones of

@@ -141,6 +141,14 @@ def main() -> int:
     _mask_obs_cli(ap)
     from estimator.first_return_observation import add_cli as _fr_cli
     _fr_cli(ap)
+    from estimator.occlusion_likelihood import add_cli as _occ_cli
+    _occ_cli(ap)
+    ap.add_argument("--phase1-group-update", choices=("legacy", "observable"), default="legacy",
+                    help="legacy (DEFAULT, v6): the 12-DoF supernode twist is applied to every member | "
+                         "observable: dx = [I; K] Q G du, Q zero on directions no camera measured "
+                         "(estimator/observable_group.py)")
+    ap.add_argument("--phase1-group-update-map", choices=("smooth", "rank"), default="smooth",
+                    help="observable update: q = lam/(1+lam) (smooth, default) or a numerical-rank projector")
     ap.add_argument("--deterministic", action="store_true",
                     help="order-independent (bitwise reproducible) IEKF reductions, estimator/deterministic_ops.py")
     from estimator.run_config import add_cli as _rc_cli
@@ -196,6 +204,10 @@ def main() -> int:
     if getattr(args, "deterministic", False):
         from estimator.deterministic_ops import enable as _det_enable
         print(f"  deterministic reductions: {_det_enable()}")
+    from estimator.occlusion_likelihood import from_args as _occ_from_args
+    _occ_from_args(args)                    # flag consistency BEFORE any GPU work
+    if args.phase1_group_update == "legacy" and args.phase1_group_update_map != "smooth":
+        raise SystemExit("--phase1-group-update-map needs --phase1-group-update observable")
     if getattr(args, "first_return_mode", "off") != "off":
         # prior schema + camera coverage BEFORE any GPU work (cameras from <source>/rgb/cam_*)
         from estimator.first_return_observation import from_args as _fr_from_args
@@ -332,6 +344,30 @@ def main() -> int:
             (out / "first_return.json").write_text(json.dumps(ns.first_return.to_manifest(), indent=1, default=str))
             print(f"  first-return mode {ns.first_return.mode}: prior {ns.first_return.prior.model_id[:12]} "
                   f"({ns.first_return.prior.status})")
+        ns.occlusion_likelihood = _occ_from_args(args)
+        if ns.occlusion_likelihood is not None and ns.masked_observation is None:
+            raise SystemExit("--phase1-likelihood occlusion-consistent needs the masked observation")
+        cfg = __import__("dataclasses").replace(cfg, group_update=args.phase1_group_update,
+                                                group_update_map=args.phase1_group_update_map)
+        if ns.occlusion_likelihood is not None or args.phase1_group_update != "legacy":
+            ns.phase1_observability_dir = out / "phase1_observability"
+            ns.phase1_observability_dir.mkdir(parents=True, exist_ok=True)
+            from estimator.observable_group import __file__ as _og_file
+            (out / "phase1_observation_model.json").write_text(json.dumps({
+                "phase1_likelihood": args.phase1_likelihood,
+                "likelihood": (ns.occlusion_likelihood.to_manifest() if ns.occlusion_likelihood is not None
+                               else "legacy-masked (v6)"),
+                "group_update": args.phase1_group_update, "group_update_map": args.phase1_group_update_map,
+                "group_update_definition": ("dx = [I; K] Q G du, Q = S U diag(q(lam)) U^T S^-1, S = chol(P_ee^-), "
+                                            "K = P_ve P_ee^-1; posterior = block (Lambda^- + F_ii)^-1, uncertified"
+                                            if args.phase1_group_update == "observable" else "legacy 12-DoF expansion"),
+                "deterministic": bool(getattr(args, "deterministic", False)),
+                "observability_export": str(ns.phase1_observability_dir),
+                "spec": "RigEuler3DGS_PHASE1_COHERENCE_CODEX_IMPLEMENTATION_SPEC_2026-11-16.md section I"},
+                indent=1, default=str))
+            print(f"  Phase-1 likelihood {args.phase1_likelihood}, group update {args.phase1_group_update}"
+                  f"{' (' + args.phase1_group_update_map + ')' if args.phase1_group_update != 'legacy' else ''}; "
+                  f"observability export -> {ns.phase1_observability_dir}")
         from estimator.mask_diagnostics import MaskDiagnostics, masks_for_run
         from estimator.renderer_bridge import build_linearization as _build_lin
         _mfn, _mroot, _mwhy = masks_for_run(args, source, frames_raw, frame_ids, ns.masked_observation)

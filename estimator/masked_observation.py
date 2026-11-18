@@ -141,6 +141,10 @@ class PreparedRGBD:
     depth_valid: torch.Tensor              # [H,W] bool, V_orig AND M
     camera: str = ""
     original_frame: int = -1
+    # [H,W] bool, V_orig AND finite AND > 0 over the WHOLE image (not restricted to M).
+    # Read only by the opt-in occlusion-consistent likelihood (estimator/occlusion_likelihood.py);
+    # every legacy term reads depth_valid. None when the caller did not supply it.
+    depth_valid_raw: torch.Tensor | None = None
 
     def target(self, b: torch.Tensor) -> torch.Tensor:
         """Y(b) = P + (1 - M) b."""
@@ -149,7 +153,8 @@ class PreparedRGBD:
     def to(self, device) -> "PreparedRGBD":
         return PreparedRGBD(self.rgb_foreground_premult.to(device), self.object_coverage.to(device),
                             self.depth_observed.to(device), self.depth_valid.to(device),
-                            self.camera, self.original_frame)
+                            self.camera, self.original_frame,
+                            None if self.depth_valid_raw is None else self.depth_valid_raw.to(device))
 
 
 def prepare(rgb: torch.Tensor, depth: torch.Tensor, depth_valid: torch.Tensor, mask: torch.Tensor,
@@ -170,8 +175,9 @@ def prepare(rgb: torch.Tensor, depth: torch.Tensor, depth_valid: torch.Tensor, m
     M = mask.to(dev)
     Mf = M.to(rgb.dtype)
     d = depth.to(dev)
-    valid = depth_valid.to(dev).bool() & M & torch.isfinite(d) & (d > 0)
-    return PreparedRGBD(rgb * Mf[None], Mf, depth.to(dev), valid, camera, int(original_frame))
+    raw = depth_valid.to(dev).bool() & torch.isfinite(d) & (d > 0)
+    valid = raw & M
+    return PreparedRGBD(rgb * Mf[None], Mf, depth.to(dev), valid, camera, int(original_frame), raw)
 
 
 def area_downsample(rgb: torch.Tensor, mask: torch.Tensor, factor: int):
