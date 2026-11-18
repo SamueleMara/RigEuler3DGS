@@ -70,6 +70,8 @@ if [ "$DRY" != 1 ]; then
   } > "$OUT13/provenance_$(date +%Y%m%d_%H%M%S).txt"
 fi
 echo "full real (new Phase 1): Phases 1-3 $HERE -> $OUT13; Phases 4-5 + assets $P45 -> $OUT45 ($RUN_ID); parts $PARTS"
+echo "  live progress of every stage (Phases 1-3 tqdm, Phase-4 ETA, Phase-5 tqdm), in another terminal:"
+echo "    OUT13=\"$OUT13\" OUT45=\"$OUT45\" bash $HERE/watch_full_real.sh"
 
 shadow() {   # shadow NAME -> the pre-registration dataset of NAME (built once; symlinks only)
   local n=$1 d="$SHADOW/$1"
@@ -129,12 +131,12 @@ print('  support:', d['status'], len(d['dynamic_gaussians']), 'Gaussians; seed e
   if has p4; then
     REAL="$SRCROOT" P03="$OUT13" CAMS="$CAMS" OUT="$OUT45" STAGE=all RUN_ID="$RUN_ID" SCENES="$sc" ARMS="$ARM" \
       DRY="$DRY" EXTRA_ARGS="--recovery-frame-stride 2" bash "$P45/run_phase45_real.sh" < /dev/null 2>&1 |
-      grep -a --line-buffered -E "^===|COMPLETE|INCOMPLETE|core check|rc=|no joint type|Error|Traceback"
+      grep -a --line-buffered -E "^===|COMPLETE|INCOMPLETE|core check|ETA this sweep|4A batch|rc=|no joint type|Error|Traceback"
     STATUS+=("$sc phase4 -> $OUT45/$sc/$ARM/phase4/$RUN_ID")
   fi
   if has p5 && [ "$DRY" != 1 ]; then
     OUT="$OUT45" RUN_ID="$RUN_ID" SCENES="$sc/$ARM" bash "$P45/run_phase5_synthetic.sh" < /dev/null 2>&1 |
-      grep -a --line-buffered -E "^===|done in|masked PSNR|SKIPPED|asset export|rc=|Error|Traceback"
+      grep -a --line-buffered -E "^===|phase5 stage|done in|masked PSNR|SKIPPED|asset export|rc=|Error|Traceback"
     STATUS+=("$sc phase5 $([ -f "$P5/complete.json" ] && echo complete || echo NOT complete) -> $P5")
   fi
   if has urdf && [ "$DRY" != 1 ]; then
