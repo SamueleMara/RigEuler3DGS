@@ -15,6 +15,9 @@ utils/loss_utils.l1_loss and the CUDA fused_ssim used by 3DGS train.py, + lambda
 Outputs: input_proof.json, unresolved_originals.npz, config_resolved.json, manifest.json, loss_log.csv,
 frame_camera_metrics.csv, renderer_parity.json, checkpoints/, final/{point_cloud.ply, lineage, joint_unchanged_proof.json,
 joint/}, initial/final_all_view_metrics.json, complete.json.
+Last operation (after the articulated PLY, before complete.json): the simulation asset assets/<scene>/ -- two Graphdeco
+3DGS PLYs, asset.yaml, object.yaml and, with a valid --asset-physics-spec, URDF / USD / MJCF
+(recovery/sim_asset_export; --asset-export-mode auto|required|visual_only|off, default auto).
 """
 import argparse
 import json
@@ -60,6 +63,67 @@ def preflight(phase4_dir: Path) -> dict:
     return {"4a": ca, "4c": cc, "setup": setup, "a_dir": a_dir, "c_dir": c_dir, "final_canonical": fc}
 
 
+ASSET_MODES = ("auto", "required", "visual_only", "off")
+
+
+def add_asset_args(ap):
+    """Final simulation-asset export options (recovery/sim_asset_export; docs/PHASE5_FINAL_SIM_ASSET_FORMAT.md)."""
+    g = ap.add_argument_group("final simulation-asset export (last Phase-5 step)")
+    g.add_argument("--asset-export-mode", default="auto", choices=ASSET_MODES,
+                   help="auto (default): always the visual + kinematic asset, physics formats when --asset-physics-spec "
+                        "is valid; required: FULL_PHYSICS_READY or Phase 5 fails (checked BEFORE training); "
+                        "visual_only: no physics on purpose; off: explicit legacy escape hatch (recorded)")
+    g.add_argument("--asset-physics-spec", default=None, help="physics YAML (collision meshes, inertia, joint stops)")
+    g.add_argument("--asset-registration", default=None, help="registration YAML (T_world_capture, gravity alignment)")
+    g.add_argument("--asset-usd-python", default=None, help="interpreter with pxr (else $RIGEULER_USD_PYTHON)")
+    g.add_argument("--asset-mujoco-python", default=None, help="interpreter with mujoco (else $RIGEULER_MUJOCO_PYTHON)")
+    g.add_argument("--asset-sapien-python", default=None, help="interpreter with sapien [+ parttwin1d] for the "
+                                                               "optional engine check (else $RIGEULER_SAPIEN_PYTHON)")
+    g.add_argument("--asset-scene", default=None, help="asset folder name (default: basename of the upstream source)")
+    g.add_argument("--asset-revision", default=None, help="write assets/<scene>.rev-<NAME> instead of assets/<scene>")
+    g.add_argument("--asset-verify", type=_bool, default=True, help="run the optional SAPIEN / PArtTwin1D check")
+
+
+def asset_preflight(a, joint) -> None:
+    """--asset-export-mode required: physics spec, registration and runtimes must be usable BEFORE training."""
+    if a.asset_export_mode != "required":
+        return
+    from recovery.sim_asset_export import ExportError, preflight_required
+    try:
+        r = preflight_required(a.asset_physics_spec, a.asset_registration, joint, a.asset_usd_python,
+                               a.asset_mujoco_python)
+    except ExportError as e:
+        raise SystemExit(str(e)) from None
+    print(f"asset export preflight (required): physics spec {r['spec']} valid; USD "
+          f"{r['runtimes']['usd']['python']}, MuJoCo {r['runtimes']['mujoco']['python']}", flush=True)
+
+
+def final_asset_export(a, out: Path, completion: dict, setup: dict, log=print) -> dict:
+    """Last Phase-5 operation (after the articulated PLY, before complete.json). Returns the fields appended to
+    complete.json. required: any failure raises (Phase 5 does not complete); auto / visual_only: a failure is
+    recorded and the trained Phase-5 result is kept."""
+    mode = a.asset_export_mode
+    if mode == "off":
+        return {"asset_export_status": "OFF", "asset_export_mode": "off"}
+    from recovery.sim_asset_export import ExportError, export_phase5_sim_asset
+    try:
+        r = export_phase5_sim_asset(out, scene=a.asset_scene, physics_spec=a.asset_physics_spec,
+                                    registration=a.asset_registration, mode=mode, usd_python=a.asset_usd_python,
+                                    mujoco_python=a.asset_mujoco_python, sapien_python=a.asset_sapien_python,
+                                    verify=a.asset_verify, revision=a.asset_revision, completion=completion,
+                                    setup=setup, log=log)
+    except ExportError as e:
+        if mode == "required":
+            raise SystemExit(f"asset export (required) failed; Phase 5 NOT completed: {e}") from None
+        log(f"asset export FAILED ({mode}); the trained Phase-5 result is kept: {e}")
+        return {"asset_export_status": "EXPORT_FAILED", "asset_export_mode": mode, "asset_export_error": str(e)[:4000]}
+    return {"asset_export_status": r.status, "asset_export_mode": mode,
+            "asset_export_dir": str(r.asset_root.relative_to(out)), "asset_export_manifest_sha256": r.manifest_sha256,
+            "asset_readiness": {"visual_complete": r.visual_complete, "physics_complete": r.physics_complete,
+                                "usd_complete": r.usd_complete},
+            "asset_missing_inputs": r.missing_inputs, "asset_export_reused": r.reused}
+
+
 def main(argv=None):
     from recovery.rgbd_loss import LossConfig
     from recovery.training import Phase5Config
@@ -73,6 +137,7 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="preflight + upstream contract only")
     _add_cfg(ap, Phase5Config, "--", skip=("mode", "loss", "bg", "seed"))
     _add_cfg(ap, LossConfig, "--loss-")
+    add_asset_args(ap)
     a = ap.parse_args(argv)
 
     import numpy as np
@@ -97,6 +162,7 @@ def main(argv=None):
         raise SystemExit("the upstream files changed since 4A (hash mismatch)")
     if AR.joint_fingerprint(up.joint) != pf["4c"]["joint_fingerprint"]:
         raise SystemExit("the Phase-3 joint differs from the one Phase 4 used")
+    asset_preflight(a, up.joint)                                   # mode required: fail now, not after training
     if a.dry_run:
         print(json.dumps({"DRY_RUN": True, "phase4_dir": str(p4), "N_final": pf["4c"]["N_final"],
                           "recovery_views": pf["4c"].get("recovery_views"), "joint": up.joint.to_dict()},
@@ -166,11 +232,12 @@ def main(argv=None):
     art = write_articulated_ply(fp, GaussianTensors.load_lineage(out / "final"), up.joint, fp,
                                 unresolved_uids=z["uid"][und], extra_comments=[f"phase5 {cfg.mode} from {p4}"])
     print(f"articulated PLY: {fp} (part_id, lineage, joint {art['joint_type']} axis/origin/range, per-frame q)")
-    write_json(out / "complete.json", {"stage": "phase5", "train_mode": cfg.mode, **proof, "final_gaussians": len(g),
-                                       "visual_comparison": str(out / "renders"),
-                                       "all_view_metrics_initial": mi, "all_view_metrics_final": mf,
-                                       "joint_unchanged": True, "NOT_FOR_RESULTS": not_for_results,
-                                       "seconds": time.time() - t0})
+    completion = {"stage": "phase5", "train_mode": cfg.mode, **proof, "final_gaussians": len(g),
+                  "visual_comparison": str(out / "renders"),
+                  "all_view_metrics_initial": mi, "all_view_metrics_final": mf,
+                  "joint_unchanged": True, "NOT_FOR_RESULTS": not_for_results}
+    asset = final_asset_export(a, out, completion, st)           # last operation; reads only final/ (immutable)
+    write_json(out / "complete.json", {**completion, **asset, "seconds": time.time() - t0})
     print(f"Phase 5 [{cfg.mode}] done in {(time.time() - t0) / 60:.1f} min: {len(g)} Gaussians; all-view mean loss "
           f"{mi['total']:.5f} -> {mf['total']:.5f}, PSNR_fg {mi['psnr_fg']:.2f} -> {mf['psnr_fg']:.2f} dB, depth L1 "
           f"{mi['depth_l1'] * 1000:.2f} -> {mf['depth_l1'] * 1000:.2f} mm; joint unchanged -> {out}", flush=True)
