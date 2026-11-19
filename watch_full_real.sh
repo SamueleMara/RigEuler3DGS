@@ -4,8 +4,8 @@
 # with tqdm bars and the Phase-4 "ETA this sweep" lines. Ctrl-C only stops the watcher, never the batch.
 #   bash ~/watch_full_real.sh
 RES=${RES:-"/media/samuelemara/Extreme SSD/Samuele/results_11_10_26"}
-OUT13=${OUT13:-"$RES/ours_v11_negray_real"}
-OUT45=${OUT45:-"$RES/ours_phase45_v11_negray_real"}
+OUT=${OUT:-"$(ls -dt "$RES"/full_real_* 2>/dev/null | head -1)"}   # newest run folder
+OUT13=${OUT13:-"$OUT"}; OUT45=${OUT45:-"$OUT"}
 N=${N:-12}
 while true; do
   f=$(find "$OUT13" "$OUT45" -maxdepth 7 \( -path '*/logs/*.log' -o -name 'console_all.log' -o -name 'console.log' \) \

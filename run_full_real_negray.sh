@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # FULL real pipeline with the corrected Phase 1 (2026-11-18), all 8 real captures:
-#   p13   Phases 1-3 from THIS worktree: --phase1-likelihood occlusion-consistent --negative-ray-reliability calibrated
+#   p13   Phases 1-3: --phase1-likelihood occlusion-consistent --negative-ray-reliability calibrated
 #         --phase1-group-update legacy --phase1-deterministic (the configuration of ours_v10b_negative_ray_legacy_group;
 #         no cautious coherence flags), same endpoints / cameras / sensor models / motion windows as v6 / cautious
-#   p4    Phase 4 (4A -> 4B -> 4C, --recovery-frame-stride 2) from RigEuler3DGS-p45 (as ours_phase45_cautious_real_v2)
-#   p5    Phase 5 from RigEuler3DGS-p45 (branch phase5-sim-asset-export): its last step writes assets/<scene>/
+#   p4    Phase 4 (4A -> 4B -> 4C, --recovery-frame-stride 2), same repo
+#   p5    Phase 5, same repo: its last step writes assets/<scene>/
 #         (two 3DGS PLYs + asset.yaml + object.yaml; no physics -> BLOCKED_MISSING_PHYSICS)
 #   urdf  PREVIEW URDF / USD / MJCF: tools/make_preview_physics_spec.py (convex hulls of the Gaussians, declared
 #         density, observed-range joint limits, declared joint dynamics, unverified gravity) + the post-hoc exporter
@@ -13,21 +13,20 @@
 #   bash run_full_real_negray.sh 2>&1 | tee -a ~/full_real_negray.log
 #   SCENE_FILTER="robot_dog red_fridge" ...      PARTS="p4 p5 urdf" ...      DRY=1 ... (plan only)
 # A scene whose Phase 3 already finished in $OUT13 is not re-run (resume after an interruption); FORCE13=1 re-runs it.
-# Env: OUT13, OUT45, RUN_ID, PARTS, SCENE_FILTER, FORCE13, VTAU, ROUNDS, PY, P45, DRY,
+# Env: OUT (one folder; or OUT13 + OUT45 separately), RES, RUN_ID, PARTS, SCENE_FILTER, FORCE13, VTAU, ROUNDS, PY, P45, DRY,
 #      PREVIEW_DENSITY, PREVIEW_VELOCITY, PREVIEW_EFFORT, PREVIEW_DAMPING, PREVIEW_FRICTION
 set -u
 cd "$(dirname "$(readlink -f "$0")")" || exit 2
 HERE=$(pwd)
 PY=${PY:-~/miniconda3/envs/rigeuler3dgs/bin/python}
-if [ -f "$HERE/tools/export_phase5_sim_asset.py" ]; then P45=${P45:-"$HERE"}   # merged tree
-else P45=${P45:-"$HOME/Joint3DGS/RigEuler3DGS-p45"}; fi
+P45=${P45:-"$HERE"}   # Phases 4-5 from this same tree (its rasterizer must be built with rasterize_gaussians_rgbd)
 REAL=${REAL:-"/media/samuelemara/Extreme SSD/Samuele/Backup_09_10_26/Sapien/output/real"}
 RES=${RES:-"/media/samuelemara/Extreme SSD/Samuele/results_11_10_26"}
 BACKUP="$RES/robot_base_registration_applied_20261112/backups"
 SHADOW=${SHADOW:-~/real_poses_before_20261112}
 V5="$RES/ours_v5_two_cams"; V6="$RES/ours_v6_two_cams"; V6_3="$RES/ours_v6_three_cams"
-OUT13=${OUT13:-"$RES/ours_v11_negray_real"}
-OUT45=${OUT45:-"$RES/ours_phase45_v11_negray_real"}
+OUT=${OUT:-"$RES/full_real_$(date +%Y%m%d)"}   # ONE folder per run: final_<scene>_episode_000000/ (Phases 1-3) and
+OUT13=${OUT13:-"$OUT"}; OUT45=${OUT45:-"$OUT"}   # <scene>/ (Phases 4-5 + assets) side by side
 RUN_ID=${RUN_ID:-negray_rs2}
 PARTS=${PARTS:-"p13 p4 p5 urdf"}
 SCENE_FILTER=${SCENE_FILTER:-}
@@ -51,6 +50,13 @@ wooden_box forward 38 127"
 has() { [[ " $PARTS " == *" $1 "* ]]; }
 
 [ -f "$P45/tools/export_phase5_sim_asset.py" ] || { echo "$P45 is not the phase5-sim-asset-export worktree" >&2; exit 2; }
+# fail now, not after hours of Phases 1-3: Phase 4/5 import `recovery`, which needs the RGB-D rasterizer build
+if [ "$DRY" != 1 ] && { has p4 || has p5; }; then
+  (cd "$P45" && CUDA_VISIBLE_DEVICES= "$PY" -c "import recovery" > /dev/null 2>&1) || {
+    echo "$P45: \`import recovery\` fails (rasterizer not built with rasterize_gaussians_rgbd). Build it:" >&2
+    echo "  cd \"$P45/submodules/diff-gaussian-rasterization\" && CUDA_HOME=/usr/local/cuda-12.8 $PY setup.py build_ext --inplace" >&2
+    exit 2; }
+fi
 if [ "$DRY" != 1 ]; then
   mkdir -p "$OUT13" "$OUT45" || exit 2
   exec 9>"$OUT13/.run.lock"
